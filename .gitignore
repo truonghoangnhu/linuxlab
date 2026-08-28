@@ -12,3 +12,6 @@ media/
 staticfiles/
 .coverage
 htmlcov/
+*.egg-info/
+build/
+dist/

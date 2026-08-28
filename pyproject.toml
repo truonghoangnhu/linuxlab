@@ -1,0 +1,29 @@
+[project]
+name = "linuxlab"
+version = "0.1.0"
+description = "LinuxLab open learning and computer-lab platform"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "django>=5.2,<5.3",
+    "wagtail>=7.4,<7.5",
+    "psycopg>=3.2,<4",
+    "cryptography>=45,<46",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-django>=4.9,<5",
+    "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["linuxlab*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
