@@ -1,6 +1,8 @@
 from typing import ClassVar
 
-from django.db import models
+from django.core.validators import MinValueValidator
+from django.db import models, transaction
+from django.db.models import Q
 
 from linuxlab.core.models import StableIdentityModel
 
@@ -27,7 +29,7 @@ class ActivityVersion(models.Model):
         on_delete=models.PROTECT,
         related_name="versions",
     )
-    version = models.PositiveIntegerField()
+    version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     config = models.JSONField(default=dict)
     required_capabilities = models.JSONField(default=list)
     published_at = models.DateTimeField(null=True, blank=True)
@@ -37,6 +39,10 @@ class ActivityVersion(models.Model):
             models.UniqueConstraint(
                 fields=["definition", "version"],
                 name="unique_activity_definition_version",
+            ),
+            models.CheckConstraint(
+                condition=Q(version__gte=1),
+                name="activity_version_number_gte_1",
             ),
         ]
 
@@ -49,12 +55,22 @@ class ActivityVersion(models.Model):
         # the persisted row is published, any further save is rejected outright
         # rather than diffed field-by-field (ADR-014). The transition that sets
         # published_at itself is allowed, since it checks the row's prior state.
-        if self.pk is not None:
+        #
+        # The published-state check and the write must happen under the same
+        # row lock: a plain (unlocked) SELECT-then-UPDATE would let a stale
+        # in-memory instance overwrite a row published concurrently by another
+        # transaction between the check and the write.
+        if self.pk is None:
+            super().save(*args, **kwargs)
+            return
+
+        with transaction.atomic():
             persisted_published_at = (
-                ActivityVersion.objects.filter(pk=self.pk)
+                ActivityVersion.objects.select_for_update()
+                .filter(pk=self.pk)
                 .values_list("published_at", flat=True)
                 .first()
             )
             if persisted_published_at is not None:
                 raise ValueError("published ActivityVersion is immutable")
-        super().save(*args, **kwargs)
+            super().save(*args, **kwargs)

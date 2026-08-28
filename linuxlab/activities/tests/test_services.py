@@ -1,6 +1,8 @@
+import threading
 import uuid
 
 import pytest
+from django.db import close_old_connections, connection
 
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 from linuxlab.activities.registry import ActivityRegistry
@@ -186,3 +188,57 @@ def test_get_activity_version_does_not_return_unpublished_version(definition):
 
     with pytest.raises(ActivityVersion.DoesNotExist):
         get_activity_version(definition.public_id, 1)
+
+
+# --- Concurrent publication ----------------------------------------------
+
+
+class _PublishWorker(threading.Thread):
+    """Publishes the given version on its own DB connection, synchronized by
+    barrier so both workers enter publish_activity_version() together."""
+
+    def __init__(self, version_pk, registry, barrier, results, index):
+        super().__init__()
+        self.version_pk = version_pk
+        self.registry = registry
+        self.barrier = barrier
+        self.results = results
+        self.index = index
+
+    def run(self):
+        close_old_connections()
+        try:
+            version = ActivityVersion.objects.get(pk=self.version_pk)
+            self.barrier.wait()
+            try:
+                publish_activity_version(version, self.registry)
+                self.results[self.index] = "success"
+            except ValueError:
+                self.results[self.index] = "rejected"
+        finally:
+            connection.close()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_publication_results_in_exactly_one_success():
+    definition = ActivityDefinition.objects.create(name="Fake activity", type_key="fake")
+    version = create_activity_version(definition, config={"expected": "ls"})
+
+    registry = ActivityRegistry()
+    registry.register(FakeProvider())
+
+    barrier = threading.Barrier(2)
+    results = [None, None]
+    workers = [_PublishWorker(version.pk, registry, barrier, results, i) for i in range(2)]
+
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert results.count("success") == 1
+    assert results.count("rejected") == 1
+
+    reloaded = ActivityVersion.objects.get(pk=version.pk)
+    assert reloaded.is_published is True
+    assert ActivityVersion.objects.filter(definition=definition).count() == 1

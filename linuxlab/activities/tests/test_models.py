@@ -1,7 +1,8 @@
 import uuid
 
 import pytest
-from django.db import IntegrityError
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 
@@ -103,3 +104,41 @@ def test_activity_version_is_published_reflects_published_at():
     version = ActivityVersion.objects.create(definition=definition, version=1)
 
     assert version.is_published is False
+
+
+# --- version >= 1 -----------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_version_zero_is_rejected_by_model_validation():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    version = ActivityVersion(
+        definition=definition, version=0, config={"a": 1}, required_capabilities=["shell"]
+    )
+
+    with pytest.raises(ValidationError):
+        version.full_clean()
+
+
+@pytest.mark.django_db
+def test_version_zero_is_rejected_by_the_database_constraint():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        ActivityVersion.objects.create(definition=definition, version=0)
+
+    # the surrounding test transaction must still be usable afterward
+    assert ActivityVersion.objects.filter(definition=definition).count() == 0
+
+
+@pytest.mark.django_db
+def test_version_one_remains_valid():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    version = ActivityVersion(
+        definition=definition, version=1, config={"a": 1}, required_capabilities=["shell"]
+    )
+
+    version.full_clean()
+    version.save()
+
+    assert version.version == 1

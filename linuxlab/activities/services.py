@@ -26,15 +26,25 @@ def create_activity_version(definition, config=None, required_capabilities=None)
 
 
 def publish_activity_version(activity_version, registry):
-    if activity_version.is_published:
-        raise ValueError("published ActivityVersion is immutable")
+    # The row lock must be acquired before checking published state, otherwise
+    # two concurrent publishers can both observe "unpublished" and both
+    # succeed. The locked, persisted row (not the caller's possibly-stale
+    # object) is what gets validated and published.
+    with transaction.atomic():
+        locked_version = (
+            ActivityVersion.objects.select_for_update()
+            .select_related("definition")
+            .get(pk=activity_version.pk)
+        )
+        if locked_version.is_published:
+            raise ValueError("published ActivityVersion is immutable")
 
-    provider = registry.get(activity_version.definition.type_key)
-    provider.validate_config(activity_version.config)
+        provider = registry.get(locked_version.definition.type_key)
+        provider.validate_config(locked_version.config)
 
-    activity_version.published_at = timezone.now()
-    activity_version.save()
-    return activity_version
+        locked_version.published_at = timezone.now()
+        locked_version.save()
+        return locked_version
 
 
 def get_activity_version(public_id, version):
