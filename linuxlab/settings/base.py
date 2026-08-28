@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "linuxlab.core",
     "linuxlab.identity",
+    "linuxlab.content",
 ]
 
 MIDDLEWARE = [
