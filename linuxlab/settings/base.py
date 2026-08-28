@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     "linuxlab.core",
     "linuxlab.identity",
     "linuxlab.content",
+    "linuxlab.activities",
 ]
 
 MIDDLEWARE = [
