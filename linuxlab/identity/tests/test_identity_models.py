@@ -93,6 +93,20 @@ def test_ensure_learner_creates_and_is_idempotent():
     assert Learner.objects.filter(account=account).count() == 1
 
 
+@pytest.mark.django_db
+def test_ensure_learner_rejects_missing_account_without_matching_guest_learner():
+    from linuxlab.identity.models import Learner
+
+    guest_capable_learner = Learner.objects.create(account=None)
+
+    with pytest.raises(ValueError, match="account"):
+        ensure_learner(None)
+
+    assert Learner.objects.count() == 1
+    guest_capable_learner.refresh_from_db()
+    assert guest_capable_learner.account is None
+
+
 # --- G. contextual RoleAssignment ---------------------------------------------
 
 
