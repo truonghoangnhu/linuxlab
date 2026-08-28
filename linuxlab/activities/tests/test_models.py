@@ -1,6 +1,8 @@
 import uuid
+from typing import ClassVar
 
 import pytest
+from django import forms
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
@@ -142,3 +144,51 @@ def test_version_one_remains_valid():
     version.save()
 
     assert version.version == 1
+
+
+# --- empty config/required_capabilities are valid domain states ----------
+
+
+@pytest.mark.django_db
+def test_default_config_and_capabilities_pass_full_clean():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    version = ActivityVersion(definition=definition, version=1)
+
+    version.full_clean()
+
+    assert version.config == {}
+    assert version.required_capabilities == []
+
+
+@pytest.mark.django_db
+def test_default_config_and_capabilities_are_preserved_through_save_and_reload():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    version = ActivityVersion(definition=definition, version=1)
+
+    version.full_clean()
+    version.save()
+
+    reloaded = ActivityVersion.objects.get(pk=version.pk)
+    assert reloaded.config == {}
+    assert reloaded.required_capabilities == []
+
+
+class _ActivityVersionConfigForm(forms.ModelForm):
+    class Meta:
+        model = ActivityVersion
+        fields: ClassVar[list[str]] = ["config", "required_capabilities"]
+
+
+def test_config_and_required_capabilities_are_not_required_on_modelform():
+    form = _ActivityVersionConfigForm()
+
+    assert form.fields["config"].required is False
+    assert form.fields["required_capabilities"].required is False
+
+
+def test_modelform_accepts_empty_json_values():
+    form = _ActivityVersionConfigForm(data={"config": "{}", "required_capabilities": "[]"})
+
+    assert form.is_valid(), form.errors
+    assert form.cleaned_data["config"] == {}
+    assert form.cleaned_data["required_capabilities"] == []

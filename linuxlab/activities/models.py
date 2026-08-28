@@ -30,8 +30,8 @@ class ActivityVersion(models.Model):
         related_name="versions",
     )
     version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
-    config = models.JSONField(default=dict)
-    required_capabilities = models.JSONField(default=list)
+    config = models.JSONField(default=dict, blank=True)
+    required_capabilities = models.JSONField(default=list, blank=True)
     published_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
