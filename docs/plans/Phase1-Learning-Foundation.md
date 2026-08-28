@@ -1,6 +1,6 @@
 # LinuxLab Phase 1 Learning Foundation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task, one task per session, following `AGENTS.md` and `CLAUDE.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the first durable LinuxLab release that authors versioned Linux learning content on Central, serves it guest-first, packages only immutable published content, activates it offline on a Node, records learning progress, and synchronizes events idempotently.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12; Django 5.2 LTS; Wagtail 7.4 LTS; PostgreSQL 16+; Django templates + HTMX + Alpine.js; pytest/pytest-django; Ruff; Ed25519 signatures via `cryptography`; REST/JSON for sync.
 
-**Spec:** `docs/superpowers/specs/2026-08-28-linuxlab-architecture-design.md`
+**Spec:** `docs/architecture/LinuxLab-Architecture-Spec-v1.md`
 
 ## Global Constraints
 
