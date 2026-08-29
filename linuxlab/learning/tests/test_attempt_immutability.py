@@ -219,6 +219,134 @@ def test_create_with_only_submitted_at_is_rejected(learner, published_version):
     assert Attempt.objects.filter(learner=learner, activity_version=published_version).count() == 0
 
 
+# --- G2: explicit local PK is rejected regardless of pk is None -----------
+# self.pk is None is NOT equivalent to Django's insertion state: an unsaved
+# instance can have an explicit pk while self._state.adding is still True.
+
+
+def _unused_pk():
+    from django.db.models import Max
+
+    current_max = Attempt.objects.aggregate(Max("pk"))["pk__max"] or 0
+    return current_max + 1000
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_with_fully_submitted_state_is_rejected(learner, published_version):
+    from linuxlab.core.models import DomainEvent
+    from linuxlab.learning.models import Progress, Result
+
+    unused_pk = _unused_pk()
+    attempt = Attempt(
+        pk=unused_pk,
+        learner=learner,
+        activity_version=published_version,
+        submission={"x": 1},
+        submitted_at=timezone.now(),
+    )
+    assert attempt._state.adding is True
+    assert attempt.pk == unused_pk
+
+    with pytest.raises(ValueError):
+        attempt.save()
+
+    assert Attempt.objects.filter(pk=unused_pk).exists() is False
+    assert Result.objects.count() == 0
+    assert Progress.objects.filter(learner=learner, activity_definition=published_version.definition).exists() is False
+    assert DomainEvent.objects.filter(event_type="activity.completed").count() == 0
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_with_only_submission_is_rejected(learner, published_version):
+    unused_pk = _unused_pk()
+    attempt = Attempt(
+        pk=unused_pk,
+        learner=learner,
+        activity_version=published_version,
+        submission={"x": 1},
+    )
+
+    with pytest.raises(ValueError):
+        attempt.save()
+
+    assert Attempt.objects.filter(pk=unused_pk).exists() is False
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_with_only_submitted_at_is_rejected(learner, published_version):
+    unused_pk = _unused_pk()
+    attempt = Attempt(
+        pk=unused_pk,
+        learner=learner,
+        activity_version=published_version,
+        submitted_at=timezone.now(),
+    )
+
+    with pytest.raises(ValueError):
+        attempt.save()
+
+    assert Attempt.objects.filter(pk=unused_pk).exists() is False
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_even_when_unsubmitted_is_rejected(learner, published_version):
+    # Local PK is a private implementation detail: ordinary application code
+    # must never supply it, submitted or not.
+    unused_pk = _unused_pk()
+    attempt = Attempt(
+        pk=unused_pk,
+        learner=learner,
+        activity_version=published_version,
+    )
+
+    with pytest.raises(ValueError):
+        attempt.save()
+
+    assert Attempt.objects.filter(pk=unused_pk).exists() is False
+
+
+# --- G3: explicit EXISTING pk cannot overwrite another Attempt's history --
+
+
+@pytest.mark.django_db
+def test_explicit_existing_pk_cannot_overwrite_an_existing_attempt(
+    learner, other_learner, published_version, other_published_version
+):
+    original = start_attempt(learner, published_version)
+
+    impersonator = Attempt(
+        pk=original.pk,
+        learner=other_learner,
+        activity_version=other_published_version,
+    )
+    assert impersonator._state.adding is True
+
+    with pytest.raises(ValueError):
+        impersonator.save()
+
+    reloaded = Attempt.objects.get(pk=original.pk)
+    assert reloaded.learner_id == learner.pk
+    assert reloaded.activity_version_id == published_version.pk
+    assert reloaded.submission is None
+    assert reloaded.submitted_at is None
+
+
+# --- G4: a missing persisted row must reject, not resurrect ---------------
+
+
+@pytest.mark.django_db
+def test_save_on_a_deleted_attempt_is_rejected_not_resurrected(learner, published_version):
+    attempt = start_attempt(learner, published_version)
+    stale = Attempt.objects.get(pk=attempt.pk)  # a second, separately-loaded copy
+
+    Attempt.objects.filter(pk=attempt.pk).delete()
+
+    with pytest.raises(ValueError):
+        stale.save()
+
+    assert Attempt.objects.filter(pk=attempt.pk).exists() is False
+
+
 # --- H: submit_attempt() still performs its one legitimate transition -----
 
 

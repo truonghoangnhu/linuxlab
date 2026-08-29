@@ -54,7 +54,22 @@ class Attempt(StableIdentityModel):
         # ActivityVersion.save()/QuestionVersion.save() use the same pattern).
         # submit_attempt() bypasses this guard deliberately via a controlled
         # QuerySet.update() rather than calling save() for the transition.
-        if self.pk is None:
+        #
+        # self.pk is None is NOT the same as "this is an insert": Django's
+        # actual insertion-state flag is self._state.adding. An unsaved
+        # instance can have an explicit pk (unused, or colliding with an
+        # existing row) while _state.adding is still True -- that must not
+        # be allowed to fall through to an existing-row UPDATE/resurrecting
+        # INSERT, since it would bypass every check below entirely.
+        if self._state.adding:
+            if self.pk is not None:
+                # Local PK is a private implementation detail (ADR-007,
+                # ADR-011): ordinary application code never assigns it.
+                # public_id is the stable identity callers may reference.
+                raise ValueError(
+                    "Attempt's local primary key is assigned by the database "
+                    "and cannot be supplied by ordinary application code"
+                )
             if self.submission is not None or self.submitted_at is not None:
                 raise ValueError(
                     "a new Attempt must be created unsubmitted "
@@ -71,8 +86,9 @@ class Attempt(StableIdentityModel):
                 .first()
             )
             if locked is None:
-                super().save(*args, **kwargs)
-                return
+                # A persisted-state object whose row no longer exists must
+                # not be silently resurrected via INSERT fallback.
+                raise ValueError("Attempt no longer exists")
 
             for field in _ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS:
                 if getattr(self, field) != locked[field]:
