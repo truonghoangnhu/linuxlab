@@ -249,3 +249,74 @@ def test_published_scoring_cannot_be_changed():
 
     reloaded = QuestionVersion.objects.get(pk=version.pk)
     assert reloaded.scoring == VALID_SCORING
+
+
+# --- insertion-state hardening (cross-task correction) --------------------
+# self.pk is None is NOT the same as Django's insertion state
+# (self._state.adding): an unsaved instance can carry an explicit pk while
+# _state.adding is still True, and Django's save() decides UPDATE-vs-INSERT
+# purely from whether pk is set, not from _state.adding.
+
+
+def _unused_question_version_pk():
+    from django.db.models import Max
+
+    current_max = QuestionVersion.objects.aggregate(Max("pk"))["pk__max"] or 0
+    return current_max + 1000
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_creation_is_rejected():
+    question = Question.objects.create(name="Q1")
+    unused_pk = _unused_question_version_pk()
+
+    version = _make_version(question, version=1)
+    version.pk = unused_pk
+    assert version._state.adding is True
+    assert version.pk == unused_pk
+
+    with pytest.raises(ValueError):
+        version.save()
+
+    assert QuestionVersion.objects.filter(pk=unused_pk).exists() is False
+
+
+@pytest.mark.django_db
+def test_explicit_existing_pk_cannot_overwrite_an_unpublished_version():
+    question = Question.objects.create(name="Q1")
+    original = _make_version(question, version=1)
+    original.save()
+
+    other_question = Question.objects.create(name="Q2")
+    impersonator = _make_version(
+        other_question,
+        version=99,
+        content={"prompt": "Hijacked?", "options": [{"id": "z", "text": "z"}, {"id": "y", "text": "y"}]},
+        answer_key={"correct_option_id": "z"},
+    )
+    impersonator.pk = original.pk
+    assert impersonator._state.adding is True
+
+    with pytest.raises(ValueError):
+        impersonator.save()
+
+    reloaded = QuestionVersion.objects.get(pk=original.pk)
+    assert reloaded.question_id == question.pk
+    assert reloaded.version == 1
+    assert reloaded.content == VALID_CONTENT
+    assert reloaded.answer_key == VALID_ANSWER_KEY
+
+
+@pytest.mark.django_db
+def test_save_on_a_deleted_question_version_is_rejected_not_resurrected():
+    question = Question.objects.create(name="Q1")
+    version = _make_version(question, version=1)
+    version.save()
+    stale = QuestionVersion.objects.get(pk=version.pk)  # a second, separately-loaded copy
+
+    QuestionVersion.objects.filter(pk=version.pk).delete()
+
+    with pytest.raises(ValueError):
+        stale.save()
+
+    assert QuestionVersion.objects.filter(pk=version.pk).exists() is False

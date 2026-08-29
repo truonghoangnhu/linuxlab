@@ -68,17 +68,37 @@ class QuestionVersion(models.Model):
         # check and the write happen under the same row lock: an unlocked
         # SELECT-then-UPDATE would let a stale in-memory instance overwrite a
         # row published concurrently by another transaction (Task 05 lesson).
-        if self.pk is None:
+        #
+        # self.pk is None is NOT equivalent to Django's insertion state
+        # (self._state.adding): an unsaved instance can carry an explicit pk
+        # (unused, or colliding with an existing row), and Django's save()
+        # decides UPDATE-vs-INSERT purely from whether pk is set, not from
+        # _state.adding. Using pk-is-None here would let such an object fall
+        # into the existing-row branch below and either insert with a
+        # caller-chosen local PK or silently overwrite an existing
+        # unpublished row it never actually loaded (cross-task Task 07
+        # lesson). Local PK is a private implementation detail (ADR-007,
+        # ADR-011); no accepted caller ever supplies it explicitly.
+        if self._state.adding:
+            if self.pk is not None:
+                raise ValueError(
+                    "QuestionVersion's local primary key is assigned by the "
+                    "database and cannot be supplied by ordinary application code"
+                )
             super().save(*args, **kwargs)
             return
 
         with transaction.atomic():
-            persisted_published_at = (
+            persisted_row = (
                 QuestionVersion.objects.select_for_update()
                 .filter(pk=self.pk)
-                .values_list("published_at", flat=True)
+                .values("published_at")
                 .first()
             )
-            if persisted_published_at is not None:
+            if persisted_row is None:
+                # A persisted-state object whose row no longer exists must
+                # not be silently resurrected via INSERT fallback.
+                raise ValueError("QuestionVersion no longer exists")
+            if persisted_row["published_at"] is not None:
                 raise ValueError("published QuestionVersion is immutable")
             super().save(*args, **kwargs)

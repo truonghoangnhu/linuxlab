@@ -219,3 +219,66 @@ def test_modelform_accepts_empty_json_values():
     assert form.is_valid(), form.errors
     assert form.cleaned_data["config"] == {}
     assert form.cleaned_data["required_capabilities"] == []
+
+
+# --- insertion-state hardening (cross-task correction) --------------------
+# self.pk is None is NOT the same as Django's insertion state
+# (self._state.adding): an unsaved instance can carry an explicit pk while
+# _state.adding is still True, and Django's save() decides UPDATE-vs-INSERT
+# purely from whether pk is set, not from _state.adding.
+
+
+def _unused_activity_version_pk():
+    from django.db.models import Max
+
+    current_max = ActivityVersion.objects.aggregate(Max("pk"))["pk__max"] or 0
+    return current_max + 1000
+
+
+@pytest.mark.django_db
+def test_explicit_unused_pk_creation_is_rejected():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    unused_pk = _unused_activity_version_pk()
+
+    version = ActivityVersion(pk=unused_pk, definition=definition, version=1, config={"a": 1})
+    assert version._state.adding is True
+    assert version.pk == unused_pk
+
+    with pytest.raises(ValueError):
+        version.save()
+
+    assert ActivityVersion.objects.filter(pk=unused_pk).exists() is False
+
+
+@pytest.mark.django_db
+def test_explicit_existing_pk_cannot_overwrite_an_unpublished_version():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    original = ActivityVersion.objects.create(definition=definition, version=1, config={"a": 1})
+
+    other_definition = ActivityDefinition.objects.create(name="Quiz B", type_key="assessment")
+    impersonator = ActivityVersion(
+        pk=original.pk, definition=other_definition, version=99, config={"hijacked": True}
+    )
+    assert impersonator._state.adding is True
+
+    with pytest.raises(ValueError):
+        impersonator.save()
+
+    reloaded = ActivityVersion.objects.get(pk=original.pk)
+    assert reloaded.definition_id == definition.pk
+    assert reloaded.version == 1
+    assert reloaded.config == {"a": 1}
+
+
+@pytest.mark.django_db
+def test_save_on_a_deleted_activity_version_is_rejected_not_resurrected():
+    definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")
+    version = ActivityVersion.objects.create(definition=definition, version=1, config={"a": 1})
+    stale = ActivityVersion.objects.get(pk=version.pk)  # a second, separately-loaded copy
+
+    ActivityVersion.objects.filter(pk=version.pk).delete()
+
+    with pytest.raises(ValueError):
+        stale.save()
+
+    assert ActivityVersion.objects.filter(pk=version.pk).exists() is False
