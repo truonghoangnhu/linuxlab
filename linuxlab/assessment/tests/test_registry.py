@@ -6,16 +6,17 @@ from linuxlab.assessment.registry import QuestionRegistry
 class FakeQuestionProvider:
     type_key = "fake"
 
-    def validate(self, content, answer_key):
+    def validate(self, content, answer_key, scoring):
         if "expected" not in answer_key:
             raise ValueError("answer_key must contain 'expected'")
 
     def learner_payload(self, content):
         return {"type": self.type_key, "prompt": content.get("prompt")}
 
-    def evaluate(self, content, answer_key, response):
+    def evaluate(self, content, answer_key, scoring, response):
         correct = response == answer_key["expected"]
-        return {"correct": correct, "score": 1 if correct else 0, "max_score": 1}
+        max_score = scoring["max_score"]
+        return {"correct": correct, "score": max_score if correct else 0, "max_score": max_score}
 
 
 def test_provider_registers_and_can_be_looked_up():

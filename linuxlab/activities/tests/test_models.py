@@ -40,6 +40,33 @@ def test_multiple_definitions_may_share_the_same_type_key():
     assert first.type_key == second.type_key == "assessment"
 
 
+# --- type_key is immutable after creation (Task 06 corrective) -----------
+
+
+@pytest.mark.django_db
+def test_type_key_change_is_rejected_after_creation():
+    definition = ActivityDefinition.objects.create(name="Shell Quiz", type_key="assessment")
+
+    definition.type_key = "terminal"
+    with pytest.raises(ValueError):
+        definition.save()
+
+    reloaded = ActivityDefinition.objects.get(pk=definition.pk)
+    assert reloaded.type_key == "assessment"
+
+
+@pytest.mark.django_db
+def test_name_remains_editable_after_creation():
+    definition = ActivityDefinition.objects.create(name="Shell Quiz", type_key="assessment")
+
+    definition.name = "Shell Quiz v2"
+    definition.save()
+
+    reloaded = ActivityDefinition.objects.get(pk=definition.pk)
+    assert reloaded.name == "Shell Quiz v2"
+    assert reloaded.type_key == "assessment"
+
+
 @pytest.mark.django_db
 def test_first_activity_version_for_a_definition_can_be_created_directly():
     definition = ActivityDefinition.objects.create(name="Quiz A", type_key="assessment")

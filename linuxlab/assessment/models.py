@@ -8,13 +8,14 @@ from linuxlab.core.models import StableIdentityModel
 
 
 class Question(StableIdentityModel):
-    """A question identity (ADR-013). Content and grading data belong to
-    QuestionVersion, not here. type_key is intentionally not unique: many
-    Questions may use the same question-type provider.
+    """A question identity/container (ADR-013). Question is mutable metadata
+    only; it must never own interpretation semantics such as provider type,
+    content, grading, or scoring. Those belong entirely to QuestionVersion,
+    so that a published version's meaning can never drift out from under it
+    (Task 06 correction).
     """
 
     name = models.CharField(max_length=255)
-    type_key = models.CharField(max_length=100)
 
 
 class QuestionVersion(models.Model):
@@ -23,8 +24,13 @@ class QuestionVersion(models.Model):
     Distributed identity is Question.public_id + version; this model
     intentionally has no public_id of its own (ADR-011, ADR-014).
 
-    content and answer_key are required (no default): an empty question is
-    never a valid domain state, unlike Task 05's Activity config/capabilities.
+    type_key, content, answer_key, and scoring are ALL required (no default):
+    an empty/underspecified question is never a valid domain state, unlike
+    Task 05's Activity config/capabilities. type_key lives here (not on
+    Question) so the provider that interprets a published version can never
+    change after the fact; version N+1 may legitimately use a different
+    type_key than N, since that creates a new immutable version rather than
+    reinterpreting an existing one.
     """
 
     question = models.ForeignKey(
@@ -33,8 +39,10 @@ class QuestionVersion(models.Model):
         related_name="versions",
     )
     version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    type_key = models.CharField(max_length=100)
     content = models.JSONField()
     answer_key = models.JSONField()
+    scoring = models.JSONField()
     published_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

@@ -20,6 +20,7 @@ FIRST_CONTENT = {
     ],
 }
 FIRST_ANSWER_KEY = {"correct_option_id": "a"}
+FIRST_SCORING = {"max_score": 1}
 
 SECOND_CONTENT = {
     "prompt": "Which command prints the working directory?",
@@ -29,6 +30,7 @@ SECOND_CONTENT = {
     ],
 }
 SECOND_ANSWER_KEY = {"correct_option_id": "x"}
+SECOND_SCORING = {"max_score": 2}
 
 
 @pytest.fixture
@@ -47,16 +49,26 @@ def activity_registry(question_registry):
 
 @pytest.fixture
 def published_question(db, question_registry):
-    question = Question.objects.create(name="Q1", type_key="single_choice")
-    version = create_question_version(question, content=FIRST_CONTENT, answer_key=FIRST_ANSWER_KEY)
+    question = Question.objects.create(name="Q1")
+    version = create_question_version(
+        question,
+        type_key="single_choice",
+        content=FIRST_CONTENT,
+        answer_key=FIRST_ANSWER_KEY,
+        scoring=FIRST_SCORING,
+    )
     return publish_question_version(version, question_registry)
 
 
 @pytest.fixture
 def second_published_question(db, question_registry):
-    question = Question.objects.create(name="Q2", type_key="single_choice")
+    question = Question.objects.create(name="Q2")
     version = create_question_version(
-        question, content=SECOND_CONTENT, answer_key=SECOND_ANSWER_KEY
+        question,
+        type_key="single_choice",
+        content=SECOND_CONTENT,
+        answer_key=SECOND_ANSWER_KEY,
+        scoring=SECOND_SCORING,
     )
     return publish_question_version(version, question_registry)
 
@@ -73,7 +85,7 @@ def _config_for(*question_versions):
     }
 
 
-# --- validate_config -----------------------------------------------------
+# --- validate_config: valid ------------------------------------------------
 
 
 @pytest.mark.django_db
@@ -81,6 +93,9 @@ def test_valid_exact_published_question_ref_is_accepted(published_question, ques
     provider = AssessmentActivityProvider(question_registry)
 
     provider.validate_config(_config_for(published_question))
+
+
+# --- validate_config: invalid -----------------------------------------------
 
 
 @pytest.mark.django_db
@@ -111,9 +126,13 @@ def test_wrong_question_version_is_rejected(published_question, question_registr
 @pytest.mark.django_db
 def test_unpublished_question_version_is_rejected(question_registry):
     provider = AssessmentActivityProvider(question_registry)
-    question = Question.objects.create(name="Draft", type_key="single_choice")
+    question = Question.objects.create(name="Draft")
     unpublished = create_question_version(
-        question, content=FIRST_CONTENT, answer_key=FIRST_ANSWER_KEY
+        question,
+        type_key="single_choice",
+        content=FIRST_CONTENT,
+        answer_key=FIRST_ANSWER_KEY,
+        scoring=FIRST_SCORING,
     )
     config = _config_for(unpublished)
 
@@ -156,6 +175,89 @@ def test_no_latest_semantics_missing_version_is_rejected(published_question, que
         provider.validate_config(config)
 
 
+@pytest.mark.django_db
+def test_boolean_question_version_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        "questions": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": True,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+# --- exact allow-list schemas (mandatory security tests) ------------------
+
+
+@pytest.mark.django_db
+def test_top_level_answer_key_in_config_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        **_config_for(published_question),
+        "answer_key": {"secret": "SERVER_SECRET"},
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_unknown_top_level_config_field_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {**_config_for(published_question), "solutions": ["a"]}
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_per_reference_correct_option_id_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        "questions": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": published_question.version,
+                "correct_option_id": "b",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_per_reference_points_field_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        "questions": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": published_question.version,
+                "points": 5,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_duplicate_configured_question_refs_are_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = _config_for(published_question, published_question)
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
 # --- evaluate --------------------------------------------------------------
 
 
@@ -182,10 +284,13 @@ def test_evaluate_grades_correct_and_incorrect_answers(
 
     result = provider.evaluate(config, submission)
 
-    assert result["score"] == 1
-    assert result["max_score"] == 2
+    assert result["score"] == 1  # 1 (correct, max_score 1) + 0 (incorrect, max_score 2)
+    assert result["max_score"] == 3
     assert result["results"][0]["correct"] is True
+    assert result["results"][0]["score"] == 1
     assert result["results"][1]["correct"] is False
+    assert result["results"][1]["score"] == 0
+    assert result["results"][1]["max_score"] == 2
 
 
 @pytest.mark.django_db
@@ -227,6 +332,65 @@ def test_evaluate_does_not_leak_answer_key(published_question, question_registry
 
     assert "answer_key" not in serialized
     assert "correct_option_id" not in serialized
+
+
+# --- wrong version / duplicate response tests (Task 06 corrective) --------
+
+
+@pytest.mark.django_db
+def test_response_claiming_wrong_version_does_not_grade_against_configured_version(
+    published_question, question_registry
+):
+    # configured Q v1; response claims Q v2 -> must not match v1's response slot
+    provider = AssessmentActivityProvider(question_registry)
+    config = _config_for(published_question)
+    submission = {
+        "responses": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": published_question.version + 1,
+                "selected_option_id": "a",
+            }
+        ]
+    }
+
+    result = provider.evaluate(config, submission)
+
+    assert result["results"][0]["correct"] is False
+
+
+@pytest.mark.django_db
+def test_response_with_boolean_version_is_not_matched(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = _config_for(published_question)
+    submission = {
+        "responses": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": True,
+                "selected_option_id": "a",
+            }
+        ]
+    }
+
+    result = provider.evaluate(config, submission)
+
+    assert result["results"][0]["correct"] is False
+
+
+@pytest.mark.django_db
+def test_duplicate_exact_response_pair_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = _config_for(published_question)
+    duplicate_response = {
+        "question_public_id": str(published_question.question.public_id),
+        "question_version": published_question.version,
+        "selected_option_id": "a",
+    }
+    submission = {"responses": [duplicate_response, dict(duplicate_response)]}
+
+    with pytest.raises(ValueError):
+        provider.evaluate(config, submission)
 
 
 # --- no learning-state persistence -----------------------------------------
@@ -327,3 +491,33 @@ def test_serialize_assessment_for_learner_never_leaks_answer_key(
 
     assert "answer_key" not in serialized
     assert "correct_option_id" not in serialized
+    assert "scoring" not in serialized
+
+
+# --- assessment serializer type guard (Task 06 corrective) -----------------
+
+
+@pytest.mark.django_db
+def test_serialize_assessment_for_learner_rejects_non_assessment_activity(question_registry):
+    from linuxlab.activities.contracts import ActivityProvider  # noqa: F401
+    from linuxlab.activities.registry import ActivityRegistry
+
+    class FakeTerminalProvider:
+        type_key = "terminal"
+
+        def validate_config(self, config):
+            pass
+
+        def evaluate(self, config, submission):
+            return {}
+
+    terminal_registry = ActivityRegistry()
+    terminal_registry.register(FakeTerminalProvider())
+
+    definition = ActivityDefinition.objects.create(name="Terminal Lab", type_key="terminal")
+    # config happens to resemble a valid assessment config
+    activity_version = create_activity_version(definition, config={"questions": []})
+    published = publish_activity_version(activity_version, terminal_registry)
+
+    with pytest.raises(ValueError):
+        serialize_assessment_for_learner(published, question_registry)

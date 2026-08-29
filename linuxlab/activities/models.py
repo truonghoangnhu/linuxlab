@@ -11,10 +11,27 @@ class ActivityDefinition(StableIdentityModel):
     """A learning extension identity (ADR-004). Provider-specific configuration
     belongs to ActivityVersion, not here. type_key is intentionally not unique:
     many Activities may use the same provider.
+
+    type_key is immutable once the definition has been created: every
+    ActivityVersion under one ActivityDefinition belongs to one provider
+    family, so reinterpreting that family after published versions exist
+    would silently change how they're graded/evaluated. Changing provider
+    means creating a different ActivityDefinition (Task 06 correction).
     """
 
     name = models.CharField(max_length=255)
     type_key = models.CharField(max_length=100)
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            persisted_type_key = (
+                ActivityDefinition.objects.filter(pk=self.pk)
+                .values_list("type_key", flat=True)
+                .first()
+            )
+            if persisted_type_key is not None and persisted_type_key != self.type_key:
+                raise ValueError("ActivityDefinition.type_key is immutable after creation")
+        super().save(*args, **kwargs)
 
 
 class ActivityVersion(models.Model):
