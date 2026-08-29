@@ -5,8 +5,8 @@ from linuxlab.activities.registry import ActivityRegistry
 from linuxlab.activities.services import create_activity_version, publish_activity_version
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.snapshots import (
-    build_learning_path_payload,
     canonical_json_bytes,
+    capture_learning_path,
     compute_content_hash,
 )
 
@@ -76,7 +76,7 @@ def test_content_hash_is_a_64_character_hex_sha256_digest():
 
 
 @pytest.mark.django_db
-def test_build_learning_path_payload_preserves_structure_and_order(published_version):
+def test_capture_learning_path_preserves_structure_and_order(published_version):
     path = LearningPathPage(title="Linux Basics")
     _root().add_child(instance=path)
     module = ModulePage(title="Shell Basics")
@@ -94,10 +94,10 @@ def test_build_learning_path_payload_preserves_structure_and_order(published_ver
     ]
     module.add_child(instance=lesson)
 
-    payload = build_learning_path_payload(path)
+    capture = capture_learning_path(path)
 
-    assert payload["kind"] == "learning_path"
-    lp = payload["learning_path"]
+    assert capture["kind"] == "learning_path"
+    lp = capture["learning_path"]
     assert lp["public_id"] == str(path.public_id)
     assert lp["title"] == "Linux Basics"
     assert lp["modules"][0]["public_id"] == str(module.public_id)
@@ -114,15 +114,31 @@ def test_build_learning_path_payload_preserves_structure_and_order(published_ver
 
 
 @pytest.mark.django_db
-def test_payload_excludes_local_pk_and_wagtail_internals():
+def test_capture_excludes_local_pk_and_wagtail_internals():
     path = LearningPathPage(title="Linux Basics")
     _root().add_child(instance=path)
     module = ModulePage(title="Shell Basics")
     path.add_child(instance=module)
 
-    payload = build_learning_path_payload(path)
+    capture = capture_learning_path(path)
 
-    lp = payload["learning_path"]
+    lp = capture["learning_path"]
     assert set(lp.keys()) == {"public_id", "title", "modules"}
     module_payload = lp["modules"][0]
     assert set(module_payload.keys()) == {"public_id", "title", "lessons"}
+
+
+@pytest.mark.django_db
+def test_capture_does_not_trust_a_stale_caller_object():
+    path = LearningPathPage(title="Linux Basics")
+    _root().add_child(instance=path)
+
+    stale = LearningPathPage.objects.get(pk=path.pk)
+    LearningPathPage.objects.filter(pk=path.pk).update(title="Renamed Live")
+    # `stale` still has the old in-memory title, but capture must resolve
+    # the authoritative row, not trust stale caller state (ADR-014
+    # corrective, section 15).
+
+    capture = capture_learning_path(stale)
+
+    assert capture["learning_path"]["title"] == "Renamed Live"

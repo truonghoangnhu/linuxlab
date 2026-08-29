@@ -1,3 +1,5 @@
+import hashlib
+import json
 import threading
 
 import pytest
@@ -8,7 +10,7 @@ from linuxlab.activities.registry import ActivityRegistry
 from linuxlab.activities.services import create_activity_version, publish_activity_version
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.models import PublicationSnapshot
-from linuxlab.publication.snapshots import publish_learning_path
+from linuxlab.publication.snapshots import canonical_json_bytes, publish_learning_path
 
 from ._wagtail_bootstrap import get_or_create_root_page
 
@@ -55,10 +57,10 @@ def _simple_learning_path(title="Linux Basics"):
 
 
 @pytest.mark.django_db
-def test_first_publish_is_version_one():
+def test_first_publish_is_version_one(registry):
     path = _simple_learning_path()
 
-    snapshot = publish_learning_path(path)
+    snapshot = publish_learning_path(path, registry)
 
     assert snapshot.version == 1
     assert snapshot.kind == "learning_path"
@@ -66,23 +68,23 @@ def test_first_publish_is_version_one():
 
 
 @pytest.mark.django_db
-def test_republish_creates_version_two():
+def test_republish_creates_version_two(registry):
     path = _simple_learning_path()
-    publish_learning_path(path)
+    publish_learning_path(path, registry)
 
-    second = publish_learning_path(path)
+    second = publish_learning_path(path, registry)
 
     assert second.version == 2
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 2
 
 
 @pytest.mark.django_db
-def test_different_learning_paths_each_start_at_version_one():
+def test_different_learning_paths_each_start_at_version_one(registry):
     first = _simple_learning_path("Linux Basics")
     second = _simple_learning_path("Networking Basics")
 
-    first_snapshot = publish_learning_path(first)
-    second_snapshot = publish_learning_path(second)
+    first_snapshot = publish_learning_path(first, registry)
+    second_snapshot = publish_learning_path(second, registry)
 
     assert first_snapshot.version == 1
     assert second_snapshot.version == 1
@@ -92,7 +94,7 @@ def test_different_learning_paths_each_start_at_version_one():
 
 
 @pytest.mark.django_db
-def test_editing_draft_after_publication_does_not_change_old_snapshot():
+def test_editing_draft_after_publication_does_not_change_old_snapshot(registry):
     path = _simple_learning_path()
     module = ModulePage(title="Shell Basics")
     path.add_child(instance=module)
@@ -100,7 +102,7 @@ def test_editing_draft_after_publication_does_not_change_old_snapshot():
     lesson.body = [("heading", "Original heading")]
     module.add_child(instance=lesson)
 
-    first = publish_learning_path(path)
+    first = publish_learning_path(path, registry)
     original_payload = first.payload
     original_hash = first.content_hash
 
@@ -111,7 +113,7 @@ def test_editing_draft_after_publication_does_not_change_old_snapshot():
     assert reloaded_first.payload == original_payload
     assert reloaded_first.content_hash == original_hash
 
-    second = publish_learning_path(path)
+    second = publish_learning_path(path, registry)
     assert second.version == 2
     assert second.payload != original_payload
     assert second.content_hash != original_hash
@@ -143,7 +145,7 @@ def test_old_publication_still_references_original_activity_version_after_a_newe
     ]
     module.add_child(instance=lesson)
 
-    snapshot = publish_learning_path(path)
+    snapshot = publish_learning_path(path, registry)
     activity_ref = snapshot.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"]
     assert activity_ref["activity_version"] == 1
 
@@ -178,7 +180,7 @@ def test_publish_rejected_when_activity_reference_unpublished(definition, regist
     module.add_child(instance=lesson)
 
     with pytest.raises(ValueError):
-        publish_learning_path(path)
+        publish_learning_path(path, registry)
 
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 0
 
@@ -202,21 +204,74 @@ def test_publish_succeeds_after_dependency_is_published(definition, registry):
     module.add_child(instance=lesson)
 
     with pytest.raises(ValueError):
-        publish_learning_path(path)
+        publish_learning_path(path, registry)
 
     publish_activity_version(unpublished, registry)
 
-    snapshot = publish_learning_path(path)
+    snapshot = publish_learning_path(path, registry)
     assert snapshot.version == 1
+
+
+# --- hash trust (section 10/34) -----------------------------------------
+
+
+@pytest.mark.django_db
+def test_persisted_hash_independently_matches_recomputed_sha256_of_persisted_payload(registry):
+    path = _simple_learning_path()
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [("heading", "Hello")]
+    module.add_child(instance=lesson)
+
+    snapshot = publish_learning_path(path, registry)
+    reloaded = PublicationSnapshot.objects.get(pk=snapshot.pk)
+
+    independently_computed = hashlib.sha256(canonical_json_bytes(reloaded.payload)).hexdigest()
+    assert reloaded.content_hash == independently_computed
+
+
+@pytest.mark.django_db
+def test_republishing_unchanged_content_gets_a_new_version_but_the_same_hash(registry):
+    path = _simple_learning_path()
+
+    first = publish_learning_path(path, registry)
+    second = publish_learning_path(path, registry)
+
+    assert second.version == first.version + 1
+    assert second.content_hash == first.content_hash
+    assert second.payload == first.payload
+
+
+# --- learner safety (section 27) ----------------------------------------
+
+
+@pytest.mark.django_db
+def test_persisted_payload_reloaded_from_db_contains_no_learner_unsafe_fields(registry):
+    path = _simple_learning_path()
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [("heading", "SERVER_SECRET should never appear")]
+    module.add_child(instance=lesson)
+
+    snapshot = publish_learning_path(path, registry)
+    reloaded = PublicationSnapshot.objects.get(pk=snapshot.pk)
+
+    serialized = json.dumps(reloaded.payload)
+    assert "answer_key" not in serialized
+    assert "correct_option_id" not in serialized
+    assert "scoring" not in serialized
 
 
 # --- concurrency: two concurrent publishes of the same LearningPathPage --
 
 
 class _PublishWorker(threading.Thread):
-    def __init__(self, path_pk, results, index):
+    def __init__(self, path_pk, registry, results, index):
         super().__init__()
         self.path_pk = path_pk
+        self.registry = registry
         self.results = results
         self.index = index
 
@@ -224,7 +279,7 @@ class _PublishWorker(threading.Thread):
         close_old_connections()
         try:
             path = LearningPathPage.objects.get(pk=self.path_pk)
-            snapshot = publish_learning_path(path)
+            snapshot = publish_learning_path(path, self.registry)
             self.results[self.index] = snapshot.version
         finally:
             connection.close()
@@ -233,9 +288,11 @@ class _PublishWorker(threading.Thread):
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_publications_allocate_distinct_sequential_versions():
     path = _simple_learning_path()
+    registry = ActivityRegistry()
+    registry.register(FakeProvider())
 
     results = [None, None]
-    workers = [_PublishWorker(path.pk, results, i) for i in range(2)]
+    workers = [_PublishWorker(path.pk, registry, results, i) for i in range(2)]
 
     for worker in workers:
         worker.start()

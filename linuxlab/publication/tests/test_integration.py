@@ -90,7 +90,7 @@ def test_real_content_publication_with_assessment_activity_end_to_end():
     module.add_child(instance=lesson)
 
     # 5. publish LinuxLab content snapshot
-    snapshot = publish_learning_path(path)
+    snapshot = publish_learning_path(path, activity_registry)
 
     # 6/7. inspect immutable published snapshot, confirm exact ActivityVersion reference
     assert snapshot.version == 1
@@ -156,11 +156,11 @@ def test_required_failure_integration_unpublished_dependency_then_success():
     module.add_child(instance=lesson)
 
     with pytest.raises(ValueError):
-        publish_learning_path(path)
+        publish_learning_path(path, registry)
 
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 0
 
     publish_activity_version(unpublished, registry)
 
-    snapshot = publish_learning_path(path)
+    snapshot = publish_learning_path(path, registry)
     assert snapshot.version == 1
