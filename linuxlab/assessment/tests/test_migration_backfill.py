@@ -1,3 +1,4 @@
+import contextlib
 import uuid
 
 import psycopg
@@ -19,6 +20,19 @@ def _restore_leaf(executor):
     executor.migrate(leaf)
 
 
+def _physical_columns(alias, table_name):
+    """Actual PostgreSQL column names for table_name, via live catalog
+    introspection - NOT the migration graph's declared state. project_state()
+    can only describe what the migration *graph* says should exist; it says
+    nothing about what PostgreSQL was actually left with after a failed
+    reverse attempt.
+    """
+    connection = connections[alias]
+    with connection.cursor() as cursor:
+        description = connection.introspection.get_table_description(cursor, table_name)
+    return {field.name for field in description}
+
+
 def _admin_connect():
     db = settings.DATABASES["default"]
     return psycopg.connect(
@@ -31,10 +45,13 @@ def _admin_connect():
     )
 
 
-@pytest.fixture
-def scratch_db():
-    """A fresh PostgreSQL database that has never had 0002 applied.
+def _scratch_database():
+    """Generator body for the scratch_db fixture below, factored out so the
+    cleanup-completeness test can drive setup/teardown manually and inspect
+    state in between - something a normal fixture can't do from within a
+    single test function.
 
+    Creates a fresh PostgreSQL database that has never had 0002 applied.
     0002 is deliberately irreversible (see its docstring), so a database
     already migrated to the leaf can no longer be moved backward to 0001 to
     set up "legacy" data. A separate, never-migrated-past-0001 database lets
@@ -52,10 +69,41 @@ def scratch_db():
         yield alias
     finally:
         connections[alias].close()
+        # BaseConnectionHandler caches wrapper instances in a thread-local
+        # (self._connections), separate from self.databases (== settings.
+        # DATABASES). Closing the wrapper and removing the settings entry is
+        # not enough: connections[alias] would still return the closed,
+        # cached wrapper via that thread-local. __delitem__ is the public
+        # API Django provides for exactly this (BaseConnectionHandler.
+        # __delitem__ -> delattr(self._connections, alias)).
+        del connections[alias]
         # connections.databases and settings.DATABASES are the same dict.
         del connections.databases[alias]
         with _admin_connect() as admin_conn, admin_conn.cursor() as cursor:
             cursor.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture
+def scratch_db():
+    yield from _scratch_database()
+
+
+def test_scratch_db_cleanup_removes_settings_entry_and_cached_connection():
+    gen = _scratch_database()
+    alias = next(gen)
+
+    # Force the wrapper into ConnectionHandler's thread-local cache, exactly
+    # as real usage (connections[alias]) does - no query/connect required.
+    connections[alias]
+
+    assert alias in connections.databases
+    assert hasattr(connections._connections, alias)
+
+    with contextlib.suppress(StopIteration):
+        next(gen)  # drive the generator through its finally/teardown block
+
+    assert alias not in connections.databases
+    assert not hasattr(connections._connections, alias)
 
 
 def test_migration_0002_backfills_type_key_and_scoring_from_question(scratch_db, django_db_blocker):
@@ -140,17 +188,18 @@ def test_reverse_migration_is_irreversible_for_a_zero_version_question():
     try:
         with pytest.raises(IrreversibleError):
             executor.migrate(BEFORE)
+
+        # Assert the IMMEDIATE post-failure state, before any restoration:
+        # a passing test here must prove no partial unapply occurred, not
+        # merely that the leaf can be restored afterward.
+        recorder = MigrationRecorder(connections["default"])
+        assert (APP, "0002_freeze_question_version_semantics") in recorder.applied_migrations()
+
+        columns = _physical_columns("default", "assessment_questionversion")
+        assert "type_key" in columns
+        assert "scoring" in columns
     finally:
         _restore_leaf(executor)
-
-    recorder = MigrationRecorder(connections["default"])
-    assert (APP, "0002_freeze_question_version_semantics") in recorder.applied_migrations()
-
-    apps_after_attempt = executor.loader.project_state(AFTER).apps
-    QuestionVersion = apps_after_attempt.get_model(APP, "QuestionVersion")
-    field_names = {f.name for f in QuestionVersion._meta.get_fields()}
-    assert "type_key" in field_names
-    assert "scoring" in field_names
 
 
 @pytest.mark.django_db(transaction=True)
@@ -186,8 +235,13 @@ def test_reverse_migration_is_irreversible_for_divergent_provider_versions():
     try:
         with pytest.raises(IrreversibleError):
             executor.migrate(BEFORE)
+
+        # Assert the IMMEDIATE post-failure state, before any restoration.
+        recorder = MigrationRecorder(connections["default"])
+        assert (APP, "0002_freeze_question_version_semantics") in recorder.applied_migrations()
+
+        columns = _physical_columns("default", "assessment_questionversion")
+        assert "type_key" in columns
+        assert "scoring" in columns
     finally:
         _restore_leaf(executor)
-
-    recorder = MigrationRecorder(connections["default"])
-    assert (APP, "0002_freeze_question_version_semantics") in recorder.applied_migrations()
