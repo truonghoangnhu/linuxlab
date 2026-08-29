@@ -70,14 +70,14 @@ def _make_tree(activity_block_value=None):
     return path
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_learning_path_with_no_activity_references_is_valid(registry):
     path = _make_tree()
 
     validate_learning_path(path, registry)  # must not raise
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_valid_published_activity_reference_passes(published_version, registry):
     path = _make_tree(
         {
@@ -89,7 +89,7 @@ def test_valid_published_activity_reference_passes(published_version, registry):
     validate_learning_path(path, registry)  # must not raise
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_missing_activity_definition_is_rejected(registry):
     path = _make_tree({"activity_public_id": str(uuid.uuid4()), "activity_version": 1})
 
@@ -97,7 +97,7 @@ def test_missing_activity_definition_is_rejected(registry):
         validate_learning_path(path, registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_unpublished_activity_version_is_rejected(definition, registry):
     unpublished = create_activity_version(definition, config={})
     path = _make_tree(
@@ -111,7 +111,7 @@ def test_unpublished_activity_version_is_rejected(definition, registry):
         validate_learning_path(path, registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_wrong_version_number_is_rejected(published_version, registry):
     path = _make_tree(
         {
@@ -124,7 +124,7 @@ def test_wrong_version_number_is_rejected(published_version, registry):
         validate_learning_path(path, registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_activity_reference_to_a_type_key_with_no_registered_provider_is_rejected(
     definition, registry
 ):
@@ -184,7 +184,7 @@ def _malformed_published_assessment_activity_version(question_public_id, questio
     return publish_activity_version(version, lenient_registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_published_activity_version_referencing_a_missing_question_version_is_rejected():
     real_registry = ActivityRegistry()
     question_registry = QuestionRegistry()
@@ -203,7 +203,7 @@ def test_published_activity_version_referencing_a_missing_question_version_is_re
         validate_learning_path(path, real_registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_published_activity_version_referencing_an_unpublished_question_version_is_rejected():
     real_registry = ActivityRegistry()
     question_registry = QuestionRegistry()
@@ -233,7 +233,7 @@ def test_published_activity_version_referencing_an_unpublished_question_version_
         validate_learning_path(path, real_registry)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_published_activity_version_with_published_question_version_passes():
     real_registry = ActivityRegistry()
     question_registry = QuestionRegistry()

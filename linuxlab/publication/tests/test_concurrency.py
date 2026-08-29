@@ -1,23 +1,31 @@
-"""Task 09 corrective concurrency evidence (Criticals 2/3, Corrections C/D).
+"""Task 09 final corrective concurrency evidence.
 
-Every test here uses REAL PostgreSQL row-lock blocking (via
-capture_learning_path()'s `_on_locked` test seam and _pg_sync's
-pg_stat_activity polling) to drive a deterministic race, never sleeps.
+Publication coherence comes entirely from a PostgreSQL session-level
+advisory mutex (publisher-vs-publisher ordering) plus a REPEATABLE READ
+MVCC snapshot (coherent tree capture) -- NOT from locking any authoring
+row. Every test here proves both halves of that with real PostgreSQL
+backend state (via _pg_sync's pg_stat_activity polling and the
+_on_snapshot_started/_on_captured test seams), never sleeps, and every
+concurrent author operation here is expected to complete WITHOUT blocking
+or erroring, which is the whole point of this corrective.
 """
 
 import threading
 
 import pytest
-from django.db import close_old_connections, connection, transaction
+from django.db import close_old_connections, connection
 
 from linuxlab.activities.models import ActivityDefinition
 from linuxlab.activities.registry import ActivityRegistry
 from linuxlab.activities.services import create_activity_version, publish_activity_version
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.models import PublicationSnapshot
-from linuxlab.publication.snapshots import publish_learning_path
+from linuxlab.publication.snapshots import _publication_mutex_key, publish_learning_path
 
-from ._pg_sync import wait_until_a_backend_is_lock_blocked, wait_until_n_backends_are_lock_blocked
+from ._pg_sync import (
+    assert_no_backend_is_row_lock_blocked,
+    wait_until_a_backend_is_advisory_lock_blocked,
+)
 from ._wagtail_bootstrap import get_or_create_root_page
 
 
@@ -41,7 +49,7 @@ def _registry():
     return reg
 
 
-# --- Critical 2: validation/build TOCTOU ------------------------------
+# --- Critical 2: validation/build TOCTOU (MVCC, no author blocking) -----
 
 
 @pytest.mark.django_db(transaction=True)
@@ -68,69 +76,78 @@ def test_author_edit_during_capture_never_produces_a_mixed_validation_and_persis
     ]
     module.add_child(instance=lesson)
 
-    locked_event = threading.Event()
-    proceed_event = threading.Event()
+    snapshot_started = threading.Event()
+    proceed = threading.Event()
     publish_result = {}
+    author_result = {}
 
-    def on_locked():
-        locked_event.set()
-        proceed_event.wait(timeout=10)
+    def on_snapshot_started():
+        snapshot_started.set()
+        proceed.wait(timeout=10)
 
     def publisher():
         close_old_connections()
         try:
             publish_result["snapshot"] = publish_learning_path(
-                path, registry, _on_captured=on_locked
+                path, registry, _on_snapshot_started=on_snapshot_started
             )
-        finally:
-            connection.close()
-
-    def author():
-        close_old_connections()
-        try:
-            with transaction.atomic():
-                lesson_obj = LessonPage.objects.get(pk=lesson.pk)
-                lesson_obj.body = [
-                    (
-                        "activity",
-                        {
-                            "activity_public_id": str(definition.public_id),
-                            "activity_version": new_version.version,  # unpublished
-                        },
-                    )
-                ]
-                lesson_obj.save_revision().publish()
         finally:
             connection.close()
 
     t_pub = threading.Thread(target=publisher)
     t_pub.start()
-    assert locked_event.wait(timeout=10)
+    assert snapshot_started.wait(timeout=10)
+
+    # The author's edit -- to an UNPUBLISHED dependency, exactly what
+    # validation must reject -- runs and commits WHILE the publisher's
+    # snapshot is already fixed. It must complete immediately: publication
+    # holds no row lock the author could contend with.
+    def author():
+        close_old_connections()
+        try:
+            lesson_obj = LessonPage.objects.get(pk=lesson.pk)
+            lesson_obj.body = [
+                (
+                    "activity",
+                    {
+                        "activity_public_id": str(definition.public_id),
+                        "activity_version": new_version.version,  # unpublished
+                    },
+                )
+            ]
+            lesson_obj.save_revision().publish()
+            author_result["committed"] = True
+        except Exception as exc:  # noqa: BLE001
+            author_result["error"] = exc
+        finally:
+            connection.close()
 
     t_author = threading.Thread(target=author)
     t_author.start()
-    wait_until_a_backend_is_lock_blocked()
-
-    proceed_event.set()
-    t_pub.join(timeout=10)
     t_author.join(timeout=10)
 
-    # Design guarantee: capture_learning_path() locks every row in the
-    # subtree before returning, so the author's edit cannot land until the
-    # publisher's transaction ends -- the publisher deterministically
-    # validates AND persists the still-old (still-published) reference
-    # (acceptable outcome A, Task 09 corrective section 16). What must never
-    # happen -- validation observing v_old but the persisted payload
-    # containing v_new -- cannot happen here because both read the SAME
-    # captured structure.
+    assert author_result.get("committed") is True, author_result.get("error")
+
+    proceed.set()
+    t_pub.join(timeout=10)
+
+    # The publisher's REPEATABLE READ snapshot was fixed before the author's
+    # commit, so it still sees (and validates against, and persists) the
+    # OLD, still-published reference -- never a mix of "validated v_old" and
+    # "persisted v_new".
     assert "error" not in publish_result
     snapshot = publish_result["snapshot"]
     ref = snapshot.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"]
     assert ref["activity_version"] == old_version.version
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 1
 
+    # A later publication does observe the author's change and fails, since
+    # the new dependency is unpublished.
+    with pytest.raises(ValueError):
+        publish_learning_path(LearningPathPage.objects.get(pk=path.pk), registry)
 
-# --- Critical 3: torn multi-row authoring state -------------------------
+
+# --- Critical 3: torn multi-row authoring state (MVCC, no author blocking)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -145,48 +162,51 @@ def test_concurrent_two_row_author_edit_never_produces_a_torn_capture():
     lesson.body = [("heading", "OLD lesson body")]
     module.add_child(instance=lesson)
 
-    locked_event = threading.Event()
-    proceed_event = threading.Event()
+    snapshot_started = threading.Event()
+    proceed = threading.Event()
     publish_result = {}
+    author_result = {}
 
-    def on_locked():
-        locked_event.set()
-        proceed_event.wait(timeout=10)
+    def on_snapshot_started():
+        snapshot_started.set()
+        proceed.wait(timeout=10)
 
     def publisher():
         close_old_connections()
         try:
             publish_result["snapshot"] = publish_learning_path(
-                path, registry, _on_captured=on_locked
+                path, registry, _on_snapshot_started=on_snapshot_started
             )
-        finally:
-            connection.close()
-
-    def author():
-        close_old_connections()
-        try:
-            with transaction.atomic():
-                module_obj = ModulePage.objects.get(pk=module.pk)
-                module_obj.title = "NEW module title"
-                module_obj.save_revision().publish()
-
-                lesson_obj = LessonPage.objects.get(pk=lesson.pk)
-                lesson_obj.body = [("heading", "NEW lesson body")]
-                lesson_obj.save_revision().publish()
         finally:
             connection.close()
 
     t_pub = threading.Thread(target=publisher)
     t_pub.start()
-    assert locked_event.wait(timeout=10)
+    assert snapshot_started.wait(timeout=10)
+
+    def author():
+        close_old_connections()
+        try:
+            module_obj = ModulePage.objects.get(pk=module.pk)
+            module_obj.title = "NEW module title"
+            module_obj.save_revision().publish()
+
+            lesson_obj = LessonPage.objects.get(pk=lesson.pk)
+            lesson_obj.body = [("heading", "NEW lesson body")]
+            lesson_obj.save_revision().publish()
+            author_result["committed"] = True
+        except Exception as exc:  # noqa: BLE001
+            author_result["error"] = exc
+        finally:
+            connection.close()
 
     t_author = threading.Thread(target=author)
     t_author.start()
-    wait_until_a_backend_is_lock_blocked()
-
-    proceed_event.set()
-    t_pub.join(timeout=10)
     t_author.join(timeout=10)
+    assert author_result.get("committed") is True, author_result.get("error")
+
+    proceed.set()
+    t_pub.join(timeout=10)
 
     snapshot = publish_result["snapshot"]
     module_payload = snapshot.payload["learning_path"]["modules"][0]
@@ -202,24 +222,23 @@ def test_concurrent_two_row_author_edit_never_produces_a_torn_capture():
     )
     # Never acceptable: OLD module + NEW lesson, or NEW module + OLD lesson.
     assert old_pair or new_pair
-    # Deterministic by this design (whole subtree locked before capture):
-    # the author's two-row edit is one transaction and cannot land any part
-    # of itself until the publisher, which locked first, has committed.
+    # Deterministic under REPEATABLE READ: the snapshot was fixed before the
+    # author's two-row commit landed, so both fields come from before it.
     assert old_pair
     assert not new_pair
 
-    # The author's edit is not lost -- it applies once the publisher is done.
+    # The author's edit is not lost -- a later read sees it.
     reloaded_module = ModulePage.objects.get(pk=module.pk)
     reloaded_lesson = LessonPage.objects.get(pk=lesson.pk)
     assert reloaded_module.title == "NEW module title"
     assert reloaded_lesson.body[0].value == "NEW lesson body"
 
 
-# --- tree membership (section 18): adding a Lesson participates in the lock
+# --- tree membership (MVCC, no author blocking) --------------------------
 
 
 @pytest.mark.django_db(transaction=True)
-def test_concurrent_lesson_addition_cannot_land_inside_a_capture_in_progress():
+def test_concurrent_lesson_addition_does_not_block_and_is_excluded_from_the_in_flight_capture():
     registry = _registry()
 
     path = LearningPathPage(title="Linux Basics")
@@ -230,22 +249,27 @@ def test_concurrent_lesson_addition_cannot_land_inside_a_capture_in_progress():
     lesson.body = [("heading", "OLD")]
     module.add_child(instance=lesson)
 
-    locked_event = threading.Event()
-    proceed_event = threading.Event()
+    snapshot_started = threading.Event()
+    proceed = threading.Event()
     publish_result = {}
+    author_result = {}
 
-    def on_locked():
-        locked_event.set()
-        proceed_event.wait(timeout=10)
+    def on_snapshot_started():
+        snapshot_started.set()
+        proceed.wait(timeout=10)
 
     def publisher():
         close_old_connections()
         try:
             publish_result["snapshot"] = publish_learning_path(
-                path, registry, _on_captured=on_locked
+                path, registry, _on_snapshot_started=on_snapshot_started
             )
         finally:
             connection.close()
+
+    t_pub = threading.Thread(target=publisher)
+    t_pub.start()
+    assert snapshot_started.wait(timeout=10)
 
     def author_adds_a_lesson():
         close_old_connections()
@@ -253,167 +277,68 @@ def test_concurrent_lesson_addition_cannot_land_inside_a_capture_in_progress():
             module_obj = ModulePage.objects.get(pk=module.pk)
             new_lesson = LessonPage(title="A brand new lesson")
             module_obj.add_child(instance=new_lesson)
-        finally:
-            connection.close()
-
-    t_pub = threading.Thread(target=publisher)
-    t_pub.start()
-    assert locked_event.wait(timeout=10)
-
-    t_author = threading.Thread(target=author_adds_a_lesson)
-    t_author.start()
-    wait_until_a_backend_is_lock_blocked()
-
-    proceed_event.set()
-    t_pub.join(timeout=10)
-    t_author.join(timeout=10)
-
-    # The publisher's capture -- taken before the addition could land --
-    # must reflect the ORIGINAL single-lesson membership, never a
-    # half-added second lesson.
-    snapshot = publish_result["snapshot"]
-    lessons_payload = snapshot.payload["learning_path"]["modules"][0]["lessons"]
-    assert len(lessons_payload) == 1
-
-    # The addition is not lost -- it applies once the publisher is done.
-    assert LessonPage.objects.child_of(module).count() == 2
-
-
-# --- Correction C: publisher chronology matches actual capture order ----
-
-
-@pytest.mark.django_db(transaction=True)
-def test_concurrent_publisher_chronology_matches_actual_capture_order():
-    registry = _registry()
-
-    path = LearningPathPage(title="Linux Basics")
-    _root().add_child(instance=path)
-    module = ModulePage(title="Shell Basics")
-    path.add_child(instance=module)
-    lesson = LessonPage(title="The ls command")
-    lesson.body = [("heading", "OLD")]
-    module.add_child(instance=lesson)
-
-    p1_locked = threading.Event()
-    p1_proceed = threading.Event()
-    p1_result = {}
-
-    def on_p1_locked():
-        p1_locked.set()
-        p1_proceed.wait(timeout=10)
-
-    def p1_worker():
-        close_old_connections()
-        try:
-            p1_result["snapshot"] = publish_learning_path(path, registry, _on_captured=on_p1_locked)
-        finally:
-            connection.close()
-
-    t1 = threading.Thread(target=p1_worker)
-    t1.start()
-    assert p1_locked.wait(timeout=10)
-
-    def author_worker():
-        close_old_connections()
-        try:
-            with transaction.atomic():
-                lesson_obj = LessonPage.objects.get(pk=lesson.pk)
-                lesson_obj.body = [("heading", "NEW")]
-                lesson_obj.save_revision().publish()
-        finally:
-            connection.close()
-
-    t_author = threading.Thread(target=author_worker)
-    t_author.start()
-    wait_until_a_backend_is_lock_blocked()
-
-    p1_proceed.set()
-    t1.join(timeout=10)
-
-    # Sequenced, not raced: the second publisher only starts once the
-    # author's edit has fully committed, so v2's capture order is settled
-    # rather than left to chance against the author's own write -- both
-    # would otherwise queue for the same leaf row (see
-    # test_transient_deadlock_against_a_concurrent_author_transaction_is_retried_not_surfaced
-    # for what happens when they genuinely do race).
-    t_author.join(timeout=10)
-
-    second = publish_learning_path(LearningPathPage.objects.get(pk=path.pk), registry)
-
-    v1 = p1_result["snapshot"]
-    assert v1.version == 1
-    assert v1.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"] == "OLD"
-
-    assert second.version == 2
-    assert second.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"] == "NEW"
-
-
-# --- section 21: transient deadlock is retried, not surfaced ------------
-
-
-@pytest.mark.django_db(transaction=True)
-def test_transient_deadlock_against_a_concurrent_author_transaction_is_retried_not_surfaced():
-    registry = _registry()
-
-    path = LearningPathPage(title="Linux Basics")
-    _root().add_child(instance=path)
-    module = ModulePage(title="Shell Basics")
-    path.add_child(instance=module)
-    lesson = LessonPage(title="The ls command")
-    lesson.body = [("heading", "OLD")]
-    module.add_child(instance=lesson)
-
-    p1_locked = threading.Event()
-    p1_proceed = threading.Event()
-    p1_result = {}
-
-    def on_p1_locked():
-        p1_locked.set()
-        p1_proceed.wait(timeout=10)
-
-    def p1_worker():
-        close_old_connections()
-        try:
-            p1_result["snapshot"] = publish_learning_path(path, registry, _on_captured=on_p1_locked)
-        finally:
-            connection.close()
-
-    t1 = threading.Thread(target=p1_worker)
-    t1.start()
-    assert p1_locked.wait(timeout=10)
-
-    author_result = {}
-
-    def author_worker():
-        # Unlike publish_learning_path(), an ordinary Wagtail author save has
-        # no built-in retry -- that is out of Task 09's scope (publication
-        # owns its own retry; a real editor would just retry the save, same
-        # as with any concurrent write conflict). Either side of the two-way
-        # deadlock below can be the one PostgreSQL aborts, so this thread
-        # tolerates losing that race instead of asserting its own success --
-        # what this test actually verifies is that the PUBLISHER'S retry
-        # (in p2_worker) recovers.
-        close_old_connections()
-        try:
-            with transaction.atomic():
-                lesson_obj = LessonPage.objects.get(pk=lesson.pk)
-                lesson_obj.body = [("heading", "NEW")]
-                lesson_obj.save_revision().publish()
             author_result["committed"] = True
         except Exception as exc:  # noqa: BLE001
             author_result["error"] = exc
         finally:
             connection.close()
 
-    t_author = threading.Thread(target=author_worker)
+    t_author = threading.Thread(target=author_adds_a_lesson)
     t_author.start()
-    wait_until_a_backend_is_lock_blocked()
+    t_author.join(timeout=10)
+    assert author_result.get("committed") is True, author_result.get("error")
 
-    # Deliberately reproduce the transient deadlock: a second publisher
-    # approaches the same leaf row (root -> module -> lesson) from a
-    # different lock-acquisition path than the author's direct write, while
-    # BOTH are queued behind P1's still-held lock (confirmed via a second
-    # blocked-backend count, not a sleep).
+    proceed.set()
+    t_pub.join(timeout=10)
+
+    # The publisher's snapshot -- fixed before the addition committed --
+    # reflects the ORIGINAL single-lesson membership.
+    snapshot = publish_result["snapshot"]
+    lessons_payload = snapshot.payload["learning_path"]["modules"][0]["lessons"]
+    assert len(lessons_payload) == 1
+
+    # The addition is not lost -- it is visible afterward.
+    assert LessonPage.objects.child_of(module).count() == 2
+
+
+# --- publisher chronology: P2's snapshot begins only after the mutex -----
+
+
+@pytest.mark.django_db(transaction=True)
+def test_second_publisher_snapshot_begins_only_after_obtaining_the_mutex():
+    registry = _registry()
+
+    path = LearningPathPage(title="Linux Basics")
+    _root().add_child(instance=path)
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [("heading", "OLD")]
+    module.add_child(instance=lesson)
+
+    p1_snapshot_started = threading.Event()
+    p1_proceed = threading.Event()
+    p1_result = {}
+
+    def on_p1_snapshot_started():
+        p1_snapshot_started.set()
+        p1_proceed.wait(timeout=10)
+
+    def p1_worker():
+        close_old_connections()
+        try:
+            p1_result["snapshot"] = publish_learning_path(
+                path, registry, _on_snapshot_started=on_p1_snapshot_started
+            )
+        finally:
+            connection.close()
+
+    t1 = threading.Thread(target=p1_worker)
+    t1.start()
+    assert p1_snapshot_started.wait(timeout=10)
+
+    # A second publisher, requesting the SAME source, must queue on the
+    # mutex -- confirmed via real PostgreSQL wait state, not a guess.
     p2_result = {}
 
     def p2_worker():
@@ -421,23 +346,174 @@ def test_transient_deadlock_against_a_concurrent_author_transaction_is_retried_n
         try:
             reloaded_path = LearningPathPage.objects.get(pk=path.pk)
             p2_result["snapshot"] = publish_learning_path(reloaded_path, registry)
-        except Exception as exc:  # noqa: BLE001
-            p2_result["error"] = exc
         finally:
             connection.close()
 
     t2 = threading.Thread(target=p2_worker)
     t2.start()
-    wait_until_n_backends_are_lock_blocked(n=2)
+    wait_until_a_backend_is_advisory_lock_blocked()
+    assert_no_backend_is_row_lock_blocked()
+
+    # The author's edit runs and commits WHILE P1 holds the mutex and P2 is
+    # queued behind it -- and completes immediately, proving neither
+    # publisher holds any row lock.
+    def author_worker():
+        close_old_connections()
+        try:
+            lesson_obj = LessonPage.objects.get(pk=lesson.pk)
+            lesson_obj.body = [("heading", "NEW")]
+            lesson_obj.save_revision().publish()
+        finally:
+            connection.close()
+
+    t_author = threading.Thread(target=author_worker)
+    t_author.start()
+    t_author.join(timeout=10)
 
     p1_proceed.set()
     t1.join(timeout=10)
-    t_author.join(timeout=10)
     t2.join(timeout=15)
 
-    assert "error" not in p2_result, (
-        f"a transient deadlock surfaced instead of being retried: {p2_result.get('error')!r}"
+    v1 = p1_result["snapshot"]
+    assert v1.version == 1
+    assert v1.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"] == "OLD"
+
+    v2 = p2_result["snapshot"]
+    assert v2.version == 2
+    # P2 only acquired the mutex (and so only opened its own REPEATABLE READ
+    # snapshot) after P1 released it, which was after the author's commit --
+    # so P2's snapshot begins strictly after that commit and observes it.
+    assert v2.payload["learning_path"]["modules"][0]["lessons"][0]["blocks"][0]["value"] == "NEW"
+
+
+# --- different sources never share a lock key -----------------------------
+
+
+def test_different_sources_never_share_a_publication_mutex_key():
+    import uuid
+
+    a = uuid.uuid4()
+    b = uuid.uuid4()
+    assert _publication_mutex_key("learning_path", a) != _publication_mutex_key("learning_path", b)
+
+
+def test_same_source_always_derives_the_same_publication_mutex_key():
+    import uuid
+
+    source = uuid.uuid4()
+    assert _publication_mutex_key("learning_path", source) == _publication_mutex_key(
+        "learning_path", source
     )
-    assert p1_result["snapshot"].version == 1
-    assert p2_result["snapshot"].version == 2
-    assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 2
+
+
+# --- mutex failure safety (section 24) ------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_publisher_mutex_is_released_after_a_validation_failure_so_a_later_publish_does_not_hang():
+    registry = _registry()
+    definition = ActivityDefinition.objects.create(name="Fake activity", type_key="fake")
+    unpublished = create_activity_version(definition, config={})
+
+    path = LearningPathPage(title="Linux Basics")
+    _root().add_child(instance=path)
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [
+        (
+            "activity",
+            {"activity_public_id": str(definition.public_id), "activity_version": unpublished.version},
+        )
+    ]
+    module.add_child(instance=lesson)
+
+    with pytest.raises(ValueError):
+        publish_learning_path(path, registry)
+
+    # If the mutex were not released in `finally`, this second call for the
+    # SAME source would hang forever waiting on it.
+    publish_activity_version(unpublished, registry)
+    snapshot = publish_learning_path(path, registry)
+    assert snapshot.version == 1
+
+
+# --- section 22/23: no new retry requirement for ordinary Wagtail authors -
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_author_operations_complete_successfully_while_publication_is_active():
+    registry = _registry()
+
+    path = LearningPathPage(title="Linux Basics")
+    _root().add_child(instance=path)
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [("heading", "OLD")]
+    module.add_child(instance=lesson)
+    other_lesson = LessonPage(title="Another lesson")
+    other_lesson.body = [("heading", "Will move")]
+    module.add_child(instance=other_lesson)
+    other_module = ModulePage(title="Networking Basics")
+    path.add_child(instance=other_module)
+
+    snapshot_started = threading.Event()
+    proceed = threading.Event()
+    publish_result = {}
+
+    def on_snapshot_started():
+        snapshot_started.set()
+        proceed.wait(timeout=10)
+
+    def publisher():
+        close_old_connections()
+        try:
+            publish_result["snapshot"] = publish_learning_path(
+                path, registry, _on_snapshot_started=on_snapshot_started
+            )
+        finally:
+            connection.close()
+
+    t_pub = threading.Thread(target=publisher)
+    t_pub.start()
+    assert snapshot_started.wait(timeout=10)
+
+    author_errors = []
+
+    def run_author_op(fn):
+        close_old_connections()
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            author_errors.append(exc)
+        finally:
+            connection.close()
+
+    def op_edit():
+        lesson_obj = LessonPage.objects.get(pk=lesson.pk)
+        lesson_obj.body = [("heading", "NEW")]
+        lesson_obj.save_revision().publish()
+
+    def op_add_child():
+        module_obj = ModulePage.objects.get(pk=module.pk)
+        module_obj.add_child(instance=LessonPage(title="Added concurrently"))
+
+    def op_move():
+        moving_lesson = LessonPage.objects.get(pk=other_lesson.pk)
+        target_module = ModulePage.objects.get(pk=other_module.pk)
+        moving_lesson.move(target_module, pos="last-child")
+
+    threads = [threading.Thread(target=run_author_op, args=(op,)) for op in (op_edit, op_add_child, op_move)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert author_errors == [], f"author operations must not fail: {author_errors!r}"
+
+    proceed.set()
+    t_pub.join(timeout=10)
+
+    assert "error" not in publish_result
+    assert publish_result["snapshot"].version == 1

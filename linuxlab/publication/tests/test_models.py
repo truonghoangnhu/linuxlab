@@ -136,6 +136,72 @@ def test_queryset_update_cannot_mutate_an_existing_snapshot():
     assert reloaded.payload == {"a": 1}
 
 
+# --- Task 09 final corrective: _base_manager is guarded too ---------------
+# (a plain models.Manager() is Django's DEFAULT _base_manager regardless of
+# what `objects` is, unless Meta.base_manager_name says otherwise -- this
+# was a live bulk_create/update/bulk_update bypass around every guard above.)
+
+
+@pytest.mark.django_db
+def test_base_manager_bulk_create_cannot_fabricate_a_secret_bearing_snapshot():
+    source_public_id = uuid.uuid4()
+
+    with pytest.raises(ValueError):
+        PublicationSnapshot._base_manager.bulk_create(
+            [
+                PublicationSnapshot(
+                    kind="learning_path",
+                    source_public_id=source_public_id,
+                    version=50,
+                    payload={"answer_key": {"secret": True}},
+                    content_hash="0" * 64,
+                )
+            ]
+        )
+
+    assert PublicationSnapshot._base_manager.filter(source_public_id=source_public_id).count() == 0
+
+
+@pytest.mark.django_db
+def test_base_manager_update_cannot_forge_an_existing_snapshot():
+    original = _insert()
+
+    with pytest.raises(ValueError):
+        PublicationSnapshot._base_manager.filter(pk=original.pk).update(payload={"forged": True})
+
+    reloaded = PublicationSnapshot._base_manager.get(pk=original.pk)
+    assert reloaded.payload == {"a": 1}
+
+
+@pytest.mark.django_db
+def test_base_manager_bulk_update_cannot_mutate_an_existing_snapshot():
+    original = _insert()
+    original.payload = {"forged": True}  # in-memory only; never persisted
+
+    with pytest.raises(ValueError):
+        PublicationSnapshot._base_manager.bulk_update([original], ["payload"])
+
+    reloaded = PublicationSnapshot._base_manager.get(pk=original.pk)
+    assert reloaded.payload == {"a": 1}
+
+
+@pytest.mark.django_db
+def test_base_manager_reads_are_unaffected():
+    first = _insert()
+    second = _insert()
+
+    all_pks = set(PublicationSnapshot._base_manager.all().values_list("pk", flat=True))
+    assert {first.pk, second.pk} <= all_pks
+
+
+@pytest.mark.django_db
+def test_default_manager_is_also_guarded():
+    # _default_manager was already correct before this corrective; kept as
+    # a regression guard alongside the _base_manager fix above.
+    with pytest.raises(ValueError):
+        PublicationSnapshot._default_manager.bulk_create([_make_snapshot()])
+
+
 # --- controlled internal insertion still works as designed ----------------
 
 

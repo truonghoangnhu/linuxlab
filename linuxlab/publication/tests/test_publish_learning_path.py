@@ -56,7 +56,7 @@ def _simple_learning_path(title="Linux Basics"):
 # --- version allocation -----------------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_first_publish_is_version_one(registry):
     path = _simple_learning_path()
 
@@ -67,7 +67,7 @@ def test_first_publish_is_version_one(registry):
     assert snapshot.source_public_id == path.public_id
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_republish_creates_version_two(registry):
     path = _simple_learning_path()
     publish_learning_path(path, registry)
@@ -78,7 +78,7 @@ def test_republish_creates_version_two(registry):
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 2
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_different_learning_paths_each_start_at_version_one(registry):
     first = _simple_learning_path("Linux Basics")
     second = _simple_learning_path("Networking Basics")
@@ -93,7 +93,7 @@ def test_different_learning_paths_each_start_at_version_one(registry):
 # --- draft edit after publication does not mutate old snapshot --------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_editing_draft_after_publication_does_not_change_old_snapshot(registry):
     path = _simple_learning_path()
     module = ModulePage(title="Shell Basics")
@@ -126,7 +126,7 @@ def test_editing_draft_after_publication_does_not_change_old_snapshot(registry):
 # --- exact ActivityVersion pinning survives newer versions -------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_old_publication_still_references_original_activity_version_after_a_newer_one_publishes(
     definition, registry, published_version
 ):
@@ -161,7 +161,7 @@ def test_old_publication_still_references_original_activity_version_after_a_newe
 # --- failure: unpublished dependency blocks publication -----------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_publish_rejected_when_activity_reference_unpublished(definition, registry):
     unpublished = create_activity_version(definition, config={})
     path = _simple_learning_path()
@@ -185,7 +185,7 @@ def test_publish_rejected_when_activity_reference_unpublished(definition, regist
     assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 0
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_publish_succeeds_after_dependency_is_published(definition, registry):
     unpublished = create_activity_version(definition, config={})
     path = _simple_learning_path()
@@ -215,7 +215,7 @@ def test_publish_succeeds_after_dependency_is_published(definition, registry):
 # --- hash trust (section 10/34) -----------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_persisted_hash_independently_matches_recomputed_sha256_of_persisted_payload(registry):
     path = _simple_learning_path()
     module = ModulePage(title="Shell Basics")
@@ -231,7 +231,7 @@ def test_persisted_hash_independently_matches_recomputed_sha256_of_persisted_pay
     assert reloaded.content_hash == independently_computed
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_republishing_unchanged_content_gets_a_new_version_but_the_same_hash(registry):
     path = _simple_learning_path()
 
@@ -246,7 +246,7 @@ def test_republishing_unchanged_content_gets_a_new_version_but_the_same_hash(reg
 # --- learner safety (section 27) ----------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_persisted_payload_reloaded_from_db_contains_no_learner_unsafe_fields(registry):
     path = _simple_learning_path()
     module = ModulePage(title="Shell Basics")

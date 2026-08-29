@@ -37,7 +37,7 @@ def _root():
     return get_or_create_root_page()
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_real_content_publication_with_assessment_activity_end_to_end():
     # 1. structured Lesson content
     path = LearningPathPage(title="Linux Basics")
@@ -121,7 +121,7 @@ def test_real_content_publication_with_assessment_activity_end_to_end():
     assert reloaded.content_hash == original_hash
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_required_failure_integration_unpublished_dependency_then_success():
     # Failure integration (Task 09 §48): reference an unpublished
     # ActivityVersion, confirm publication is rejected with no snapshot

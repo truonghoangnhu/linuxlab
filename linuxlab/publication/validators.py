@@ -55,7 +55,8 @@ def _validate_activity_reference(value, activity_registry):
 
 def validate_captured_learning_path(capture, activity_registry):
     """Validate a capture_learning_path() structure -- the frozen tree
-    captured under lock -- never the live Wagtail tree.
+    captured under one REPEATABLE READ MVCC snapshot -- never the live
+    Wagtail tree.
 
     Task 09 correction (TOCTOU, Critical 2): validation and persistence must
     observe exactly the same captured state, so this never reads Wagtail
@@ -70,14 +71,22 @@ def validate_captured_learning_path(capture, activity_registry):
 
 def validate_learning_path(learning_path_page, activity_registry):
     """Standalone convenience validator: captures a fresh coherent snapshot
-    of the tree under lock and validates it in one step.
+    of the tree and validates it in one step.
 
     publish_learning_path() does NOT call this -- it performs its own single
-    capture_learning_path() call and reuses that exact structure for both
-    validation and persistence, so validation and the persisted payload can
-    never diverge (Task 09 correction, Critical 2).
+    capture_learning_path() call, inside its own REPEATABLE READ transaction,
+    and reuses that exact structure for both validation and persistence, so
+    validation and the persisted payload can never diverge (Task 09
+    correction, Critical 2). This wrapper is read-only, so unlike
+    publish_learning_path() it does not need the publisher mutex -- there is
+    nothing here for a second caller to race against.
     """
-    from linuxlab.publication.snapshots import capture_learning_path
+    from django.db import transaction
 
-    capture = capture_learning_path(learning_path_page)
+    from linuxlab.publication.snapshots import _set_repeatable_read, capture_learning_path
+
+    with transaction.atomic():
+        _set_repeatable_read()
+        capture = capture_learning_path(learning_path_page)
+
     validate_captured_learning_path(capture, activity_registry)

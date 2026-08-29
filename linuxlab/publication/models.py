@@ -6,12 +6,13 @@ from django.db.models import Q
 
 
 class PublicationSnapshotQuerySet(models.QuerySet):
-    """Blocks the two bulk write paths that never call Model.save() and so
-    would otherwise bypass PublicationSnapshot.save()'s unconditional
-    rejection below (Task 09 corrective, Critical 1): QuerySet.bulk_create()
-    builds rows with a raw multi-row INSERT, and QuerySet.update() issues a
-    raw UPDATE against already-matched rows -- neither ever routes through
-    the model's overridden save().
+    """Blocks the bulk write paths that never call Model.save() and so would
+    otherwise bypass PublicationSnapshot.save()'s unconditional rejection
+    below (Task 09 corrective, Critical 1): QuerySet.bulk_create() builds
+    rows with a raw multi-row INSERT, and QuerySet.update()/bulk_update()
+    issue raw UPDATEs against already-matched rows -- none of these ever
+    route through the model's overridden save(). This queryset only guards
+    writes; every read method (all(), filter(), get(), ...) is untouched.
     """
 
     def bulk_create(self, objs, *args, **kwargs):
@@ -23,6 +24,12 @@ class PublicationSnapshotQuerySet(models.QuerySet):
     def update(self, **kwargs):
         raise ValueError(
             "PublicationSnapshot cannot be mutated through QuerySet.update(); "
+            "publication snapshots are immutable once created"
+        )
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        raise ValueError(
+            "PublicationSnapshot cannot be mutated through QuerySet.bulk_update(); "
             "publication snapshots are immutable once created"
         )
 
@@ -43,9 +50,15 @@ class PublicationSnapshot(models.Model):
     application code cannot create a row here AT ALL, not even a first,
     otherwise-valid one -- save() unconditionally rejects (which also blocks
     Manager.create()/get_or_create()/update_or_create(), since those all
-    call save() internally), and PublicationSnapshotQuerySet blocks the two
-    write paths that don't. The publication service is the sole legitimate
-    writer; it inserts through
+    call save() internally), and PublicationSnapshotQuerySet blocks the
+    write paths that don't. That guard is bound to EVERY manager Django
+    exposes, not just `objects`: base_manager_name (Meta, below) makes
+    `_base_manager` -- otherwise a bare, unguarded models.Manager() by
+    Django's default, regardless of what `objects` is -- resolve to this
+    same guarded queryset too, closing a live bulk_create()/update()/
+    bulk_update() bypass a prior corrective missed (`_default_manager` was
+    always guarded; `_base_manager` was not). The publication service is
+    the sole legitimate writer; it inserts through
     linuxlab.publication.snapshots._insert_published_snapshot(), which
     deliberately bypasses save() via Model.save_base() -- the same bypass
     spirit as Task 07's controlled QuerySet.update() for Attempt -- and only
@@ -63,6 +76,17 @@ class PublicationSnapshot(models.Model):
     objects = models.Manager.from_queryset(PublicationSnapshotQuerySet)()
 
     class Meta:
+        # Without this, Model._base_manager defaults to a bare, unguarded
+        # models.Manager() regardless of what `objects` is -- Django only
+        # uses the first declared manager for _default_manager, not
+        # _base_manager (Task 09 corrective, Critical: _base_manager was a
+        # live bulk_create/update/bulk_update bypass). Pointing
+        # base_manager_name at the SAME guarded manager closes it without
+        # a second manager class or a filtering base manager -- reads via
+        # _base_manager (used internally by e.g. delete() collectors and
+        # relation traversal) are completely unaffected, since
+        # PublicationSnapshotQuerySet only overrides write paths.
+        base_manager_name = "objects"
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.UniqueConstraint(
                 fields=["kind", "source_public_id", "version"],
