@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "linuxlab.assessment",
     "linuxlab.quiz",
     "linuxlab.learning",
+    "linuxlab.publication",
 ]
 
 MIDDLEWARE = [
