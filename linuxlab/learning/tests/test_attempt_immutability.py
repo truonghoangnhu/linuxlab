@@ -2,6 +2,7 @@ import threading
 
 import pytest
 from django.db import close_old_connections, connection
+from django.utils import timezone
 
 from linuxlab.activities.models import ActivityDefinition
 from linuxlab.activities.registry import ActivityRegistry
@@ -155,6 +156,102 @@ def test_first_submission_transition_still_succeeds(learner, published_version, 
     reloaded = Attempt.objects.get(pk=attempt.pk)
     assert reloaded.submitted_at is not None
     assert reloaded.submission == "ls"
+
+
+# --- F: ordinary save cannot perform the first-submission transition ------
+
+
+@pytest.mark.django_db
+def test_ordinary_save_cannot_first_submit_an_attempt(learner, published_version):
+    from linuxlab.learning.models import Progress, Result
+
+    attempt = start_attempt(learner, published_version)
+
+    attempt.submission = {"anything": "value"}
+    attempt.submitted_at = timezone.now()
+    with pytest.raises(ValueError):
+        attempt.save()
+
+    reloaded = Attempt.objects.get(pk=attempt.pk)
+    assert reloaded.submission is None
+    assert reloaded.submitted_at is None
+    assert Result.objects.filter(attempt=reloaded).count() == 0
+    assert Progress.objects.filter(learner=learner, activity_definition=published_version.definition).exists() is False
+
+
+# --- G: creation cannot fabricate already-submitted state ------------------
+
+
+@pytest.mark.django_db
+def test_create_with_submission_and_submitted_at_is_rejected(learner, published_version):
+    with pytest.raises(ValueError):
+        Attempt.objects.create(
+            learner=learner,
+            activity_version=published_version,
+            submission={"x": 1},
+            submitted_at=timezone.now(),
+        )
+
+    assert Attempt.objects.filter(learner=learner, activity_version=published_version).count() == 0
+
+
+@pytest.mark.django_db
+def test_create_with_only_submission_is_rejected(learner, published_version):
+    with pytest.raises(ValueError):
+        Attempt.objects.create(
+            learner=learner,
+            activity_version=published_version,
+            submission={"x": 1},
+        )
+
+    assert Attempt.objects.filter(learner=learner, activity_version=published_version).count() == 0
+
+
+@pytest.mark.django_db
+def test_create_with_only_submitted_at_is_rejected(learner, published_version):
+    with pytest.raises(ValueError):
+        Attempt.objects.create(
+            learner=learner,
+            activity_version=published_version,
+            submitted_at=timezone.now(),
+        )
+
+    assert Attempt.objects.filter(learner=learner, activity_version=published_version).count() == 0
+
+
+# --- H: submit_attempt() still performs its one legitimate transition -----
+
+
+@pytest.mark.django_db
+def test_submit_attempt_still_works_end_to_end_after_boundary_hardening(
+    learner, published_version, registry
+):
+    from linuxlab.core.models import DomainEvent
+    from linuxlab.learning.models import Progress, Result
+
+    attempt = start_attempt(learner, published_version)
+    result = submit_attempt(attempt, "ls", registry)
+
+    reloaded = Attempt.objects.get(pk=attempt.pk)
+    assert reloaded.submission == "ls"
+    assert reloaded.submitted_at is not None
+
+    assert Result.objects.filter(attempt=reloaded).count() == 1
+    assert Result.objects.get(attempt=reloaded).pk == result.pk
+
+    assert Progress.objects.filter(
+        learner=learner, activity_definition=published_version.definition
+    ).exists() is True
+
+    assert (
+        DomainEvent.objects.filter(
+            event_type="activity.completed", aggregate_id=reloaded.public_id
+        ).count()
+        == 1
+    )
+
+    with pytest.raises(ValueError):
+        submit_attempt(attempt, "ls", registry)
 
 
 # --- stale pre-submit object cannot overwrite committed history -----------

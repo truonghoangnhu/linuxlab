@@ -73,9 +73,24 @@ def submit_attempt(attempt, submission, registry):
         outcome = provider.evaluate(activity_version.config, submission)
         score, max_score = _validate_provider_outcome(outcome)
 
+        # Deliberate, narrow bypass of Attempt.save()'s guard: finalization
+        # is the ONE service-owned write path, so it persists the first
+        # submission transition through a conditional QuerySet.update()
+        # rather than an ordinary save() (which now rejects this transition
+        # unconditionally, on purpose). The row is already select_for_update
+        # locked above, so this update is not itself a race; the
+        # submitted_at__isnull=True filter plus the row-count check are a
+        # defensive assertion of that invariant, not the actual guard.
+        submitted_at = timezone.now()
+        updated = Attempt.objects.filter(pk=locked_attempt.pk, submitted_at__isnull=True).update(
+            submission=submission,
+            submitted_at=submitted_at,
+        )
+        if updated != 1:
+            raise ValueError("Attempt has already been submitted")
+
         locked_attempt.submission = submission
-        locked_attempt.submitted_at = timezone.now()
-        locked_attempt.save(update_fields=["submission", "submitted_at"])
+        locked_attempt.submitted_at = submitted_at
 
         result = Result.objects.create(
             attempt=locked_attempt,

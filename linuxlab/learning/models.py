@@ -8,7 +8,13 @@ from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 from linuxlab.core.models import StableIdentityModel
 from linuxlab.identity.models import Learner
 
-_ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS = ("learner_id", "activity_version_id", "started_at")
+_ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS = (
+    "learner_id",
+    "activity_version_id",
+    "started_at",
+    "submission",
+    "submitted_at",
+)
 
 
 class Attempt(StableIdentityModel):
@@ -36,14 +42,24 @@ class Attempt(StableIdentityModel):
     submission = models.JSONField(null=True, blank=True)
 
     def save(self, *args, **kwargs):
-        # Attempt is historical evidence (ADR-003): learner/activity_version/
-        # started_at never change after creation, and once submitted_at is
-        # set, submission/submitted_at become immutable too. The check reads
-        # the LOCKED persisted row, not this possibly-stale in-memory
+        # Attempt is historical evidence (ADR-003), and finalization is
+        # SERVICE-ONLY: submission/submitted_at are owned entirely by
+        # submit_attempt(), never by ordinary save(). A new Attempt must
+        # always start unsubmitted; an existing Attempt's learner/
+        # activity_version/started_at/submission/submitted_at can never
+        # change through this method at all, submitted or not. The check
+        # reads the LOCKED persisted row, not this possibly-stale in-memory
         # instance, so a stale pre-submit copy can never overwrite state a
         # concurrent submit_attempt() already committed (Task 05/06 lesson:
         # ActivityVersion.save()/QuestionVersion.save() use the same pattern).
+        # submit_attempt() bypasses this guard deliberately via a controlled
+        # QuerySet.update() rather than calling save() for the transition.
         if self.pk is None:
+            if self.submission is not None or self.submitted_at is not None:
+                raise ValueError(
+                    "a new Attempt must be created unsubmitted "
+                    "(submission/submitted_at must be None; use submit_attempt())"
+                )
             super().save(*args, **kwargs)
             return
 
@@ -60,12 +76,7 @@ class Attempt(StableIdentityModel):
 
             for field in _ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS:
                 if getattr(self, field) != locked[field]:
-                    raise ValueError(f"Attempt.{field} is immutable after creation")
-
-            if locked["submitted_at"] is not None and (
-                self.submission != locked["submission"] or self.submitted_at != locked["submitted_at"]
-            ):
-                raise ValueError("submitted Attempt history is immutable")
+                    raise ValueError(f"Attempt.{field} is immutable via normal save")
 
             super().save(*args, **kwargs)
 
