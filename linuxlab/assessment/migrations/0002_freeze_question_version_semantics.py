@@ -10,29 +10,24 @@ def backfill_type_key_and_scoring(apps, schema_editor):
     QuestionVersion/SingleChoiceProvider implemented before this migration.
     """
     QuestionVersion = apps.get_model("assessment", "QuestionVersion")
+    db_alias = schema_editor.connection.alias
 
-    for version in QuestionVersion.objects.select_related("question").iterator():
+    versions = QuestionVersion.objects.using(db_alias).select_related("question")
+    for version in versions.iterator():
         version.type_key = version.question.type_key
         version.scoring = {"max_score": 1}
-        version.save(update_fields=["type_key", "scoring"])
-
-
-def backfill_question_type_key(apps, schema_editor):
-    """Best-effort reverse: restore each Question.type_key from its most
-    recent QuestionVersion (versions may legitimately diverge in type_key
-    going forward, so this is a lossy but reasonable reconstruction for a
-    migration that is not expected to run backward in normal operation).
-    """
-    Question = apps.get_model("assessment", "Question")
-
-    for question in Question.objects.iterator():
-        latest_version = question.versions.order_by("-version").first()
-        if latest_version is not None:
-            question.type_key = latest_version.type_key
-            question.save(update_fields=["type_key"])
+        version.save(using=db_alias, update_fields=["type_key", "scoring"])
 
 
 class Migration(migrations.Migration):
+    """Provider identity moves from Question (one mutable value) to
+    QuestionVersion (frozen per version). Versions of the same Question may
+    legitimately carry different type_key values going forward, and a
+    Question with zero versions has no version-level type_key at all -
+    neither case can be losslessly collapsed back into one required
+    Question.type_key. This migration is therefore deliberately irreversible
+    rather than pretending a lossy or arbitrary reverse mapping is safe.
+    """
 
     dependencies = [
         ("assessment", "0001_initial"),
@@ -51,20 +46,11 @@ class Migration(migrations.Migration):
             name="scoring",
             field=models.JSONField(null=True),
         ),
-        # Stage 2: re-add Question.type_key as nullable temporarily so the
-        # reverse migration has somewhere to write the reconstructed value;
-        # forward, this is immediately backfilled from itself (a no-op) and
-        # then removed in stage 4.
-        migrations.AlterField(
-            model_name="question",
-            name="type_key",
-            field=models.CharField(max_length=100, null=True),
-        ),
-        # Stage 3: backfill from the historical models, then require the
-        # fields going forward.
+        # Stage 2: backfill from the historical models, then require the
+        # fields going forward. Irreversible: see the migration docstring.
         migrations.RunPython(
             backfill_type_key_and_scoring,
-            reverse_code=backfill_question_type_key,
+            reverse_code=None,
         ),
         migrations.AlterField(
             model_name="questionversion",
@@ -76,7 +62,7 @@ class Migration(migrations.Migration):
             name="scoring",
             field=models.JSONField(),
         ),
-        # Stage 4: Question.type_key is no longer authoritative now that
+        # Stage 3: Question.type_key is no longer authoritative now that
         # every QuestionVersion carries its own frozen type_key.
         migrations.RemoveField(
             model_name="question",
