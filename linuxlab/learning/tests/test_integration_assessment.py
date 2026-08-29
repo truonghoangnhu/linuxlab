@@ -25,6 +25,16 @@ CONTENT = {
 ANSWER_KEY = {"correct_option_id": "a"}
 SCORING = {"max_score": 1}
 
+SECOND_CONTENT = {
+    "prompt": "Which command prints the working directory?",
+    "options": [
+        {"id": "x", "text": "pwd"},
+        {"id": "y", "text": "cd"},
+    ],
+}
+SECOND_ANSWER_KEY = {"correct_option_id": "x"}
+SECOND_SCORING = {"max_score": 1}
+
 
 @pytest.fixture
 def question_registry():
@@ -68,6 +78,19 @@ def published_assessment_activity(db, published_question, activity_registry):
         },
     )
     return publish_activity_version(version, activity_registry)
+
+
+@pytest.fixture
+def second_published_question(db, question_registry):
+    question = Question.objects.create(name="Shell basics Q2")
+    version = create_question_version(
+        question,
+        type_key="single_choice",
+        content=SECOND_CONTENT,
+        answer_key=SECOND_ANSWER_KEY,
+        scoring=SECOND_SCORING,
+    )
+    return publish_question_version(version, question_registry)
 
 
 @pytest.fixture
@@ -139,3 +162,78 @@ def test_no_answer_key_material_in_result_records(learner, published_assessment_
         dumped = json.dumps(stored.details)
         assert "answer_key" not in dumped
         assert "correct_option_id" not in dumped
+
+
+# --- completion_threshold with the real AssessmentActivityProvider --------
+
+
+def _two_question_config(q1, q2, **extra):
+    return {
+        "questions": [
+            {"question_public_id": str(q1.question.public_id), "question_version": q1.version},
+            {"question_public_id": str(q2.question.public_id), "question_version": q2.version},
+        ],
+        **extra,
+    }
+
+
+def _one_correct_one_incorrect_submission(q1, q2):
+    return {
+        "responses": [
+            {
+                "question_public_id": str(q1.question.public_id),
+                "question_version": q1.version,
+                "selected_option_id": "a",  # correct
+            },
+            {
+                "question_public_id": str(q2.question.public_id),
+                "question_version": q2.version,
+                "selected_option_id": "y",  # incorrect
+            },
+        ]
+    }
+
+
+@pytest.mark.django_db
+def test_real_assessment_completion_threshold_allows_partial_score_to_complete(
+    learner, published_question, second_published_question, activity_registry
+):
+    definition = ActivityDefinition.objects.create(name="Shell quiz (lenient)", type_key="assessment")
+    version = create_activity_version(
+        definition,
+        config=_two_question_config(published_question, second_published_question, completion_threshold=0.5),
+    )
+    published = publish_activity_version(version, activity_registry)
+
+    attempt = start_attempt(learner, published)
+    submission = _one_correct_one_incorrect_submission(published_question, second_published_question)
+    result = submit_attempt(attempt, submission, activity_registry)
+
+    assert result.score == 1
+    assert result.max_score == 2
+
+    progress = Progress.objects.get(learner=learner, activity_definition=definition)
+    assert progress.completed is True
+    assert progress.best_score == 1
+
+
+@pytest.mark.django_db
+def test_real_assessment_without_threshold_uses_default_full_score_requirement(
+    learner, published_question, second_published_question, activity_registry
+):
+    definition = ActivityDefinition.objects.create(name="Shell quiz (default)", type_key="assessment")
+    version = create_activity_version(
+        definition, config=_two_question_config(published_question, second_published_question)
+    )
+    published = publish_activity_version(version, activity_registry)
+
+    attempt = start_attempt(learner, published)
+    submission = _one_correct_one_incorrect_submission(published_question, second_published_question)
+    result = submit_attempt(attempt, submission, activity_registry)
+
+    assert result.score == 1
+    assert result.max_score == 2
+
+    progress = Progress.objects.get(learner=learner, activity_definition=definition)
+    assert progress.completed is False
+    assert progress.best_score == 1

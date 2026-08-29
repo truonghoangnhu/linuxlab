@@ -258,6 +258,88 @@ def test_duplicate_configured_question_refs_are_rejected(published_question, que
         provider.validate_config(config)
 
 
+# --- completion_threshold (Task 07 corrective integration) ----------------
+
+
+@pytest.mark.django_db
+def test_valid_completion_threshold_is_accepted(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {**_config_for(published_question), "completion_threshold": 0.5}
+
+    provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_integer_completion_threshold_is_accepted(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {**_config_for(published_question), "completion_threshold": 1}
+
+    provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_boolean_completion_threshold_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {**_config_for(published_question), "completion_threshold": True}
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_string_completion_threshold_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {**_config_for(published_question), "completion_threshold": "0.5"}
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_out_of_range_completion_threshold_is_rejected(published_question, question_registry):
+    provider = AssessmentActivityProvider(question_registry)
+
+    with pytest.raises(ValueError):
+        provider.validate_config({**_config_for(published_question), "completion_threshold": 1.5})
+
+    with pytest.raises(ValueError):
+        provider.validate_config({**_config_for(published_question), "completion_threshold": -0.1})
+
+
+@pytest.mark.django_db
+def test_completion_threshold_does_not_reopen_arbitrary_config_fields(
+    published_question, question_registry
+):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        **_config_for(published_question),
+        "completion_threshold": 0.5,
+        "answer_key": {"secret": "SERVER_SECRET"},
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
+@pytest.mark.django_db
+def test_completion_threshold_cannot_be_placed_on_a_question_reference(
+    published_question, question_registry
+):
+    provider = AssessmentActivityProvider(question_registry)
+    config = {
+        "questions": [
+            {
+                "question_public_id": str(published_question.question.public_id),
+                "question_version": published_question.version,
+                "completion_threshold": 0.5,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError):
+        provider.validate_config(config)
+
+
 # --- evaluate --------------------------------------------------------------
 
 

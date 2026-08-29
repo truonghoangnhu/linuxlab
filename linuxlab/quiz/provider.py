@@ -3,7 +3,7 @@ import uuid
 from linuxlab.assessment.models import QuestionVersion
 from linuxlab.assessment.services import get_question_version, serialize_question_for_learner
 
-_CONFIG_KEYS = {"questions"}
+_CONFIG_KEYS = {"questions", "completion_threshold"}
 _QUESTION_REF_KEYS = {"question_public_id", "question_version"}
 
 
@@ -11,6 +11,18 @@ def _is_exact_version(value):
     # type(x) is int, not isinstance(x, int): isinstance(True, int) is True in
     # Python, which would let question_version=True silently match version 1.
     return type(value) is int and value >= 1
+
+
+def _validate_completion_threshold(value):
+    # type(x) in (int, float), not isinstance: isinstance(True, int) is True
+    # in Python, which would let completion_threshold=True silently pass as
+    # 1.0 (Task 07 corrective). Range/type semantics match the only existing
+    # convention: the generic learning-state projection reads this as a
+    # score/max_score ratio in [0, 1] (linuxlab.learning.projections).
+    if type(value) not in (int, float):
+        raise ValueError("completion_threshold must be a number")
+    if not (0 <= value <= 1):
+        raise ValueError("completion_threshold must be between 0 and 1")
 
 
 def _parse_question_ref(item):
@@ -71,6 +83,9 @@ class AssessmentActivityProvider:
         questions = config.get("questions")
         if not isinstance(questions, list) or not questions:
             raise ValueError("config must contain a non-empty 'questions' list")
+
+        if "completion_threshold" in config:
+            _validate_completion_threshold(config["completion_threshold"])
 
         seen_refs = set()
         for item in questions:

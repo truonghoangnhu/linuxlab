@@ -115,6 +115,23 @@ def test_stricter_threshold_in_a_later_version_does_not_retroactively_apply(
     assert progress.completed is False
 
 
+@pytest.mark.django_db
+def test_boolean_completion_threshold_in_config_does_not_silently_apply(
+    learner, definition, registry
+):
+    # A provider that (unlike AssessmentActivityProvider) does not validate
+    # completion_threshold could still let a bool through. The generic
+    # projection layer must not treat False as a valid 0-threshold (which
+    # would make ANY score "complete") purely because False == 0 in Python.
+    version = create_activity_version(definition, config={"completion_threshold": False})
+    published = publish_activity_version(version, registry)
+
+    _submit(learner, published, registry, score=0, max_score=5)
+
+    progress = Progress.objects.get(learner=learner, activity_definition=definition)
+    assert progress.completed is False
+
+
 # --- delete + rebuild is a correctness oracle (load-bearing) -------------
 
 
@@ -177,3 +194,87 @@ def test_rebuild_progress_removes_stale_row_when_results_no_longer_exist(
     rebuild_progress(learner=learner, activity_definition=definition)
 
     assert Progress.objects.filter(learner=learner, activity_definition=definition).exists() is False
+
+
+# --- rebuild must prune stale/orphaned Progress rows (corrective) ---------
+
+
+@pytest.mark.django_db
+def test_rebuild_progress_prunes_orphaned_row_with_no_result_history_at_all(learner, definition):
+    # A Progress row that never had backing Results (e.g. created by a bad
+    # script, or left behind after unrelated data cleanup). A true rebuild
+    # must converge to the authoritative projection, which has no row here.
+    Progress.objects.create(learner=learner, activity_definition=definition, completed=True, best_score=99)
+
+    rebuild_progress()
+
+    assert Progress.objects.filter(learner=learner, activity_definition=definition).exists() is False
+
+
+@pytest.mark.django_db
+def test_unscoped_rebuild_prunes_stale_rows_and_recomputes_valid_ones(
+    learner, definition, published_version, registry
+):
+    _submit(learner, published_version, registry, score=1, max_score=1)
+    valid_progress = Progress.objects.get(learner=learner, activity_definition=definition)
+
+    other_learner = Learner.objects.create(account=None)
+    Progress.objects.create(
+        learner=other_learner, activity_definition=definition, completed=True, best_score=42
+    )
+
+    rebuild_progress()
+
+    reloaded_valid = Progress.objects.get(pk=valid_progress.pk)
+    assert reloaded_valid.completed == valid_progress.completed
+    assert reloaded_valid.best_score == valid_progress.best_score
+    assert (
+        Progress.objects.filter(learner=other_learner, activity_definition=definition).exists()
+        is False
+    )
+
+    # Authoritative history itself must be untouched.
+    from linuxlab.learning.models import Attempt, Result
+
+    assert Attempt.objects.filter(learner=learner).count() == 1
+    assert Result.objects.filter(attempt__learner=learner).count() == 1
+
+    # Idempotent: running again yields the same final state, no duplicates.
+    rebuild_progress()
+    assert Progress.objects.filter(learner=learner, activity_definition=definition).count() == 1
+    reloaded_again = Progress.objects.get(learner=learner, activity_definition=definition)
+    assert reloaded_again.completed == valid_progress.completed
+    assert reloaded_again.best_score == valid_progress.best_score
+
+
+@pytest.mark.django_db
+def test_filtered_rebuild_by_learner_prunes_only_that_learners_stale_rows(learner, definition):
+    other_learner = Learner.objects.create(account=None)
+    Progress.objects.create(learner=learner, activity_definition=definition, completed=True, best_score=1)
+    Progress.objects.create(
+        learner=other_learner, activity_definition=definition, completed=True, best_score=2
+    )
+
+    rebuild_progress(learner=learner)
+
+    assert Progress.objects.filter(learner=learner, activity_definition=definition).exists() is False
+    assert Progress.objects.filter(learner=other_learner, activity_definition=definition).exists() is True
+
+
+@pytest.mark.django_db
+def test_filtered_rebuild_by_activity_definition_prunes_only_that_definitions_stale_rows(
+    learner, definition
+):
+    other_definition = ActivityDefinition.objects.create(name="Other activity", type_key="scored")
+    Progress.objects.create(learner=learner, activity_definition=definition, completed=True, best_score=1)
+    Progress.objects.create(
+        learner=learner, activity_definition=other_definition, completed=True, best_score=2
+    )
+
+    rebuild_progress(activity_definition=definition)
+
+    assert Progress.objects.filter(learner=learner, activity_definition=definition).exists() is False
+    assert (
+        Progress.objects.filter(learner=learner, activity_definition=other_definition).exists()
+        is True
+    )

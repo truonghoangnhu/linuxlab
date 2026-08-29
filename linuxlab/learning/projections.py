@@ -8,9 +8,24 @@ from linuxlab.learning.models import Progress, Result
 DEFAULT_COMPLETION_THRESHOLD = 1.0
 
 
+def _resolve_completion_threshold(config):
+    raw_threshold = config.get("completion_threshold", DEFAULT_COMPLETION_THRESHOLD)
+
+    # type(x) in (int, float), not isinstance: isinstance(True, int) is True
+    # in Python, so an unvalidated provider config could let a bool through
+    # (e.g. completion_threshold=False == 0, silently making ANY score
+    # "complete"). Not every ActivityProvider validates this key as strictly
+    # as AssessmentActivityProvider does, so the generic layer that actually
+    # applies it stays defensive and falls back to the default instead.
+    if type(raw_threshold) not in (int, float) or not (0 <= raw_threshold <= 1):
+        return DEFAULT_COMPLETION_THRESHOLD
+
+    return raw_threshold
+
+
 def _meets_completion_threshold(result):
     config = result.attempt.activity_version.config or {}
-    threshold = config.get("completion_threshold", DEFAULT_COMPLETION_THRESHOLD)
+    threshold = _resolve_completion_threshold(config)
 
     if result.max_score <= 0:
         return threshold <= 0
@@ -85,26 +100,51 @@ def refresh_progress(learner_id, activity_definition_id):
         return progress
 
 
-def rebuild_progress(*, learner=None, activity_definition=None):
-    """Rebuild Progress solely from authoritative Attempt/Result history.
+def _rebuild_pairs(learner_id, activity_definition_id):
+    """Every (learner_id, activity_definition_id) pair a rebuild must visit
+    within the given scope: the union of pairs backed by Result history AND
+    pairs that currently have a Progress row.
 
-    With no arguments, rebuilds every (learner, activity_definition) pair
-    that has Result history -- this is what makes "delete all Progress rows,
-    then rebuild" a correctness oracle (Task 07 load-bearing invariant).
+    Including existing-Progress pairs (not just Result-backed ones) is what
+    lets a rebuild PRUNE a stale/orphaned Progress row that has no
+    authoritative history left -- refresh_progress() already deletes such a
+    row once it's asked to look at it; the defect being fixed here was that
+    an unscoped/filtered rebuild previously never asked.
     """
-    if (learner is None) != (activity_definition is None):
-        raise ValueError("learner and activity_definition must be provided together")
+    result_pairs = Result.objects.values_list(
+        "attempt__learner_id", "attempt__activity_version__definition_id"
+    ).distinct()
+    progress_pairs = Progress.objects.values_list("learner_id", "activity_definition_id").distinct()
 
-    if learner is not None:
-        pairs = [(learner.pk, activity_definition.pk)]
-    else:
-        pairs = list(
-            Result.objects.values_list(
-                "attempt__learner_id", "attempt__activity_version__definition_id"
-            )
-            .distinct()
-            .order_by()
-        )
+    if learner_id is not None:
+        result_pairs = result_pairs.filter(attempt__learner_id=learner_id)
+        progress_pairs = progress_pairs.filter(learner_id=learner_id)
+    if activity_definition_id is not None:
+        result_pairs = result_pairs.filter(attempt__activity_version__definition_id=activity_definition_id)
+        progress_pairs = progress_pairs.filter(activity_definition_id=activity_definition_id)
 
-    for learner_id, activity_definition_id in pairs:
-        refresh_progress(learner_id, activity_definition_id)
+    return set(result_pairs) | set(progress_pairs)
+
+
+def rebuild_progress(*, learner=None, activity_definition=None):
+    """Rebuild Progress solely from authoritative Attempt/Result history,
+    within the given scope.
+
+    - both None: full rebuild -- every pair with Result history and every
+      pair with an existing Progress row, anywhere.
+    - learner only / activity_definition only: every matching pair for that
+      learner / that definition, respectively.
+    - both given: exactly that one pair.
+
+    A pair that currently has NO Result history is still visited (via the
+    existing-Progress half of the scope) so refresh_progress() can prune it:
+    old Progress values are never used as rebuild input, only as a signal
+    that the pair needs to be checked against current authoritative history.
+    """
+    learner_id = learner.pk if learner is not None else None
+    activity_definition_id = activity_definition.pk if activity_definition is not None else None
+
+    pairs = _rebuild_pairs(learner_id, activity_definition_id)
+
+    for pair_learner_id, pair_activity_definition_id in pairs:
+        refresh_progress(pair_learner_id, pair_activity_definition_id)

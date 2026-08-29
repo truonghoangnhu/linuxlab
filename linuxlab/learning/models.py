@@ -1,12 +1,14 @@
 from typing import ClassVar
 
 from django.core.validators import MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 from linuxlab.core.models import StableIdentityModel
 from linuxlab.identity.models import Learner
+
+_ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS = ("learner_id", "activity_version_id", "started_at")
 
 
 class Attempt(StableIdentityModel):
@@ -32,6 +34,40 @@ class Attempt(StableIdentityModel):
     started_at = models.DateTimeField(auto_now_add=True)
     submitted_at = models.DateTimeField(null=True, blank=True)
     submission = models.JSONField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        # Attempt is historical evidence (ADR-003): learner/activity_version/
+        # started_at never change after creation, and once submitted_at is
+        # set, submission/submitted_at become immutable too. The check reads
+        # the LOCKED persisted row, not this possibly-stale in-memory
+        # instance, so a stale pre-submit copy can never overwrite state a
+        # concurrent submit_attempt() already committed (Task 05/06 lesson:
+        # ActivityVersion.save()/QuestionVersion.save() use the same pattern).
+        if self.pk is None:
+            super().save(*args, **kwargs)
+            return
+
+        with transaction.atomic():
+            locked = (
+                Attempt.objects.select_for_update()
+                .filter(pk=self.pk)
+                .values("learner_id", "activity_version_id", "started_at", "submission", "submitted_at")
+                .first()
+            )
+            if locked is None:
+                super().save(*args, **kwargs)
+                return
+
+            for field in _ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS:
+                if getattr(self, field) != locked[field]:
+                    raise ValueError(f"Attempt.{field} is immutable after creation")
+
+            if locked["submitted_at"] is not None and (
+                self.submission != locked["submission"] or self.submitted_at != locked["submitted_at"]
+            ):
+                raise ValueError("submitted Attempt history is immutable")
+
+            super().save(*args, **kwargs)
 
 
 class Result(models.Model):
