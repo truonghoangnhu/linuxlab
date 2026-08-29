@@ -8,5 +8,6 @@ urlpatterns = [
     path("django-admin/", admin.site.urls),
     path("admin/", include(wagtailadmin_urls)),
     path("documents/", include(wagtaildocs_urls)),
+    path("api/v1/learning/", include("linuxlab.learning.urls")),
     path("", include(wagtail_urls)),
 ]
