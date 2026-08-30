@@ -5,6 +5,7 @@ projection.
 """
 
 import uuid
+from datetime import timedelta
 
 import pytest
 from django.utils import timezone
@@ -384,9 +385,8 @@ def test_flush_treats_rejected_without_code_as_unconfirmed_never_dead_letters():
 # --- T14-D40: deterministic HTTP 400 handling --------------------------------
 
 
-def test_deterministic_400_releases_retryable_without_dead_lettering():
-    a = _make_outbox()
-    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+def test_deterministic_400_on_singleton_releases_retryable_without_dead_lettering():
+    row = _make_outbox()
     transport = _ScriptedTransport(exception=ProtocolTransportError("malformed request"))
 
     summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
@@ -394,11 +394,10 @@ def test_deterministic_400_releases_retryable_without_dead_lettering():
     assert summary.protocol_fault is True
     assert summary.dead_lettered == 0
     assert summary.delivered == 0
-    assert summary.released_transient == 2
-    for row in (a, b):
-        refreshed = OutboxMessage.objects.get(pk=row.pk)
-        assert refreshed.state == OUTBOX_PENDING
-        assert refreshed.attempts == 1
+    assert summary.released_transient == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_PENDING
+    assert refreshed.rejection_code == ""
 
 
 def test_deterministic_400_does_not_tight_loop_the_identical_request():
@@ -410,13 +409,157 @@ def test_deterministic_400_does_not_tight_loop_the_identical_request():
     refreshed_after_first = OutboxMessage.objects.get(pk=row.pk)
 
     # The SAME malformed request would recur unchanged on an immediate
-    # retry -- but next_attempt_at has moved out via backoff, so an
-    # immediate second flush at the same `now` claims nothing.
+    # retry -- but next_attempt_at has moved out via a LONG
+    # protocol-specific backoff (T14-D41), so an immediate second flush
+    # at the same `now` claims nothing.
     second = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now)
 
     assert first.protocol_fault is True
     assert second.claimed == 0
     assert refreshed_after_first.next_attempt_at > now
+
+
+# --- T14-D41: deterministic HTTP 400 isolation ------------------------------
+
+
+def test_multi_event_400_bisects_and_isolates_the_offending_singleton():
+    """[A, B, C, D] -> 400; [A, B] -> 400; [A] -> accepted; [B] -> 400;
+    [C, D] -> accepted. A, C, D reach DELIVERED; B alone is isolated as
+    the persistent 400 singleton and stays PENDING with long backoff."""
+    a = _make_outbox()
+    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+    c = _make_outbox(next_attempt_at=a.next_attempt_at)
+    d = _make_outbox(next_attempt_at=a.next_attempt_at)
+
+    def _decide(envelopes):
+        ids = {e.event_id for e in envelopes}
+        if len(envelopes) == 4:
+            raise ProtocolTransportError("400")
+        if ids == {a.event_id, b.event_id}:
+            raise ProtocolTransportError("400")
+        if ids == {b.event_id}:
+            raise ProtocolTransportError("400")
+        if ids == {a.event_id}:
+            return BatchAck(results=(EventAck(event_id=a.event_id, status=ACCEPTED),))
+        if ids == {c.event_id, d.event_id}:
+            return BatchAck(
+                results=(
+                    EventAck(event_id=c.event_id, status=ACCEPTED),
+                    EventAck(event_id=d.event_id, status=ACCEPTED),
+                )
+            )
+        raise AssertionError(f"unexpected batch: {ids}")
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.claimed == 4
+    assert summary.delivered == 3
+    assert summary.dead_lettered == 0
+    assert summary.protocol_fault is True
+    for row in (a, c, d):
+        assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DELIVERED
+    refreshed_b = OutboxMessage.objects.get(pk=b.pk)
+    assert refreshed_b.state == OUTBOX_PENDING
+    assert refreshed_b.rejection_code == ""
+    # Never a blind resend of the original 4-event (or the [A,B]) batch --
+    # the transport only ever saw 4, then 2, then 1-event requests.
+    assert max(len(call) for call in transport.calls) <= 4
+    assert any(len(call) == 1 for call in transport.calls)
+
+
+def test_multi_event_400_never_dead_letters_any_event():
+    a = _make_outbox()
+    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+    transport = _ScriptedTransport(exception=ProtocolTransportError("400"))
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.dead_lettered == 0
+    for row in (a, b):
+        assert OutboxMessage.objects.get(pk=row.pk).state != OUTBOX_DEAD_LETTER
+
+
+def test_singleton_400_uses_long_protocol_backoff_distinct_from_transient():
+    protocol_row = _make_outbox()
+    transient_row = _make_outbox(next_attempt_at=protocol_row.next_attempt_at)
+    now = timezone.now()
+
+    protocol_transport = _ScriptedTransport(exception=ProtocolTransportError("400"))
+    flush_outbox(
+        protocol_transport, max_events=1, max_bytes=1_000_000, lease_seconds=60, now=now
+    )
+    transient_transport = _ScriptedTransport(exception=TransientTransportError("timeout"))
+    flush_outbox(
+        transient_transport, max_events=1, max_bytes=1_000_000, lease_seconds=60, now=now
+    )
+
+    protocol_next = OutboxMessage.objects.get(pk=protocol_row.pk).next_attempt_at
+    transient_next = OutboxMessage.objects.get(pk=transient_row.pk).next_attempt_at
+    assert protocol_next > transient_next
+
+
+def test_worker_delay_regression_second_cycle_does_not_resend_identical_batch():
+    """Reproduces the exact previously-fixed failure mode: a two-event
+    batch that deterministically 400s must not be reconstructed and
+    resent unchanged on a later cycle just because both rows' original
+    next_attempt_at has since passed."""
+    a = _make_outbox()
+    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+    now = timezone.now()
+
+    def _decide(envelopes):
+        ids = {e.event_id for e in envelopes}
+        if ids == {a.event_id, b.event_id}:
+            raise ProtocolTransportError("400")
+        if ids == {a.event_id}:
+            return BatchAck(results=(EventAck(event_id=a.event_id, status=ACCEPTED),))
+        if ids == {b.event_id}:
+            raise ProtocolTransportError("400")
+        raise AssertionError(f"unexpected batch: {ids}")
+
+    transport = _CallableTransport(_decide)
+    flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now)
+
+    # Advance well beyond the old fixed 60-second worker interval, but
+    # still short of B's new long protocol backoff.
+    later = now + timedelta(minutes=5)
+    calls_before = len(transport.calls)
+    second_summary = flush_outbox(
+        transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=later
+    )
+
+    # A is already DELIVERED and B's next_attempt_at is far in the
+    # future -- the second cycle has nothing due to claim at all, so the
+    # transport is never called again with the stale [A, B] pair.
+    assert len(transport.calls) == calls_before
+    assert second_summary.claimed == 0
+    assert OutboxMessage.objects.get(pk=a.pk).state == OUTBOX_DELIVERED
+    assert OutboxMessage.objects.get(pk=b.pk).state == OUTBOX_PENDING
+
+
+def test_unrelated_eligible_event_still_progresses_after_singleton_400():
+    stuck = _make_outbox()
+    unrelated = _make_outbox(next_attempt_at=stuck.next_attempt_at)
+
+    def _decide(envelopes):
+        ids = {e.event_id for e in envelopes}
+        if stuck.event_id in ids and len(envelopes) > 1:
+            raise ProtocolTransportError("400")
+        if ids == {stuck.event_id}:
+            raise ProtocolTransportError("400")
+        return BatchAck(
+            results=tuple(EventAck(event_id=e.event_id, status=ACCEPTED) for e in envelopes)
+        )
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.delivered == 1
+    assert OutboxMessage.objects.get(pk=unrelated.pk).state == OUTBOX_DELIVERED
+    assert OutboxMessage.objects.get(pk=stuck.pk).state == OUTBOX_PENDING
 
 
 # --- FileSyncTransport non-delivery -----------------------------------------

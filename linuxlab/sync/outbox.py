@@ -284,16 +284,71 @@ def _merge_flush_summaries(a, b):
     )
 
 
+# T14-D41: deliberately much longer than the exponential transient-backoff
+# cap -- a 400 singleton has already been isolated as the specific cause
+# of a request-level fault this Task 14 implementation itself constructed,
+# so it is not retried on the ordinary short cadence, but it is also never
+# permanently unsendable the way a 413 singleton is (T14-D40), so it stays
+# PENDING rather than DEAD_LETTER.
+_PROTOCOL_400_SINGLETON_BACKOFF_SECONDS = _DEFAULT_BACKOFF_CAP_SECONDS
+
+
+def _dead_letter_event_too_large(row, now):
+    mark_dead_letter(
+        row,
+        "EVENT_TOO_LARGE",
+        "singleton event still rejected as too large by Central",
+        now=now,
+    )
+    return FlushSummary(claimed=1, dead_lettered=1)
+
+
+def _release_singleton_protocol_fault(row, now):
+    now = now or timezone.now()
+    _write_fenced(
+        row,
+        state=OUTBOX_PENDING,
+        next_attempt_at=now + timedelta(seconds=_PROTOCOL_400_SINGLETON_BACKOFF_SECONDS),
+        claimed_at=None,
+        lease_until=None,
+        claim_token=None,
+    )
+    return FlushSummary(claimed=1, released_transient=1, protocol_fault=True)
+
+
+def _isolate_and_retry(transport, rows, now, on_singleton_terminal):
+    """Shared T14-D40/T14-D41 isolation: bisect `rows` and retry each
+    half through _send_claimed_rows() independently until a half
+    shrinks to one event, at which point `on_singleton_terminal(row, now)`
+    decides that event's terminal outcome (permanent DEAD_LETTER for a
+    413 singleton; retryable PENDING with long backoff for a 400
+    singleton) and returns a one-event FlushSummary. Bounded by simple
+    halving -- O(log n) deep for any realistic batch, never unbounded.
+    """
+    if len(rows) == 1:
+        return on_singleton_terminal(rows[0], now)
+    midpoint = len(rows) // 2
+    first_half = _send_claimed_rows(transport, rows[:midpoint], now=now)
+    second_half = _send_claimed_rows(transport, rows[midpoint:], now=now)
+    return _merge_flush_summaries(first_half, second_half)
+
+
 def _send_claimed_rows(transport, rows, now=None):
     """Send exactly `rows` (already-claimed OutboxMessage instances)
     through `transport`, OUTSIDE any open DB transaction, then update
-    delivery metadata only for confirmed events. Handles T14-D40 (413)
-    recovery by splitting a multi-event batch and retrying smaller
-    subsets outside any DB transaction/claim lock; a singleton event
-    that still receives 413 is permanently unsendable under the current
-    transport contract and dead-letters with code EVENT_TOO_LARGE. The
-    recursion is bounded by repeated halving (O(log n) deep for any
-    realistic batch size), never unbounded.
+    delivery metadata only for confirmed events.
+
+    Handles T14-D40 (413) recovery and T14-D41 (400 isolation) with the
+    same bisection mechanism, but distinct terminal semantics: a
+    singleton that still receives 413 is permanently unsendable under
+    the current transport contract and dead-letters with code
+    EVENT_TOO_LARGE; a singleton that still receives 400 is a
+    request-shape fault, not an inherent property of the event, so it
+    stays retryable (PENDING) with a long protocol-specific backoff and
+    an operator-visible protocol_fault flag -- never DEAD_LETTER, never
+    EVENT_TOO_LARGE. Neither case ever reconstructs and resends the
+    original, larger blocking batch unchanged; unaffected subsets/events
+    always complete independently.
     """
     if not rows:
         return FlushSummary()
@@ -303,29 +358,12 @@ def _send_claimed_rows(transport, rows, now=None):
     try:
         batch_ack = transport.send_batch(envelopes)
     except RequestTooLargeError:
-        if len(rows) == 1:
-            mark_dead_letter(
-                rows[0],
-                "EVENT_TOO_LARGE",
-                "singleton event still rejected as too large by Central",
-                now=now,
-            )
-            return FlushSummary(claimed=1, dead_lettered=1)
-        midpoint = len(rows) // 2
-        first_half = _send_claimed_rows(transport, rows[:midpoint], now=now)
-        second_half = _send_claimed_rows(transport, rows[midpoint:], now=now)
-        return _merge_flush_summaries(first_half, second_half)
+        return _isolate_and_retry(transport, rows, now, _dead_letter_event_too_large)
     except AuthTransportError:
         release_auth_failure(rows, now=now)
         return FlushSummary(claimed=len(rows), released_auth_failure=len(rows), auth_fault=True)
     except ProtocolTransportError:
-        # A deterministic 400: never falsely dead-letter every event
-        # over a request-level fault, and never silently rebuild/resend
-        # the identical malformed request in a tight loop -- release as
-        # retryable (with the usual backoff) and flag protocol_fault so
-        # the worker can additionally pause/degrade (T14-D40).
-        release_transient(rows, "protocol_400", now=now)
-        return FlushSummary(claimed=len(rows), released_transient=len(rows), protocol_fault=True)
+        return _isolate_and_retry(transport, rows, now, _release_singleton_protocol_fault)
     except TransientTransportError:
         release_transient(rows, "transient", now=now)
         return FlushSummary(claimed=len(rows), released_transient=len(rows))
