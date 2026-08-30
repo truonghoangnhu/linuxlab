@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-30
 **Project:** LinuxLab.vn / LinuxLab Open Lab
-**Status:** DESIGN APPROVED — documentation only; implementation has not started
+**Status:** IMPLEMENTED — see "Implementation record" at the end of this file; awaiting independent Task 14 architecture/security review
 **Predecessor:** Task 13 FINAL PASS at `63a2baa2c33f4d8792befa85c1bb6835e3aa8b60`, 566 tests passing
 
 This file records the architecture choices approved for Task 14. These decisions are normative for the Task 14 spec and future implementation plan. They must not be silently changed during implementation.
@@ -599,3 +599,67 @@ Task 14's new models (`OutboxMessage`, `InboxMessage`, `NodeRegistration`) must 
 **Existing `DomainEvent` production paths.** `linuxlab.core.models.DomainEvent` (fields: `event_id`, `event_type`, `aggregate_id`, `payload`, `created_at`, `processed_at`) and `linuxlab.core.events.publish_event(event_type, payload, aggregate_id)` already exist and are already used in production. As of this writing, the **only** event type actually published outside tests is `"activity.completed"`, from exactly two call sites in `linuxlab/learning/services.py` (`claim_activity_completion()` and `submit_attempt()`), both immediately after `Result.objects.create(...)` in the same transaction — this is a strong, obvious candidate for T14-D21's "one real vertical slice," matching the checked-in prompt's own phrasing ("same transaction as authoritative local Result/domain event") closely. This is recorded as a candidate only, per the docs-only instructions; the implementation plan must confirm and select it (or another) explicitly rather than this document deciding it.
 
 **T14-D39** (above) is the one new architectural decision recorded for Task 14's documentation, added 2026-08-30 after the independent review described above. Everything else in this reconciliation section is naming/layout mapping, not a separate decision.
+
+---
+
+## Implementation record (2026-08-30)
+
+Task 14 is implemented, task-by-task per `docs/superpowers/plans/2026-08-30-task14-node-central-event-sync.md`. No semantic change was made to T14-D01 through T14-D39 during implementation; no new architectural decision was invented (no T14-D40).
+
+**Commit range:** `eca5ba6..22e0f88` (11 commits), branched from `abae15b` / Task 13 FINAL PASS `63a2baa2c33f4d8792befa85c1bb6835e3aa8b60`.
+
+```
+eca5ba6 feat: add Task 14 sync persistence
+0317a90 feat: add versioned sync event contracts
+f35f2a4 feat: add per-node sync credentials
+9826aa7 feat: enqueue activity completion for sync
+66db664 feat: add leased outbox delivery state
+1add4c8 feat: add Task 14 sync transports
+77107de feat: add idempotent Central inbox ingestion
+46dd326 feat: add authenticated sync ingestion API
+acdd0ab feat: add Central sync processor boundary
+f7611e5 feat: add Node outbox sync worker
+22e0f88 test: prove Task 14 event sync end to end
+```
+
+**Final module/model names** (all under `linuxlab/sync/`, matching the plan's locked file structure and the checked-in prompt's authoritative naming):
+
+- `models.py` — `NodeRegistration`, `OutboxMessage`, `InboxMessage` (plus Task 12's pre-existing `Installed*` models, unmodified), and two shared trust-boundary helpers reused from Task 12/13's pattern: `_insert_immutable_row()`, `_write_immutable_row_fields()`.
+- `contracts.py` — `WireEventEnvelope`, `EventAck`, `BatchAck`, `SyncTransport` (protocol), `SyncEventContract`, `canonical_event_dict()`/`canonical_event_bytes()`, and the transport failure classification `TransportError`/`TransientTransportError`/`AuthTransportError`/`ProtocolTransportError`.
+- `registry.py` — `register_sync_event_contract()`, `get_sync_event_contract()`, `get_current_sync_event_contract()`; fail-closed, in-memory, keyed by `(event_type, schema_version)`.
+- `authentication.py` — `issue_node_registration()`, `rotate_node_credential()`, `revoke_node_registration()`, `authenticate_node()`, `IssuedNodeCredential`, `NodeAuthenticationError`.
+- `enqueue.py` — `enqueue_sync_event()`, `SyncConfigurationError`, and the one registered vertical-slice contract `ACTIVITY_COMPLETED_V1`.
+- `outbox.py` — `claim_outbox_batch()`, `mark_delivered()`, `mark_dead_letter()`, `release_transient()`, `release_auth_failure()`, `compute_retry_delay()`, `envelope_for()`, `flush_outbox()`, `FlushSummary`.
+- `transports.py` — `HttpSyncTransport` (production), `FileSyncTransport` (dev/test/reference only).
+- `ingestion.py` — `ingest_event()`.
+- `processing.py` — `SyncEventProcessor` (protocol), `process_inbox_event()`.
+- `api.py` — `SyncEventsView`.
+- `management/commands/manage_sync_node.py` — `issue`/`rotate`/`revoke` Node credential admin CLI.
+- `management/commands/sync_events.py` — `--once` / continuous Node flush worker CLI.
+
+**Migration:** `linuxlab/sync/migrations/0003_noderegistration_inboxmessage_outboxmessage.py` — additive only; no historical migration file was modified; `makemigrations --check --dry-run` is clean on both the `central` and `node` settings profiles.
+
+**Selected real vertical slice:** `activity.completed`, schema_version 1 — the only production `DomainEvent` type actually published as of Task 13 HEAD, from `linuxlab.learning.services.claim_activity_completion()` and `submit_attempt()`, both immediately after `Result.objects.create(...)` in the same `transaction.atomic()` block that also now calls `enqueue_sync_event()`. Exact wire payload fields: `attempt_public_id`, `learner_public_id`, `activity_definition_public_id`, `activity_version`, `score`, `max_score` — a minimal, learner/result-safe subset; no answer key, provider config, grading rationale, or local integer PK is ever included (`aggregate_public_id`/`aggregate_type` and all payload identity fields are stable UUIDs/public values). The guest-claim call site's extra `"source"` payload key is deliberately dropped by the contract's serializer, not forwarded.
+
+**Node credential configuration (environment/settings, never the database):** `LINUXLAB_SYNC_ENABLED`, `LINUXLAB_NODE_ID`, `LINUXLAB_SYNC_SECRET`, `LINUXLAB_CENTRAL_URL`, `LINUXLAB_SYNC_ALLOW_INSECURE_HTTP` (default `false`), `LINUXLAB_SYNC_BATCH_MAX_EVENTS` (default 100), `LINUXLAB_SYNC_BATCH_MAX_BYTES` (default 1,000,000), `LINUXLAB_SYNC_LEASE_SECONDS` (default 300), `LINUXLAB_SYNC_BACKOFF_BASE_SECONDS` (default 5), `LINUXLAB_SYNC_BACKOFF_CAP_SECONDS` (default 3600). Central never stores a Node's plaintext secret — only a Django password hash (`current_secret_hash`/`previous_secret_hash` on `NodeRegistration`), via `django.contrib.auth.hashers.make_password`/`check_password`.
+
+**HTTP route:** `POST /api/v1/sync/events/` (`linuxlab/sync/urls.py`, name `sync-events`), authenticated via `Authorization: Bearer <secret>` + `X-LinuxLab-Node-Id: <uuid>` headers only — never a credential in the JSON body.
+
+**Test coverage for the required proof points** (242 tests total under `linuxlab/sync/tests/`, all passing):
+
+- transaction rollback: `test_task14_enqueue.py::test_business_rollback_rolls_back_domain_event_and_outbox_together`.
+- real PostgreSQL concurrency (`select_for_update(skip_locked=True)`, no mocked locking): `test_task14_outbox.py::test_concurrent_claims_never_select_the_same_row`, `test_task14_ingestion.py::test_concurrent_ingest_of_the_same_new_event_id_normalizes_to_one_accepted_one_duplicate`.
+- ACK loss / replay: `test_task14_e2e.py::test_commit_then_ack_lost_replay_yields_one_inbox_row_and_eventual_delivery`.
+- exact duplicate / idempotency conflict: `test_task14_ingestion.py::test_exact_duplicate_returns_duplicate_with_one_inbox_row`, `test_same_event_id_different_payload_is_idempotency_conflict`.
+- authentication (issue/rotate/revoke/grace period/disabled/unknown/wrong-secret, and the 401-vs-403 API distinction): `test_task14_authentication.py`, `test_task14_api.py`.
+- lease recovery: `test_task14_outbox.py::test_claim_reclaims_lease_expired_in_flight_row_without_changing_envelope`.
+- long-offline recovery: `test_task14_e2e.py::test_repeated_transient_failures_never_delete_or_dead_letter_then_eventually_deliver`.
+- `FileSyncTransport` non-delivery: `test_task14_transports.py` (writes/no-secret/unconfirmed-results/empty-batch), `test_task14_flush.py::test_file_transport_flush_leaves_events_unconfirmed_never_delivered`.
+- poison-neighbor batch independence: `test_task14_api.py::test_mixed_batch_returns_independent_per_event_results`, `test_task14_flush.py::test_permanent_rejection_only_dead_letters_that_event`, `test_task14_e2e.py::test_poison_neighbor_does_not_block_good_events_in_the_same_batch`.
+- source spoofing: `test_task14_api.py::test_source_spoof_is_permanently_rejected_with_no_inbox_row`.
+- processor failure after ACK: `test_task14_e2e.py::test_processor_failure_after_ack_never_requires_node_retransmission`.
+- no package/Central→Node regression: `test_task14_e2e.py::test_full_cycle_never_touches_package_inventory_or_creates_reverse_transport`.
+
+**Full-suite verification:** `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest -q` → 726 passed (566 pre-Task-14 baseline + 160 new Task 14 tests). `.venv/bin/ruff check .` clean. `manage.py check` and `manage.py makemigrations --check --dry-run` clean on both the `central` and `node` settings profiles.
+
+**One real bug found and fixed during TDD** (Task 5): `claim_outbox_batch()`'s initial implementation fetched all due candidates under `select_for_update(skip_locked=True)` before trimming to the byte budget in Python — but `SELECT FOR UPDATE` locks every row a query returns, not just the ones ultimately selected, so an unbounded fetch over-locked rows beyond `max_events` and starved a concurrent claimer. Fixed by bounding the locked query to `max_events` up front (byte-budget trimming only ever removes from the tail of that same window, so no candidate beyond `max_events` is ever eligible anyway). Caught by a real two-thread PostgreSQL concurrency test, not a mock.
