@@ -1,5 +1,6 @@
 import uuid
 
+from linuxlab.activities.contracts import ActivityDependencies
 from linuxlab.assessment.models import QuestionVersion
 from linuxlab.assessment.services import get_question_version, serialize_question_for_learner
 
@@ -105,6 +106,15 @@ class AssessmentActivityProvider:
 
             # confirm a provider is registered for this exact version's type
             self.question_registry.get(question_version.type_key)
+
+    def collect_dependencies(self, config):
+        """Exact QuestionVersion references this config depends on (Task 11
+        package dependency closure). Reuses _parse_question_ref -- the same
+        parsing validate_config() already applies -- rather than
+        duplicating assessment config parsing in the packaging layer.
+        """
+        refs = tuple(_parse_question_ref(item) for item in config["questions"])
+        return ActivityDependencies(question_versions=refs)
 
     def evaluate(self, config, submission):
         responses_by_key = self._parse_responses(submission)

@@ -3,6 +3,7 @@ import uuid
 
 import pytest
 
+from linuxlab.activities.contracts import ActivityDependencies
 from linuxlab.activities.models import ActivityDefinition
 from linuxlab.activities.registry import ActivityRegistry
 from linuxlab.activities.services import create_activity_version, publish_activity_version
@@ -93,6 +94,31 @@ def test_valid_exact_published_question_ref_is_accepted(published_question, ques
     provider = AssessmentActivityProvider(question_registry)
 
     provider.validate_config(_config_for(published_question))
+
+
+# --- collect_dependencies: Task 11 package dependency closure --------------
+
+
+@pytest.mark.django_db
+def test_collect_dependencies_returns_the_exact_question_version_refs(
+    published_question, second_published_question, question_registry
+):
+    provider = AssessmentActivityProvider(question_registry)
+
+    dependencies = provider.collect_dependencies(
+        _config_for(published_question, second_published_question)
+    )
+
+    assert dependencies == ActivityDependencies(
+        question_versions=(
+            (published_question.question.public_id, published_question.version),
+            (second_published_question.question.public_id, second_published_question.version),
+        )
+    )
+
+
+def test_activity_dependencies_default_is_empty():
+    assert ActivityDependencies() == ActivityDependencies(question_versions=())
 
 
 # --- validate_config: invalid -----------------------------------------------
