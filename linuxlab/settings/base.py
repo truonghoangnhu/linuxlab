@@ -87,6 +87,7 @@ WAGTAILADMIN_BASE_URL = os.environ.get("WAGTAILADMIN_BASE_URL", "http://localhos
 # Profile flags; each deployment profile module overrides these explicitly.
 LINUXLAB_CAN_AUTHOR = False
 LINUXLAB_CAN_IMPORT_PACKAGES = False
+LINUXLAB_CAN_SERVE_LEARNER_CONTENT = False
 
 
 def database_config(default_name):

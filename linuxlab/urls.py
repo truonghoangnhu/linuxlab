@@ -9,5 +9,7 @@ urlpatterns = [
     path("admin/", include(wagtailadmin_urls)),
     path("documents/", include(wagtaildocs_urls)),
     path("api/v1/learning/", include("linuxlab.learning.urls")),
+    # Task 13: must precede wagtail_urls' catch-all page-serving route below.
+    path("", include("linuxlab.sync.urls")),
     path("", include(wagtail_urls)),
 ]

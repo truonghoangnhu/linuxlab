@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ publication.payload.learning_path.title }}</title>
+</head>
+<body>
+  <h1>{{ publication.payload.learning_path.title }}</h1>
+  <p>Installed package version {{ runtime_context.package_version }}</p>
+
+  {% for module in publication.payload.learning_path.modules %}
+    <section>
+      <h2>{{ module.title }}</h2>
+      <ul>
+        {% for lesson in module.lessons %}
+          <li>{{ lesson.title }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endfor %}
+</body>
+</html>
