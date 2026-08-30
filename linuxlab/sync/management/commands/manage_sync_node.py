@@ -16,6 +16,7 @@ from linuxlab.sync.authentication import (
     revoke_node_registration,
     rotate_node_credential,
 )
+from linuxlab.sync.capabilities import can_receive_sync_events
 from linuxlab.sync.models import NodeRegistration
 
 
@@ -43,6 +44,11 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if not can_receive_sync_events():
+            raise CommandError(
+                "Node credential provisioning is not enabled on this deployment profile"
+            )
+
         action = options["action"]
 
         if action == "issue":

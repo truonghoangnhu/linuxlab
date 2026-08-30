@@ -18,6 +18,14 @@ pytestmark = pytest.mark.django_db
 _URL = "/api/v1/sync/events/"
 
 
+@pytest.fixture(autouse=True)
+def _central_sync_authority(settings):
+    """This file exercises SyncEventsView's ingestion behavior itself,
+    already covered independently by test_task14_profiles.py -- profile
+    gating is proven there, not re-tested per case here."""
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
+
+
 def _make_envelope(**overrides):
     fields = {
         "event_id": uuid.uuid4(),

@@ -14,6 +14,7 @@ import time
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from linuxlab.sync.capabilities import can_run_sync_worker
 from linuxlab.sync.outbox import flush_outbox
 from linuxlab.sync.transports import HttpSyncTransport
 
@@ -32,6 +33,10 @@ class Command(BaseCommand):
         )
 
     def _build_transport(self):
+        if not can_run_sync_worker():
+            raise CommandError(
+                "the outbound sync worker is not enabled on this deployment profile"
+            )
         if not settings.LINUXLAB_SYNC_ENABLED:
             raise CommandError("LINUXLAB_SYNC_ENABLED is false; sync_events refuses to run")
         if not settings.LINUXLAB_NODE_ID:

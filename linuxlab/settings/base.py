@@ -89,6 +89,15 @@ LINUXLAB_CAN_AUTHOR = False
 LINUXLAB_CAN_IMPORT_PACKAGES = False
 LINUXLAB_CAN_SERVE_LEARNER_CONTENT = False
 
+# Task 14 corrective (independent review finding #1): Central-only sync
+# authority (ingestion API + Node credential provisioning) and Node-only
+# outbound worker authority are each a fixed deployment-profile capability,
+# the same as LINUXLAB_CAN_AUTHOR/LINUXLAB_CAN_IMPORT_PACKAGES/
+# LINUXLAB_CAN_SERVE_LEARNER_CONTENT above -- never a LINUXLAB_PROFILE
+# string comparison scattered across call sites.
+LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
+LINUXLAB_CAN_RUN_SYNC_WORKER = False
+
 # Task 14: Node -> Central event sync configuration. Sync-enablement is
 # per-Node-instance runtime configuration (not a fixed profile capability
 # like LINUXLAB_CAN_*), so it is read from the environment with a safe

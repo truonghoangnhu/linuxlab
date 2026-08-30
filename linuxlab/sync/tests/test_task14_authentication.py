@@ -23,6 +23,15 @@ from linuxlab.sync.models import NodeRegistration
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _central_sync_authority(settings):
+    """The manage_sync_node CLI tests below need Central's provisioning
+    capability enabled to test their own (non-profile) failure modes;
+    profile gating itself is proven independently in
+    test_task14_profiles.py."""
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
+
+
 def test_issue_returns_plaintext_secret_and_stores_only_a_hash():
     credential = issue_node_registration("Lab A")
 

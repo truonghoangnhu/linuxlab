@@ -24,12 +24,14 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
 from .authentication import NodeAuthenticationError, authenticate_node
+from .capabilities import can_receive_sync_events
 from .contracts import WireEventEnvelope
 from .ingestion import ingest_event
 from .models import NodeRegistration
 
 _BEARER_PREFIX = "Bearer "
 _AUTH_FAILED_BODY = {"detail": "authentication failed"}
+_PROFILE_DISABLED_BODY = {"detail": "sync ingestion is not enabled on this deployment profile"}
 
 
 def _parse_bearer_credential(request):
@@ -122,6 +124,9 @@ class SyncEventsView(View):
     ambient authority), so CSRF protection does not apply here."""
 
     def post(self, request):
+        if not can_receive_sync_events():
+            return JsonResponse(_PROFILE_DISABLED_BODY, status=403)
+
         node_id, secret = _parse_bearer_credential(request)
         if node_id is None:
             return JsonResponse(_AUTH_FAILED_BODY, status=401)

@@ -47,6 +47,18 @@ def test_node_capability_flags():
     assert node.LINUXLAB_CAN_IMPORT_PACKAGES is True
 
 
+def test_central_sync_capability_flags():
+    central = importlib.import_module("linuxlab.settings.central")
+    assert central.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS is True
+    assert central.LINUXLAB_CAN_RUN_SYNC_WORKER is False
+
+
+def test_node_sync_capability_flags():
+    node = importlib.import_module("linuxlab.settings.node")
+    assert node.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS is False
+    assert node.LINUXLAB_CAN_RUN_SYNC_WORKER is True
+
+
 # --- Deployment database name defaults --------------------------------------
 #
 # database_config() reads POSTGRES_DB from the environment at import time,

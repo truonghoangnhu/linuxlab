@@ -17,6 +17,14 @@ from linuxlab.sync.outbox import FlushSummary
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _node_sync_worker_authority(settings):
+    """This file exercises the sync_events worker's own (non-profile)
+    failure modes; profile gating itself is proven independently in
+    test_task14_profiles.py."""
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+
+
 def _configure_sync_settings(settings):
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(uuid.uuid4())
