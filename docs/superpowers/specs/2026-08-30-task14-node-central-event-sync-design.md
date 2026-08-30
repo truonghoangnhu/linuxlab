@@ -69,7 +69,8 @@ Task 14 does not implement:
 - dead-letter repair UI;
 - automatic retention/GC;
 - Celery/Redis/RabbitMQ/Kafka;
-- Node inbound Internet endpoints.
+- Node inbound Internet endpoints;
+- production air-gap/USB synchronization workflow (file authenticity/integrity trust, Central import authorization, operator transfer workflow, ACK/result round-trip, reconciliation after delayed import — see T14-D39 and §13.2).
 
 ## 4. Deployment model
 
@@ -367,10 +368,21 @@ Node initiates outbound requests.
 
 ### 13.2 Transport abstraction
 
-Transport is an explicit interface (`SyncTransport` per the checked-in prompt), not hard-coded HTTP: ADR-010 states "Transport is independent from the package/event format so HTTPS, LAN, file, or later USB workflows can use the same contracts." Task 14 provides at least two implementations against the same envelope:
+Transport is an explicit interface (`SyncTransport` per the checked-in prompt), not hard-coded HTTP: ADR-010 states "Transport is independent from the package/event format so HTTPS, LAN, file, or later USB workflows can use the same contracts." Task 14 provides two implementations against the same envelope, with clearly distinct scope (T14-D39):
 
-- `HttpSyncTransport` — the production Node → Central path (§13.3, §13.4);
-- `FileSyncTransport` — a deterministic file-based transport using exactly the same event envelope, for offline/USB-style integration tests and as a concrete proof that the envelope itself is transport-independent.
+```text
+SyncTransport
+├── HttpSyncTransport
+│   └── production Node → Central transport (§13.3, §13.4)
+└── FileSyncTransport
+    └── dev/test/reference transport in Task 14 (§13.3)
+```
+
+**`HttpSyncTransport` is the only production Node → Central transport in Task 14.** Production delivery is defined as: HTTPS push → Central authenticated ingestion → durable `SyncInbox` commit (or exact duplicate) → valid per-event ACK → `DELIVERED`. No other path produces `DELIVERED` in production.
+
+**`FileSyncTransport` exists only because the checked-in prompt requires the transport abstraction and a file implementation**, and is limited in Task 14 to: development; tests; reference implementation of the `SyncTransport` interface; deterministic fixtures/local export inspection. It uses exactly the same event envelope `HttpSyncTransport` would send, which is what makes it useful as a reference implementation and as offline/USB-style integration-test scaffolding — but Task 14 does **not** implement the additional production air-gap protocol a real USB/offline sync workflow would need: file authenticity/integrity trust, Central import authorization, an operator transfer workflow, durable Inbox acceptance of an imported file, an ACK/result round-trip back to the originating Node, or reconciliation after a delayed import. That protocol is out of scope (§3) and is not designed here.
+
+**A successful local file write is not delivery.** `FileSyncTransport` completing a write proves the envelope serialized correctly; it proves nothing about whether Central has durably accepted the event. No code path may transition an Outbox event to `DELIVERED` on the strength of a `FileSyncTransport` write alone in production semantics — only a confirmed per-event ACK from real Central ingestion does that (T14-D04, T14-D30).
 
 ### 13.3 Production security
 
@@ -378,7 +390,7 @@ Production requires HTTPS with normal certificate/hostname validation.
 
 There is no automatic HTTP fallback.
 
-Explicit HTTP may exist in development/test only. `FileSyncTransport` is not a production HTTPS fallback — it is a distinct, explicitly-selected transport for offline/USB/test scenarios, and does not weaken the HTTPS-only production policy.
+Explicit HTTP may exist in development/test only. `FileSyncTransport` is not a production HTTPS fallback and is not a production USB/air-gap sync path — it is a distinct, explicitly-selected dev/test/reference transport (§13.2), and does not weaken the HTTPS-only production policy or the durable-Inbox-before-ACK boundary (T14-D04, T14-D12).
 
 ### 13.4 Authentication
 

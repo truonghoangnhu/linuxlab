@@ -401,6 +401,51 @@ When sync is enabled:
 
 A temporarily invalid/revoked secret does not stop enqueue; it pauses transport.
 
+## T14-D39 — FileSyncTransport is non-production reference/test transport in Task 14
+
+`HttpSyncTransport` is the production Node → Central transport for Task 14. Production delivery semantics remain exactly:
+
+```text
+Node Outbox
+  → HTTPS push
+  → Central authenticated ingestion
+  → durable SyncInbox commit / exact duplicate
+  → valid per-event ACK
+  → DELIVERED
+```
+
+`FileSyncTransport` exists because the authoritative Task 14 prompt requires the transport abstraction and a file implementation. In Task 14, `FileSyncTransport` is limited to:
+
+- development;
+- tests;
+- reference implementation of the transport abstraction;
+- deterministic fixtures / local export inspection.
+
+Task 14 does **not** claim that `FileSyncTransport` implements a complete production USB/air-gap synchronization workflow.
+
+A successful local file write alone **must not** be treated as proof that Central durably accepted the event in a production workflow.
+
+Task 14 does not design or implement the additional production air-gap protocol needed for:
+
+- file authenticity/integrity trust;
+- Central import authorization;
+- operator transfer workflow;
+- durable Inbox acceptance;
+- ACK/result round-trip back to Node;
+- reconciliation after delayed import.
+
+ADR-010 remains compatible because it permits file/later USB workflows as an architectural possibility, but Task 14 does not complete that production workflow.
+
+This decision does not change:
+
+- T14-D01 (Node → Central direction);
+- T14-D04 (durable Inbox ACK boundary);
+- T14-D08 (per-event acknowledgement);
+- T14-D29 (production HTTPS policy);
+- T14-D30 (conservative ACK handling).
+
+No automatic state transition to `DELIVERED` may be justified solely by a `FileSyncTransport` write in production semantics.
+
 ## Approved component layout
 
 Task 14 remains inside the existing `linuxlab.sync` Django app. No new Django app is created.
@@ -519,13 +564,14 @@ Task 14 does not implement:
 - Kafka;
 - global event ordering;
 - automatic Inbox/Outbox GC;
-- DB replication.
+- DB replication;
+- production air-gap/USB synchronization workflow (file authenticity/integrity trust, Central import authorization, operator transfer workflow, ACK/result round-trip, reconciliation after delayed import — see T14-D39).
 
 ---
 
 ## Repository reality reconciliation (2026-08-30)
 
-Added during the docs-only write-up (this file's content above is otherwise verbatim from the approved design). Semantics of T14-D01 through T14-D38 are unchanged; this section only maps the conceptual layout above onto what the checked-in authoritative Task 14 prompt (`docs/codex/task-prompts/TASK_14_idempotent-outbox-inbox-event-sync.md`) and current repository state actually require or already contain.
+Added during the docs-only write-up (this file's content above is otherwise verbatim from the approved design). Semantics of T14-D01 through T14-D38 are unchanged; this section only maps the conceptual layout above onto what the checked-in authoritative Task 14 prompt (`docs/codex/task-prompts/TASK_14_idempotent-outbox-inbox-event-sync.md`) and current repository state actually require or already contain. *(Corrective, same day: an independent review of this section's original wording found it did not clearly rule out treating a `FileSyncTransport` write as delivery proof. That gap is closed by T14-D39, added above; this section's file-transport paragraph below was reworded to match — no other paragraph in this section changed.)*
 
 **Authoritative naming.** The checked-in Task 14 prompt names the exact deliverables (its own "Produces:" line), which take precedence over this design's more conceptual `SyncOutbox`/`SyncInbox` naming, the same way Task 12's "Produces:" line was authoritative for `InstalledPackage`/`import_package()`/etc.:
 
@@ -539,7 +585,7 @@ Added during the docs-only write-up (this file's content above is otherwise verb
 
 None of T14-D01–D38's *semantics* change under this renaming — every decision above still holds verbatim under the authoritative names.
 
-**File-based transport is required, not optional.** The checked-in prompt explicitly requires "`FileSyncTransport`... using exactly the same event envelope for offline/USB-style integration tests," alongside `HttpSyncTransport`. This was not spelled out in section 13 of the design spec (which only discussed HTTPS) but does not conflict with it: ADR-010 itself states "Transport is independent from the package/event format so HTTPS, LAN, file, or later USB workflows can use the same contracts" — a file-based transport implementing the same `SyncTransport` interface is exactly what ADR-010 already anticipates. T14-D29's "HTTPS production policy" governs *production* Node→Central sync specifically; it does not forbid a deterministic file-based transport for offline/USB/test scenarios. The design spec (written alongside this file) makes `transport.py` an explicit `SyncTransport` interface with both implementations.
+**File-based transport is required, not optional — but is dev/test/reference scope only.** The checked-in prompt explicitly requires "`FileSyncTransport`... using exactly the same event envelope for offline/USB-style integration tests," alongside `HttpSyncTransport`. This does not conflict with T14-D29's HTTPS-only production policy: ADR-010 states "Transport is independent from the package/event format so HTTPS, LAN, file, or later USB workflows can use the same contracts," anticipating a file-based transport implementing the same `SyncTransport` interface. However, an independent review of the first version of these documents flagged a dangerous ambiguity: successfully writing an event batch to a file is **not** equivalent to Central durably ingesting that event into `SyncInbox`, and the original wording here did not say so explicitly. **T14-D39** (below) is the human-approved correction: `HttpSyncTransport` is the sole production Node → Central transport in Task 14; `FileSyncTransport` is limited to development, tests, and reference/fixture use, and a local file write alone must never be treated as `DELIVERED`. The design spec's transport section reflects this distinction explicitly.
 
 **Existing `linuxlab/sync/` layout.** As of Task 13 (`63a2baa`), `linuxlab/sync/` already contains, from Tasks 12–13:
 
@@ -552,4 +598,4 @@ Task 14's new models (`OutboxMessage`, `InboxMessage`, `NodeRegistration`) must 
 
 **Existing `DomainEvent` production paths.** `linuxlab.core.models.DomainEvent` (fields: `event_id`, `event_type`, `aggregate_id`, `payload`, `created_at`, `processed_at`) and `linuxlab.core.events.publish_event(event_type, payload, aggregate_id)` already exist and are already used in production. As of this writing, the **only** event type actually published outside tests is `"activity.completed"`, from exactly two call sites in `linuxlab/learning/services.py` (`claim_activity_completion()` and `submit_attempt()`), both immediately after `Result.objects.create(...)` in the same transaction — this is a strong, obvious candidate for T14-D21's "one real vertical slice," matching the checked-in prompt's own phrasing ("same transaction as authoritative local Result/domain event") closely. This is recorded as a candidate only, per the docs-only instructions; the implementation plan must confirm and select it (or another) explicitly rather than this document deciding it.
 
-No T14-D39 was added for any of the above — these are naming/layout reconciliations, not new architectural decisions.
+**T14-D39** (above) is the one new architectural decision recorded for Task 14's documentation, added 2026-08-30 after the independent review described above. Everything else in this reconciliation section is naming/layout mapping, not a separate decision.
