@@ -545,7 +545,7 @@ Use the actual URL configuration path discovered in Step 1; do not modify unrela
 **Interfaces:**
 - Proves T13-D08, D10, D11, D12, D14, D15 end-to-end.
 
-- [ ] **Step 1: Add request/use-case pinning test**
+- [x] **Step 1: Add request/use-case pinning test**
 
 Runtime-level sequence:
 
@@ -567,7 +567,7 @@ assert new_ctx.package_pk == v2.pk
 
 The exact publication/version assertion must use the actual installed schema; do not conflate package version with publication version if they are separate fields.
 
-- [ ] **Step 2: Add no-network HTTP test**
+- [x] **Step 2: Add no-network HTTP test**
 
 Patch outbound network entry points to fail loudly:
 
@@ -583,7 +583,7 @@ Then request the LAN learner route. Expected: successful offline rendering from 
 
 Patch only functions that do not interfere with Django's in-process test client/database connection.
 
-- [ ] **Step 3: Add no-fallback regression test**
+- [x] **Step 3: Add no-fallback regression test**
 
 Monkeypatch or otherwise make Central/domain fallback paths explode if touched, then resolve/render through Task 13. The test should prove runtime imports/services never require:
 - Wagtail pages;
@@ -593,13 +593,13 @@ Monkeypatch or otherwise make Central/domain fallback paths explode if touched, 
 
 Prefer import/query isolation assertions over brittle global monkeypatching.
 
-- [ ] **Step 4: Run Task 13 focused tests**
+- [x] **Step 4: Run Task 13 focused tests**
 
 ```bash
 .venv/bin/pytest linuxlab/runtime/tests linuxlab/sync/tests -v
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add linuxlab/runtime/tests linuxlab/sync/tests
@@ -618,7 +618,7 @@ git commit -m "test: prove offline pinned runtime serving"
 **Interfaces:**
 - Records implementation result without silently changing T13-D01–D15.
 
-- [ ] **Step 1: Audit dependency direction**
+- [x] **Step 1: Audit dependency direction**
 
 Run:
 
@@ -635,7 +635,7 @@ Expected:
 
 Imports used only for type names/tests must be judged semantically, not by grep alone.
 
-- [ ] **Step 2: Append an implementation record to the dev log**
+- [x] **Step 2: Append an implementation record to the dev log**
 
 Record:
 - implementation commit range;
@@ -647,14 +647,14 @@ Record:
 
 If implementation uncovers a new architectural choice not already covered, STOP and request human approval instead of adding `T13-D16` unilaterally.
 
-- [ ] **Step 3: Run documentation diff review**
+- [x] **Step 3: Run documentation diff review**
 
 ```bash
 git diff --check
 git diff -- docs/devlog/2026-08-30-task13-runtime-decisions.md docs/superpowers/specs/2026-08-30-task13-node-runtime-design.md
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/devlog/2026-08-30-task13-runtime-decisions.md
@@ -671,19 +671,19 @@ git commit -m "docs: record Task 13 runtime implementation"
 **Interfaces:**
 - Produces final Task 13 implementation report for independent review.
 
-- [ ] **Step 1: Run focused runtime tests**
+- [x] **Step 1: Run focused runtime tests**
 
 ```bash
 .venv/bin/pytest linuxlab/runtime/tests -v
 ```
 
-- [ ] **Step 2: Run sync tests**
+- [x] **Step 2: Run sync tests**
 
 ```bash
 .venv/bin/pytest linuxlab/sync/tests -v
 ```
 
-- [ ] **Step 3: Run relevant existing suites**
+- [x] **Step 3: Run relevant existing suites**
 
 ```bash
 .venv/bin/pytest \
@@ -699,7 +699,7 @@ git commit -m "docs: record Task 13 runtime implementation"
 
 Adjust only if exact test directory names differ in the repository; do not omit equivalent suites.
 
-- [ ] **Step 4: Run complete suite**
+- [x] **Step 4: Run complete suite**
 
 ```bash
 env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest -v
@@ -707,7 +707,7 @@ env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest -v
 
 Expected: at least the accepted 513-test baseline plus Task 13 tests, all passing.
 
-- [ ] **Step 5: Run static/framework checks**
+- [x] **Step 5: Run static/framework checks**
 
 ```bash
 .venv/bin/ruff check .
@@ -725,7 +725,7 @@ DJANGO_SETTINGS_MODULE=linuxlab.settings.node .venv/bin/python manage.py makemig
 
 Expected: no issues and no model changes.
 
-- [ ] **Step 6: Verify scope**
+- [x] **Step 6: Verify scope**
 
 ```bash
 git status --short
@@ -740,6 +740,6 @@ Confirm:
 - no Task 11 package changes;
 - no React/SPA.
 
-- [ ] **Step 7: Produce Task 13 implementation report and STOP**
+- [x] **Step 7: Produce Task 13 implementation report and STOP**
 
 Do not begin Task 14. Independent review is required before Task 13 is closed.
