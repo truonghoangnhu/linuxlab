@@ -98,6 +98,24 @@ LINUXLAB_CAN_SERVE_LEARNER_CONTENT = False
 LINUXLAB_SYNC_ENABLED = os.environ.get("LINUXLAB_SYNC_ENABLED", "false").lower() == "true"
 LINUXLAB_NODE_ID = os.environ.get("LINUXLAB_NODE_ID") or None
 
+# Task 14 Node-side transport/worker configuration (T14-D01, T14-D02,
+# T14-D16, T14-D17). The bearer secret lives in environment/local secret
+# configuration only -- never in the database (T14-D18).
+LINUXLAB_SYNC_SECRET = os.environ.get("LINUXLAB_SYNC_SECRET") or None
+LINUXLAB_CENTRAL_URL = os.environ.get("LINUXLAB_CENTRAL_URL") or None
+LINUXLAB_SYNC_ALLOW_INSECURE_HTTP = (
+    os.environ.get("LINUXLAB_SYNC_ALLOW_INSECURE_HTTP", "false").lower() == "true"
+)
+LINUXLAB_SYNC_BATCH_MAX_EVENTS = int(os.environ.get("LINUXLAB_SYNC_BATCH_MAX_EVENTS", "100"))
+LINUXLAB_SYNC_BATCH_MAX_BYTES = int(os.environ.get("LINUXLAB_SYNC_BATCH_MAX_BYTES", "1000000"))
+LINUXLAB_SYNC_LEASE_SECONDS = int(os.environ.get("LINUXLAB_SYNC_LEASE_SECONDS", "300"))
+LINUXLAB_SYNC_BACKOFF_BASE_SECONDS = float(
+    os.environ.get("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", "5")
+)
+LINUXLAB_SYNC_BACKOFF_CAP_SECONDS = float(
+    os.environ.get("LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", "3600")
+)
+
 
 def database_config(default_name):
     """Build a PostgreSQL DATABASES entry for a deployment profile.

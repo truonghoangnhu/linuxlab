@@ -67,6 +67,32 @@ class SyncTransport(Protocol):
     def send_batch(self, envelopes: tuple[WireEventEnvelope, ...]) -> BatchAck: ...
 
 
+class TransportError(Exception):
+    """Base for whole-batch (not per-event) transport failures raised by
+    send_batch() -- always classify into exactly one of the subclasses
+    below rather than raising this directly (T14-D29)."""
+
+
+class TransientTransportError(TransportError):
+    """Timeout, DNS/connect failure, 5xx, or a malformed/unparseable
+    response -- always safely retryable; never a reason to dead-letter
+    any event (T14-D14)."""
+
+
+class AuthTransportError(TransportError):
+    """401/403 -- a channel/credential fault, never an individual event's
+    fault; callers must release the whole claimed batch back to PENDING
+    without dead-lettering and without incrementing per-event attempts
+    (T14-D17)."""
+
+
+class ProtocolTransportError(TransportError):
+    """400/413 -- the outgoing request itself was malformed/oversized;
+    a Task 14 implementation-side batching fault, not any one event's
+    fault, so it is handled the same as a transient failure by the
+    flush orchestrator rather than dead-lettering individual events."""
+
+
 @dataclass(frozen=True)
 class SyncEventContract:
     """One registered (event_type, schema_version)'s serialization/
