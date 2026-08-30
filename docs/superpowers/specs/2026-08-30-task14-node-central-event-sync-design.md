@@ -347,6 +347,8 @@ The transaction commits before network I/O begins.
 
 Expired leases make events reclaimable.
 
+**Reclaiming a lease-expired event must fence out the stale worker that originally claimed it (corrective).** A worker whose lease has already expired and been reclaimed by another worker must not be able to affect that row's state afterward — not to mark it `DELIVERED`, not to release it back to `PENDING`, not to dead-letter it, and not to undo the reclaiming worker's own transition. Every post-network write (delivered/dead-letter/release) must prove, at write time, that it still owns the currently active claim, not merely that it once did. A stale worker's write affects zero rows rather than raising or retrying.
+
 This scheduling policy is not a transport ordering guarantee.
 
 ## 12. Batch construction
@@ -359,6 +361,8 @@ A batch is bounded by both:
 The first limit reached ends the batch.
 
 Limits are runtime configuration, not hard-coded into the event contract.
+
+**Byte accounting must measure the actual outgoing HTTP request body** (corrective, T14-D40 context). A single shared serializer produces both the bytes counted against the byte limit and the bytes `HttpSyncTransport` transmits — there is no second, differently-formatted encoding used only for size estimation. This closes a gap identified in the independent review: an estimate built from a different JSON encoding than the wire body can under- or over-count relative to what Central actually receives, which in turn makes the request-level 413 behavior in §18.3 unreliable.
 
 ## 13. Transport
 
@@ -526,8 +530,8 @@ Examples:
 
 ```text
 401/403 → auth/channel failure
-400     → malformed request/batch
-413     → request exceeds accepted batch limits
+400     → malformed request/batch (see §18.3 deterministic-400 handling)
+413     → request exceeds accepted batch limits (see §18.3 / T14-D40)
 5xx     → transient Central failure
 2xx     → authenticated structurally valid batch with per-event results
 ```
@@ -543,6 +547,8 @@ rejected
 Node marks only explicitly confirmed `accepted`/`duplicate` event IDs as delivered.
 
 Missing or malformed results are unconfirmed and remain retryable.
+
+**Ambiguous per-event results never authorize an irreversible transition (corrective, T14-D30 reaffirmed).** A response result set is not a naive last-entry-wins map: if the same `event_id` appears more than once with conflicting or duplicated verdicts, or a `rejected` result is missing its rejection code, that event's outcome is treated as unconfirmed/retryable — never `DELIVERED`, never `DEAD_LETTER`. An unknown `event_id` present in the results that was not part of the sent batch is ignored and has no effect on any sent event.
 
 ## 18. Failure taxonomy
 
@@ -572,6 +578,15 @@ Malformed/oversized request:
 
 - request-level error;
 - Node does not infer delivery for unconfirmed events.
+
+**413 recovery (T14-D40, corrective).** A 413 response is a batch-sizing fault, not a per-event verdict:
+
+- if the rejected batch contained more than one event, the Node splits/adapts it and retries smaller subsets, outside any open DB transaction and without recursively holding claim locks;
+- if a single already-claimed event alone still receives 413, that exact event is permanently unsendable under the current transport contract and transitions to `DEAD_LETTER` with rejection code `EVENT_TOO_LARGE`;
+- good neighboring events already claimed in the same cycle must still reach `DELIVERED` independently — an oversized event must never starve them;
+- this does not introduce a new Outbox state; `DEAD_LETTER` already exists (T14-D09, §10).
+
+**Deterministic 400 (T14-D40, corrective).** A 400 is not automatically `EVENT_TOO_LARGE` and must not be treated as a per-event payload rejection merely because the request as a whole was malformed — only a valid per-event `rejected` result from Central does that (T14-D09, T14-D17). A stable/deterministic 400 (the same malformed request would recur unchanged on an identical retry) must not be retried as a tight loop; the worker takes an operator-visible/degraded path with safe long backoff instead of rebuilding and resending the identical blocking request indefinitely.
 
 ### 18.4 Permanent event rejection
 

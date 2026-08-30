@@ -446,6 +446,22 @@ This decision does not change:
 
 No automatic state transition to `DELIVERED` may be justified solely by a `FileSyncTransport` write in production semantics.
 
+## T14-D40 — Deterministic HTTP 413 recovery
+
+- 413 for a batch containing multiple events is a batch-sizing fault, not a
+  permanent rejection of every event.
+- The Node must split/adapt that batch and retry smaller batches.
+- If the batch has been reduced to one event and Central still returns 413,
+  that event is permanently unsendable under the current transport contract.
+- That singleton event transitions to DEAD_LETTER with code EVENT_TOO_LARGE.
+- Good events must continue and must not be starved behind the oversized event.
+- No new Outbox state is introduced.
+- HTTP 400 is not automatically EVENT_TOO_LARGE; deterministic 400 must enter
+  an operator-visible/degraded non-tight-loop path rather than replay the same
+  malformed request indefinitely.
+
+This decision is a corrective addition approved 2026-08-31, following the independent Task 14 architecture/security review (verdict B, TASK 14 CONDITIONAL). It does not change T14-D01 through T14-D39; it resolves an underspecified gap in T14-D16 (batch limits are count + bytes) and T14-D09 (permanent rejection and dead letter) by defining exactly what happens when the byte limit Task 14 itself enforces locally is still rejected by Central as oversized.
+
 ## Approved component layout
 
 Task 14 remains inside the existing `linuxlab.sync` Django app. No new Django app is created.
