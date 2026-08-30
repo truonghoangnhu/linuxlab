@@ -39,15 +39,34 @@ three members:
     signature.bin   -- a raw 64-byte Ed25519 signature over
                        manifest.json bytes + payload.json bytes
 
-verify_package() is the sole trust boundary: it takes an EXTERNALLY
-supplied trusted public key -- never a key embedded in the package -- and
-either returns a validated VerifiedPackage or raises
+verify_package() is the sole trust boundary: it takes the trusted activity
+registry (internal DI, never attacker-controlled package data) and an
+EXTERNALLY supplied trusted public key -- never a key embedded in the
+package -- and either returns a validated VerifiedPackage or raises
 PackageVerificationError. It fully validates archive structure, the
 manifest, the payload envelope's shape (including cross-checking manifest
 identity against the embedded publication identity, and independently
-recomputing the embedded Task 09 content_hash), and the signature, before
-returning anything. It is side-effect free: no DB writes, no extraction,
-no activation (Task 12 owns package lifecycle).
+recomputing the embedded Task 09 content_hash), the EXACT dependency
+closure (every publication activity reference has a matching activity
+artifact and no orphans, every activity's exact question dependencies have
+matching learner/server artifacts and no orphans -- using the SAME pure
+_collect_activity_refs() walker build_package() uses, so the two can never
+silently diverge), and the signature, before returning anything. It never
+touches the database (everything it needs is the package bytes, the
+trusted registry, and the trusted key) and is otherwise side-effect free:
+no extraction, no activation (Task 12 owns package lifecycle).
+
+verify_package() returns bytes, not a parsed mutable dict: VerifiedPackage
+carries only the frozen PackageManifest plus the exact immutable
+`package_bytes`/`payload_bytes` that were cryptographically verified --
+there is no supported way to mutate "the verified payload" through
+VerifiedPackage, because there is no authoritative parsed payload exposed
+by it at all. A caller may independently parse `payload_bytes` into its own
+dict, but that parse is the caller's own unauthoritative interpretation,
+not the trust-boundary object. Task 12's future staging must accept a
+VerifiedPackage (or its payload_bytes) and parse+stage in the same trusted
+operation -- never accept a caller-supplied replacement payload dict as
+equivalent to a verified one.
 """
 
 import json
@@ -119,13 +138,32 @@ class PackageManifest:
 @dataclass(frozen=True)
 class VerifiedPackage:
     """The full, fully-validated result of verify_package(): the manifest
-    plus the parsed package payload envelope, so a caller (Task 12) can
-    stage `publication`/`activities`/`questions`/`server` without needing
-    a second parse pass over already-verified bytes.
+    (scalar/frozen fields only) plus the EXACT immutable bytes that were
+    cryptographically verified. This is the trust boundary Task 12 must
+    stage from -- bytes, not a parsed mutable dict, precisely because a
+    parsed dict/list graph is mutable after the fact even inside a frozen
+    dataclass (Task 11 final correction, Critical): reassigning
+    `verified.manifest` fails (frozen), but `verified.payload["x"] = y`
+    would NOT have failed on the prior payload:dict design, letting
+    unsigned data cross the verify -> stage boundary silently.
+
+    `package_bytes` is the exact archive bytes verify_package() was given
+    (defensively copied via bytes() so a caller's mutable bytearray/
+    memoryview input can never later change what this object reports).
+    `payload_bytes` is the exact stored payload.json member bytes: the
+    same bytes that were SHA-256 checked against the manifest, included in
+    the signed message, JSON-parsed, schema-validated, and
+    dependency-closure-validated. Nothing here is re-serialized/
+    re-canonicalized before being returned.
+
+    A caller may independently `json.loads(verified.payload_bytes)` to get
+    a working dict -- that parse is the caller's own unauthoritative
+    interpretation, not a second copy of the trust boundary.
     """
 
     manifest: PackageManifest
-    payload: dict
+    package_bytes: bytes
+    payload_bytes: bytes
 
 
 def _manifest_dict(kind, source_public_id, version, created_at, payload_sha256):
@@ -192,12 +230,16 @@ def _load_authoritative_snapshot(candidate):
     return authoritative
 
 
-# --- build: exact immutable dependency closure ----------------------------
+# --- shared: pure, DB-free reference walking ------------------------------
+# Used by BOTH build_package() and verify_package() so the two can never
+# silently parse the Task 09 publication payload differently (Task 11
+# final correction, section 14: a shared reference walker, not two
+# independent implementations that could drift apart).
 
 
-def _collect_activity_refs(snapshot_payload):
+def _collect_activity_refs(publication_payload):
     refs = set()
-    for module in snapshot_payload["learning_path"]["modules"]:
+    for module in publication_payload["learning_path"]["modules"]:
         for lesson in module["lessons"]:
             for block in lesson["blocks"]:
                 if block["type"] == "activity":
@@ -206,6 +248,43 @@ def _collect_activity_refs(snapshot_payload):
                         (uuid.UUID(str(value["activity_public_id"])), value["activity_version"])
                     )
     return refs
+
+
+def _resolve_provider(type_key, activity_registry, error_cls):
+    """Fail closed (Task 11 final correction): a package whose activity
+    references a type_key with no registered provider has unknown runtime
+    behavior and must not be considered buildable or deployable.
+    """
+    try:
+        return activity_registry.get(type_key)
+    except LookupError as exc:
+        raise error_cls(f"no provider registered for type_key '{type_key}'") from exc
+
+
+def _collect_provider_dependencies(provider, config, error_cls):
+    """Fail closed (Task 11 final correction): collect_dependencies() is a
+    REQUIRED part of the ActivityProvider contract. Silence -- a provider
+    missing the method entirely -- is never interpreted as "no
+    dependencies"; only an explicit ActivityDependencies.empty() return
+    value means that. This is what stops a future dependency-bearing
+    provider that forgets to implement the method from silently producing
+    an incomplete package.
+    """
+    collect_dependencies = getattr(provider, "collect_dependencies", None)
+    if collect_dependencies is None:
+        raise error_cls(
+            f"provider for type_key '{provider.type_key}' does not implement "
+            "collect_dependencies(); every registered ActivityProvider must "
+            "declare its exact dependencies explicitly, using "
+            "ActivityDependencies.empty() if it has none"
+        )
+    try:
+        return collect_dependencies(config)
+    except (ValueError, TypeError) as exc:
+        raise error_cls(f"provider dependency discovery failed: {exc}") from exc
+
+
+# --- build: exact immutable dependency closure ----------------------------
 
 
 def _resolve_activities(activity_refs, activity_registry):
@@ -233,18 +312,11 @@ def _resolve_activities(activity_refs, activity_registry):
             }
         )
 
-        try:
-            provider = activity_registry.get(type_key)
-        except LookupError as exc:
-            raise PackageBuildError(f"no provider registered for type_key '{type_key}'") from exc
-
-        # Providers with no dependencies (the default for any provider that
-        # doesn't implement this) contribute nothing (ADR-011: the
-        # packaging layer does not understand provider config internals).
-        collect_dependencies = getattr(provider, "collect_dependencies", None)
-        if collect_dependencies is not None:
-            dependencies = collect_dependencies(activity_version.config)
-            question_refs.update(dependencies.question_versions)
+        provider = _resolve_provider(type_key, activity_registry, PackageBuildError)
+        dependencies = _collect_provider_dependencies(
+            provider, activity_version.config, PackageBuildError
+        )
+        question_refs.update(dependencies.question_versions)
 
     activities.sort(key=lambda a: (a["activity_public_id"], a["version"]))
     return activities, question_refs
@@ -636,10 +708,81 @@ def _parse_payload(payload_bytes):
     return payload
 
 
-def verify_package(package_bytes, trusted_public_key):
-    """Verify a .llpkg archive's structure, integrity, payload schema, and
-    Ed25519 signature, and return its validated VerifiedPackage -- or
-    raise PackageVerificationError.
+# --- verify: exact dependency closure --------------------------------------
+# Proves the package is not merely well-formed but SELF-CONTAINED: every
+# publication activity reference has a matching activity artifact (no
+# missing, no orphan), and every activity's exact question dependencies
+# have matching learner artifacts (already known, transitively, to have
+# matching server artifacts too, via _validate_server_section above). A
+# correctly-signed package that omits or adds an artifact must fail here
+# even though its signature is genuinely valid -- cryptographic
+# authenticity alone does not prove structural completeness.
+
+
+def _verify_activity_closure(payload):
+    expected_activity_refs = _collect_activity_refs(payload["publication"]["payload"])
+    actual_activity_refs = {
+        (uuid.UUID(entry["activity_public_id"]), entry["version"])
+        for entry in payload["activities"]
+    }
+
+    if expected_activity_refs != actual_activity_refs:
+        missing = sorted(
+            expected_activity_refs - actual_activity_refs, key=lambda k: (str(k[0]), k[1])
+        )
+        orphan = sorted(
+            actual_activity_refs - expected_activity_refs, key=lambda k: (str(k[0]), k[1])
+        )
+        raise PackageVerificationError(
+            "payload.activities does not exactly match the publication's activity "
+            f"references (missing={missing}, orphan={orphan})"
+        )
+
+    return payload["activities"]
+
+
+def _verify_question_closure(activities, questions, activity_registry):
+    expected_question_refs = set()
+    for entry in activities:
+        provider = _resolve_provider(entry["type_key"], activity_registry, PackageVerificationError)
+        dependencies = _collect_provider_dependencies(
+            provider, entry["config"], PackageVerificationError
+        )
+        expected_question_refs.update(dependencies.question_versions)
+
+    actual_question_refs = {
+        (uuid.UUID(entry["question_public_id"]), entry["version"]) for entry in questions
+    }
+
+    if expected_question_refs != actual_question_refs:
+        missing = sorted(
+            expected_question_refs - actual_question_refs, key=lambda k: (str(k[0]), k[1])
+        )
+        orphan = sorted(
+            actual_question_refs - expected_question_refs, key=lambda k: (str(k[0]), k[1])
+        )
+        raise PackageVerificationError(
+            "payload.questions does not exactly match the activity dependency "
+            f"closure (missing={missing}, orphan={orphan})"
+        )
+
+
+def _verify_dependency_closure(payload, activity_registry):
+    activities = _verify_activity_closure(payload)
+    _verify_question_closure(activities, payload["questions"], activity_registry)
+    # payload.server.questions == payload.questions is already enforced by
+    # _validate_server_section() inside _parse_payload(), so the closure
+    # activities -> questions -> server.questions is now fully proven.
+
+
+def verify_package(package_bytes, activity_registry, trusted_public_key):
+    """Verify a .llpkg archive's structure, integrity, payload schema,
+    EXACT dependency closure, and Ed25519 signature, and return its
+    validated VerifiedPackage -- or raise PackageVerificationError.
+
+    `activity_registry` is a trusted internal dependency-injection
+    boundary (never attacker-controlled package data) used to resolve each
+    packaged activity's provider for dependency-closure verification.
 
     `trusted_public_key` is an Ed25519PublicKey supplied EXTERNALLY by the
     caller (e.g. Node configuration) -- this function never reads a key
@@ -647,8 +790,15 @@ def verify_package(package_bytes, trusted_public_key):
     with its own embedded key would prove nothing about the publisher's
     authenticity (ADR-010).
 
-    Side-effect free: no DB writes, no extraction to disk, no activation.
+    Never touches the database. Otherwise side-effect free: no extraction
+    to disk, no activation.
     """
+    # Defensive immutable copy: a caller-supplied bytearray/memoryview must
+    # not be able to change what this function verifies OR what the
+    # returned VerifiedPackage.package_bytes later reports, if the caller
+    # mutates their own buffer after this call returns.
+    package_bytes = bytes(package_bytes)
+
     try:
         archive = zipfile.ZipFile(BytesIO(package_bytes))
     except zipfile.BadZipFile as exc:
@@ -690,4 +840,13 @@ def verify_package(package_bytes, trusted_public_key):
             "manifest package_version does not match payload.publication.version"
         )
 
-    return VerifiedPackage(manifest=PackageManifest(**manifest_fields), payload=payload)
+    _verify_dependency_closure(payload, activity_registry)
+
+    # `payload` (the parsed dict) has done its job -- structural and
+    # closure validation -- and is discarded here. It is never part of the
+    # returned trust boundary (Task 11 final correction).
+    return VerifiedPackage(
+        manifest=PackageManifest(**manifest_fields),
+        package_bytes=package_bytes,
+        payload_bytes=payload_bytes,
+    )

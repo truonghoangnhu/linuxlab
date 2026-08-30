@@ -10,12 +10,17 @@ class ActivityDependencies:
     (public_id, version) pair -- never "latest" -- matching the same
     exact-version convention used everywhere else in this codebase.
 
-    A provider with no dependencies -- the default for any provider that
-    does not implement collect_dependencies() at all -- is
-    ActivityDependencies(), i.e. every field empty.
+    Silence is not a valid dependency declaration (Task 11 final
+    correction): a provider with no external dependencies must call
+    ActivityDependencies.empty() explicitly, rather than package/build code
+    inferring "none" because collect_dependencies() happens to be missing.
     """
 
     question_versions: tuple[tuple[uuid.UUID, int], ...] = ()
+
+    @classmethod
+    def empty(cls) -> "ActivityDependencies":
+        return cls()
 
 
 class ActivityProvider(Protocol):
@@ -32,11 +37,12 @@ class ActivityProvider(Protocol):
     def evaluate(self, config: dict[str, Any], submission: Any) -> dict[str, Any]: ...
 
     def collect_dependencies(self, config: dict[str, Any]) -> ActivityDependencies:
-        """Optional (Task 11): return the exact immutable artifacts this
-        config depends on, for package dependency closure. A provider that
-        does not implement this method is treated by callers as having no
-        dependencies -- this method exists on the Protocol as documentation
-        of the extension point, not as a requirement every existing
-        provider must implement.
+        """Required (Task 11 final correction): return the exact immutable
+        artifacts this config depends on, for package dependency closure. A
+        provider with no dependencies must return ActivityDependencies.empty()
+        explicitly. Package build/verify code treats a provider that omits
+        this method as a fail-closed error, never as "no dependencies" --
+        an accidentally-incomplete provider must not be able to produce a
+        package Task 12 later discovers is missing data it needed.
         """
         ...
