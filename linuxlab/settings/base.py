@@ -36,6 +36,7 @@ INSTALLED_APPS = [
     "linuxlab.learning",
     "linuxlab.publication",
     "linuxlab.catalog",
+    "linuxlab.sync",
 ]
 
 MIDDLEWARE = [
