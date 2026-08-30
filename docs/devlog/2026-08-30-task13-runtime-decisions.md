@@ -181,7 +181,7 @@ Expected semantics:
 - context valid but requested exact artifact is not contained in the pinned package → `RuntimeArtifactNotFound`;
 - context locator/identity does not match persisted installed package → `RuntimeContextInvalid`.
 
-Task 13 must not map these directly to HTTP status codes. HTTP mapping belongs to a later web/API layer.
+The runtime core must not map these directly to HTTP status codes. HTTP mapping belongs to the Task 13 HTTP adapter (see T13-D15 below) — the adapter is part of Task 13 itself, architecturally separate from the runtime core, not a distant "later" layer. *(Wording clarified 2026-08-30 alongside T13-D15; see History note below — the exception semantics themselves are unchanged.)*
 
 ---
 
@@ -235,6 +235,33 @@ Task 13 must not implement:
 - Wagtail runtime fallback;
 - React frontend;
 - long-running request transaction machinery.
+
+---
+
+## History — HTTP scope correction (2026-08-30)
+
+1. **Decision being superseded:** the initial design spec (`docs/superpowers/specs/2026-08-30-task13-node-runtime-design.md`, §2, as first committed in `0024f82`) listed "HTTP endpoint design" as a Task 13 non-goal.
+2. **New decision:** T13-D15, below — Task 13 explicitly includes the authoritative Node LAN HTTP serving route as a thin adapter over the runtime core. "HTTP endpoint design" is no longer a Task 13 non-goal.
+3. **Reason:** the checked-in authoritative Task 13 prompt (`docs/codex/task-prompts/TASK_13_offline-node-serving.md`) requires `linuxlab/sync/views.py`, `linuxlab/sync/urls.py`, templates, and a `/learn/<uuid>/` LAN route as the Task 13 deliverable, gated to the Node profile and tested with all outbound network access patched to fail. That deliverable is HTTP-shaped by definition; excluding "HTTP endpoint design" contradicted the authoritative prompt.
+4. **Migration/backward-compatibility impact:** none. This is a documentation-only correction — no runtime or HTTP code has been written yet (Task 13 implementation has not started), so nothing existing changes behavior. D13-01 through D13-13 remain fully valid and unmodified in substance; only the one HTTP-status-mapping sentence in D13-10 was reworded in place (see that entry) to remove language that implied HTTP mapping was a distant future concern rather than part of Task 13 itself.
+5. **Review approval:** corrective documentation task from the coordinator, 2026-08-30 ("Task 13 Design Documentation Corrective — Align Runtime Core with Authoritative LAN Serving Deliverable").
+
+**Identifier note:** decisions D13-01 through D13-13 above were numbered during the initial spec-writing session. The corrective task that produced T13-D15 restated D13-01 through D13-13's content under its own working labels (T13-D01 through T13-D14) purely for cross-reference while reviewing this document; that restatement confirmed the content already present here was complete and did not request renumbering the existing entries. T13-D15 is the first decision recorded under the `T13-D` prefix and is additive, not a renumbering of the D13-xx series.
+
+---
+
+## T13-D15 — LAN HTTP serving adapter
+
+**Decision:** Task 13 includes the authoritative Node LAN HTTP serving route as a thin adapter over the plain-Python runtime core (D13-01 through D13-13).
+
+Concretely:
+
+- the route lives in the existing `linuxlab.sync` Django app (`views.py`, `urls.py`, templates) — not in `linuxlab/runtime/`, and not in a new Django app;
+- the route's responsibilities are limited to: receive the request, call the runtime core, render a template, map runtime domain exceptions to a response, and remain Node-profile-only;
+- the route must never perform its own `Installed*` ORM queries for business/runtime resolution, choose a latest version, fall back to Central/domain/Wagtail data, expose grading data, or call `import_package()`/`activate_package()`/`rollback_package()`;
+- the runtime core remains framework-light: it must not depend on Django request/response classes, and it must not itself assign HTTP status codes.
+
+**Reason:** the checked-in authoritative Task 13 prompt requires this route as the Task 13 deliverable. Treating "HTTP endpoint design" as a non-goal (the original wording) contradicted that requirement. Keeping the HTTP-specific transport/rendering logic strictly out of the runtime core — rather than abandoning the runtime-core/DTO architecture already approved in D13-02 through D13-13 — preserves that architecture's testability and its independence from any particular delivery mechanism.
 
 ---
 

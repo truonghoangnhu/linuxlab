@@ -5,39 +5,76 @@
 **Depends on:** Task 12 FINAL PASS at `6e8d9545a5c4507a5c21eb17f55a0332efd53747`
 **Baseline:** 513 tests
 **Decision log:** `docs/devlog/2026-08-30-task13-runtime-decisions.md`
+**Correction:** 2026-08-30 — the authoritative checked-in Task 13 prompt requires a LAN HTTP serving route as part of Task 13; the original wording listing "HTTP endpoint design" as a non-goal was superseded (see decision log history note and T13-D15). This revision corrects §2, §3, and adds the HTTP adapter sections; the runtime-core architecture (§4–§19) is unchanged.
 
 ## 1. Goal
 
-Task 13 introduces the Node runtime read boundary for offline LinuxLab content.
+Task 13 introduces the Node runtime read boundary for offline LinuxLab content, together with the thin Node HTTP adapter that serves that content over the LAN (the checked-in Task 13 deliverable; T13-D15).
 
-The runtime resolves learner-safe publication/activity/question data and server-only grading data exclusively from the exact installed package explicitly selected as ACTIVE by Task 12.
+The runtime core resolves learner-safe publication/activity/question data and server-only grading data exclusively from the exact installed package explicitly selected as ACTIVE by Task 12. The HTTP adapter calls the runtime core to render that data; it performs no independent business/runtime resolution of its own.
 
-It must remain correct if package activation changes during a request/use-case.
+The whole boundary must remain correct if package activation changes during a request/use-case.
 
 ## 2. Non-goals
 
 Task 13 does not implement:
 
-- package download;
-- Central–Node synchronization;
-- Outbox/Inbox;
-- package activation/rollback redesign;
-- new `.llpkg` schema;
-- Wagtail serving fallback;
-- authoring;
-- browser UI;
-- HTTP endpoint design;
-- browser grading endpoints;
+- Task 14 synchronization (Outbox/Inbox/event sync);
+- Central package download/transport;
+- package activation/import/rollback changes, unless an actual integration defect is discovered;
+- new `.llpkg` schema or signing/verification changes;
+- Wagtail authoring, or a Wagtail runtime fallback;
+- browser/learner grading API or endpoints;
 - exam security/kiosk;
-- package garbage collection.
+- package garbage collection;
+- latest-version fallback;
+- React/frontend SPA work.
+
+**HTTP LAN serving itself IS in Task 13 scope** (§3B, §20–§23; T13-D15) — it is no longer listed as a non-goal. What remains excluded is everything above: richer web/API surface, authentication/authorization redesign, and anything belonging to a later task.
 
 ## 3. Architectural boundary
 
-Task 13 introduces a Python runtime service layer between higher-level execution/rendering code and Task 12 installed package models.
+Task 13 has TWO layers.
+
+### 3A. Plain-Python runtime core
+
+`linuxlab/runtime/` is **NOT** a new Django app. It is a plain Python package that provides the runtime/domain read boundary between higher-level execution/rendering code and Task 12 installed package models.
 
 Normal consumers must not directly depend on `InstalledPackage`, `InstalledPublication`, `InstalledActivityVersion`, `InstalledQuestionVersion`, or `InstalledQuestionGrading` as their runtime contract.
 
-Conceptual flow:
+### 3B. Thin Node HTTP adapter
+
+The checked-in Task 13 prompt (`docs/codex/task-prompts/TASK_13_offline-node-serving.md`) requires an authoritative LAN HTTP serving route — conceptually `GET /learn/<uuid>/` — backed only by active local package data. This route is implemented as a **thin adapter** living in the existing `linuxlab.sync` app (`views.py`, `urls.py`, templates), per T13-D15. The adapter calls the runtime core in 3A; it must not duplicate runtime resolution rules, and it must not directly query `Installed*` models for business/runtime resolution. Full contract: §20.
+
+### Dependency direction
+
+```text
+sync HTTP adapter
+        ↓
+linuxlab.runtime
+        ↓
+Installed* persistence models
+```
+
+Never:
+
+```text
+linuxlab.runtime
+        ↓
+linuxlab.sync.views
+```
+
+and never:
+
+```text
+templates/views
+        ↓
+direct Central authoring models
+```
+
+The runtime package must not depend on Django request/response classes, so it stays framework-light and independently testable without an HTTP test client.
+
+### Conceptual flow (runtime core)
 
 ```text
 caller/use-case
@@ -70,7 +107,7 @@ It must never fall back to:
 - highest installed version;
 - most recently imported package.
 
-This preserves the Task 11/12 chain from signed publication to explicit Node activation.
+This preserves the Task 11/12 chain from signed publication to explicit Node activation. This rule applies identically whether the caller is a runtime-core consumer or the HTTP adapter — the HTTP adapter never bypasses it.
 
 ## 5. RuntimePackageContext
 
@@ -249,7 +286,7 @@ No combined DTO or default query should merge learner content with answer keys/s
 
 ## 13. Error model
 
-Use a small explicit runtime-domain hierarchy.
+Use a small explicit runtime-domain hierarchy, owned by the runtime core.
 
 Expected semantics:
 
@@ -267,7 +304,7 @@ Do not use this merely because pinned package is now ARCHIVED.
 
 Raised when the exact requested publication/activity/question/grading artifact is not present in the pinned package.
 
-Task 13 must not assign HTTP status codes.
+The runtime core must not assign HTTP status codes or otherwise know about HTTP. Mapping these exceptions to a response is entirely the HTTP adapter's job — see §21.
 
 ## 14. Package state semantics
 
@@ -309,14 +346,14 @@ A context pinned to Package A must never retrieve:
 
 Even if UUID/version values happen to overlap across package inventory, package ownership is part of every lookup.
 
-## 17. Offline requirement
+## 17. Offline requirement (runtime core)
 
-After Task 12 package import/activation, all Task 13 operations require only:
+After Task 12 package import/activation, all Task 13 runtime-core operations require only:
 
 - local Node PostgreSQL;
 - local application code.
 
-No Central DB, Central API, Internet, Wagtail read, package signer, or trusted public key is needed for normal runtime resolution.
+No Central DB, Central API, Internet, Wagtail read, package signer, or trusted public key is needed for normal runtime resolution. The HTTP adapter inherits this requirement unchanged — see §23 for the HTTP-specific test expectation (network sockets patched to fail).
 
 ## 18. Concurrency model
 
@@ -331,7 +368,7 @@ Consistency comes from:
 
 Activation may occur concurrently and affects only which package future contexts open.
 
-## 19. Security properties
+## 19. Security properties (runtime core)
 
 Task 13 must preserve these invariants:
 
@@ -343,9 +380,67 @@ Task 13 must preserve these invariants:
 6. runtime does not accidentally execute unpublished Central/domain state;
 7. local database PK is never public/cross-node identity.
 
-## 20. Expected module organization
+The HTTP adapter must preserve these too, purely by construction (it only ever touches the runtime core's public surface) — see §22 for the HTTP-specific restatement of invariant 1.
 
-Preferred:
+## 20. HTTP adapter contract
+
+The authoritative Node LAN route (conceptually `GET /learn/<uuid>/`) is a thin adapter over the runtime core in §3A–§19. Exact route naming and URL namespace follow the checked-in Task 13 prompt and existing project URL conventions (e.g. the existing `linuxlab.learning.urls` include pattern in `linuxlab/urls.py`).
+
+The adapter's responsibilities are **limited to**:
+
+1. receive request/path parameters;
+2. call the runtime service layer (open a context, request the needed DTOs);
+3. render the appropriate template from those DTOs;
+4. translate runtime domain exceptions into HTTP/UI behavior (§21);
+5. remain Node-profile appropriate (§23).
+
+It must **NOT**:
+
+- perform its own `Installed*` ORM queries for business/runtime resolution;
+- choose latest versions;
+- fall back to Central/domain/Wagtail data;
+- expose grading data;
+- implement package activation;
+- implement package import;
+- implement synchronization.
+
+## 21. HTTP request lifecycle, pinned context, and exception mapping
+
+**One context per request.** The view opens exactly one `RuntimePackageContext` via `open_runtime_context()` at the start of request handling, and reuses that same context object for every publication/activity/question lookup needed to render the response. It must not call `open_runtime_context()` more than once per request. This is what prevents a single response from mixing, for example, a publication from v1 with an activity from v2 if an activation happens mid-request (§8, §14, T13-D14).
+
+**ACTIVE → ARCHIVED mid-request.** If the pinned package transitions from ACTIVE to ARCHIVED while a request is in flight (because an admin activated a newer version concurrently), the in-flight request's context remains valid and continues to resolve its originally pinned version to completion — the adapter does not re-open the context and does not re-check ACTIVE (§8, §14). A new request started after that point opens a new context and gets the new ACTIVE version.
+
+**Exception mapping.** The runtime core raises plain Python exceptions (§13) with no HTTP awareness; the adapter maps them:
+
+```text
+RuntimeContentUnavailable   → offline/unavailable response (no ACTIVE package for this source)
+RuntimeArtifactNotFound     → not-found response
+RuntimeContextInvalid       → fail-closed server/runtime error response
+```
+
+The runtime core must not hard-code exact status codes or templates. If the checked-in Task 13 prompt specifies exact response codes/templates for these cases, that requirement is recorded and implemented in the adapter, not the runtime core.
+
+**No silent redirect.** On `RuntimeContentUnavailable`, the adapter must not silently redirect to the latest staged/imported package, an archived package, or Central — it renders the offline-unavailable response.
+
+## 22. Learner route security boundary
+
+The learner LAN route must only use learner-safe runtime DTOs: `RuntimePublication`, `RuntimeActivity`, `RuntimeQuestion`.
+
+It must **never** call `get_runtime_question_grading()`, and must never serialize or render `answer_key` or `scoring` into the response, template context, or any client-visible artifact (HTML, headers, embedded JSON).
+
+The grading service (§12) is server-side-only infrastructure reserved for later evaluation flows — Task 13 does not add a learner-facing consumer of it. This is the HTTP-specific restatement of runtime-core invariant 1 in §19.
+
+## 23. Node profile and offline HTTP requirement
+
+**Node-only availability.** The LAN learning route is available only under the Node-capable deployment profile, per the checked-in Task 13 prompt. The Central profile must not expose this route. Gating follows the existing project profile/settings convention already established for Node-capable behavior (see `linuxlab/settings/{base,central,node,test}.py` and the `LINUXLAB_PROFILE`/`LINUXLAB_CAN_*` pattern used for Task 12's `import_package()`); Task 13 does not invent a second deployment codebase or a parallel settings mechanism.
+
+**Offline/no-network requirement.** Serving this route requires no outbound network access at any point: no Central API call, no package download, no remote resource lookup. Task 13 tests must be able to patch socket/network access to fail entirely and still successfully serve installed ACTIVE content through this route, exactly as the checked-in Task 13 prompt requires ("Test a Node serves an active LearningPath while all socket/network connection attempts are patched to fail").
+
+## 24. Expected module organization
+
+Two separate placements, with two separate responsibilities — the corrected Task 13 does **not** require moving all functionality out of `linuxlab.sync`, and does **not** create a new Django app for the runtime core:
+
+**Core architectural responsibility — plain Python package, not a Django app:**
 
 ```text
 linuxlab/runtime/
@@ -359,46 +454,62 @@ linuxlab/runtime/
 └── tests/
 ```
 
-However, before implementation Claude must inspect the checked-in Task 13 prompt and current project structure.
+**Authoritative HTTP delivery responsibility — inside the existing `linuxlab.sync` Django app:**
 
-If the authoritative prompt explicitly assigns this code to an existing app/module, stop and report the conflict before moving files or creating a new Django app.
+```text
+linuxlab/sync/
+├── views.py
+├── urls.py
+└── templates/
+    └── ...
+```
 
-A plain Python package is preferred over a new Django app unless persistent models/configuration require one. Task 13 should add no persistence model.
+Before implementation, the actual implementation step must still inspect the checked-in Task 13 prompt and current project structure for anything this design did not anticipate (e.g. an existing `linuxlab/sync/tests/` convention for where adapter tests should live). If the authoritative prompt requires yet another placement for the runtime core specifically, implementation must stop and report the conflict rather than silently diverge. A plain Python package remains preferred over a new Django app for the runtime core unless persistent models/configuration require one — and Task 13 adds no persistence model at all (§25).
 
-## 21. Database/migrations
+## 25. Database/migrations
 
 Expected: **no new models and no migration**.
 
-Task 13 is a read/runtime boundary over Task 12 installed state.
+Task 13 — both the runtime core and the HTTP adapter — is a read/runtime boundary over Task 12 installed state. The HTTP adapter adds no models of its own; it only adds `views.py`/`urls.py`/templates.
 
 If implementation appears to require persistent runtime state, stop and justify it before adding schema.
 
-## 22. Testing strategy
+## 26. Testing strategy
 
-Tests must prove behavior, not merely DTO shapes.
+Tests must prove behavior, not merely DTO or response shapes.
 
-Required load-bearing scenarios:
+### Runtime-core tests
 
-1. no ACTIVE package → `RuntimeContentUnavailable`;
-2. ACTIVE package → context pins exact identity;
+1. only an ACTIVE package can open a new context;
+2. no ACTIVE → `RuntimeContentUnavailable`;
 3. no latest fallback;
-4. activate v2 after opening context on v1 → old context still resolves v1;
-5. newly opened context resolves v2;
-6. fake/mismatched context → `RuntimeContextInvalid`;
-7. missing exact activity/question → `RuntimeArtifactNotFound`;
-8. package A context cannot retrieve package B artifact;
-9. exact activity/question version is respected;
+4. context identity pinning;
+5. fabricated/mismatched context → `RuntimeContextInvalid`;
+6. ACTIVE→ARCHIVED context remains readable;
+7. a new request/context opened after activation uses the new ACTIVE package;
+8. artifact lookup respects exact UUID/version;
+9. cross-package artifact lookup is rejected/not found;
 10. returned publication/activity/question JSON is deeply immutable;
 11. returned grading JSON is deeply immutable;
-12. learner DTO contains no answer_key/scoring;
-13. grading obtained only through grading service;
+12. learner DTO contains no `answer_key`/`scoring`;
+13. grading is obtainable only through the grading service;
 14. runtime performs no Central/Wagtail fallback;
-15. ordinary read flow works with ARCHIVED pinned package;
-16. no model instance is exposed as the public runtime result.
+15. no Django model instance is exposed as the public runtime result.
 
-Prefer a real integration fixture created through accepted Task 11 → Task 12 flow for at least one end-to-end runtime test.
+### HTTP adapter tests
 
-## 23. Architecture compatibility
+1. the authoritative route (e.g. `/learn/<uuid>/`) works on the Node profile;
+2. the Central profile rejects/does not expose the route;
+3. the route serves the active installed package only;
+4. no Central/domain fallback is reachable through the route;
+5. switching the ACTIVE package affects only new requests, not one already in flight/rendered from an older pinned context;
+6. no `answer_key`/`scoring` appears anywhere in the learner HTML/response/template context;
+7. all outbound socket/network calls are patched to fail, and the route still serves successfully;
+8. the route/adapter has no dependency on Task 14 code.
+
+Prefer a real integration fixture created through the accepted Task 11 → Task 12 flow for at least one end-to-end runtime-core test, and for at least one end-to-end HTTP adapter test.
+
+## 27. Architecture compatibility
 
 Task 13 must not change accepted Task 11/12 semantics.
 
@@ -408,24 +519,48 @@ It consumes:
 - one-ACTIVE-per-source invariant;
 - immutable installed artifacts.
 
-It must not bypass Task 12 services to mutate lifecycle.
+It must not bypass Task 12 services to mutate lifecycle. The HTTP adapter in particular must never call `import_package()`, `activate_package()`, or `rollback_package()` — it is read-only.
 
-## 24. Completion gate
+## 28. Completion gate
 
 Task 13 is complete only when:
 
-- all runtime access goes through the new service boundary in Task 13 scope;
+- all runtime access goes through the runtime-core service boundary in Task 13 scope;
 - runtime reads only installed package artifacts;
 - contexts pin exact package identity;
-- old context remains coherent after activation switch;
+- old context remains coherent after an activation switch;
 - DTOs are deeply immutable;
 - grading remains separately accessible server-side only;
-- error semantics are explicit;
+- runtime-core error semantics are explicit and HTTP-unaware;
+- the authoritative LAN HTTP route exists, is Node-profile-only, and calls only the runtime core (§20–§23);
+- the route works with all outbound network access patched to fail;
 - no migrations are introduced;
 - full existing suite remains green;
 - independent code/architecture review returns no Critical/Important findings.
 
-## 25. Deferred work
+## 29. Implementation boundary handoff
+
+The future implementation plan for Task 13 covers **both**:
+
+**A. Runtime core**
+- context (`open_runtime_context`, identity rebind)
+- DTOs (`RuntimePublication`, `RuntimeActivity`, `RuntimeQuestion`, `RuntimeQuestionGrading`, `RuntimePackageContext`)
+- deep immutable JSON (`freeze_json_value`)
+- learner content services
+- grading service
+- exceptions (`RuntimeContentUnavailable`, `RuntimeArtifactNotFound`, `RuntimeContextInvalid`)
+
+**B. Thin offline-serving adapter**
+- Node URL (`linuxlab/sync/urls.py`)
+- view (`linuxlab/sync/views.py`)
+- template(s)
+- Node-profile restriction
+- domain-error → response mapping
+- offline/no-network test coverage
+
+This document does not implement either A or B. It records the design for both so a future implementation-planning step can proceed without re-deriving this architecture.
+
+## 30. Deferred work
 
 Track but do not implement now:
 
@@ -435,5 +570,5 @@ Track but do not implement now:
 - package GC;
 - minimum LinuxLab version enforcement;
 - Task 14 synchronization;
-- HTTP/API mapping;
-- UI/runtime rendering integration beyond what checked-in Task 13 explicitly requires.
+- richer HTTP/API mapping beyond the single authoritative LAN route;
+- UI/runtime rendering integration beyond what the checked-in Task 13 prompt explicitly requires.
