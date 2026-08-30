@@ -45,6 +45,26 @@ def test_issue_returns_plaintext_secret_and_stores_only_a_hash():
     assert credential.secret not in registration.current_secret_hash
 
 
+# --- corrective (independent review finding #8): the plaintext secret must
+# never appear in IssuedNodeCredential's own repr(), not just the DB row's.
+
+
+def test_issued_credential_repr_excludes_secret():
+    credential = issue_node_registration("Lab A")
+
+    assert credential.secret not in repr(credential)
+    assert "secret=" not in repr(credential)
+
+
+def test_rotated_credential_repr_excludes_secret():
+    credential = issue_node_registration("Lab A")
+
+    rotated = rotate_node_credential(credential.node_id, timedelta(hours=1))
+
+    assert rotated.secret not in repr(rotated)
+    assert "secret=" not in repr(rotated)
+
+
 def test_issued_secret_authenticates():
     credential = issue_node_registration("Lab A")
 

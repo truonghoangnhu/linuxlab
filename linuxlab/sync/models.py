@@ -253,25 +253,60 @@ def _insert_immutable_row(model_cls, **fields):
     return instance
 
 
-def _write_immutable_row_fields(model_cls, pk, allowed_fields, **fields):
-    """Task 14 shared private controlled-mutation bypass for
-    ImmutableArtifact subclasses: update ONLY an explicit allow-listed
-    subset of fields on an existing row (credential rotation/revocation
-    for NodeRegistration; delivery metadata for OutboxMessage; processing
+# Task 14 corrective (independent review finding #2): the mutable-field
+# allow-list for each protected model is fixed HERE, inside the trust
+# boundary, keyed by model class -- never accepted as a parameter from
+# a caller. The old signature let any caller pass its own allowed_fields,
+# which meant the "allow-list" was only as trustworthy as whichever call
+# site constructed it; a model-fixed mapping cannot be widened or
+# swapped by a caller, buggy or otherwise. Populated after each
+# protected model class is defined, at the bottom of this module.
+_MUTABLE_FIELDS_BY_MODEL = {}
+
+
+def _write_immutable_row_fields(instance, **changes):
+    """Update ONLY the model-fixed mutable subset of fields on the ONE
+    row `instance` identifies (credential rotation/revocation for
+    NodeRegistration; delivery metadata for OutboxMessage; processing
     metadata for InboxMessage), bypassing the guarded QuerySet.update()
     rejection by calling Django's underlying QuerySet.update() directly --
     the same bypass spirit as Task 12's _write_installed_package_lifecycle().
-    Never accepts arbitrary **kwargs without the allow-list check below.
+    The allow-list is resolved from `_MUTABLE_FIELDS_BY_MODEL[type(instance)]`,
+    never from the caller.
     """
-    unexpected = set(fields) - set(allowed_fields)
+    model_cls = type(instance)
+    allowed = _MUTABLE_FIELDS_BY_MODEL[model_cls]
+    unexpected = set(changes) - allowed
     if unexpected:
         raise ValueError(
             f"cannot write non-mutable {model_cls.__name__} fields: {sorted(unexpected)}"
         )
 
-    updated = models.QuerySet.update(model_cls.objects.filter(pk=pk), **fields)
+    updated = models.QuerySet.update(model_cls.objects.filter(pk=instance.pk), **changes)
     if updated != 1:
-        raise ValueError(f"{model_cls.__name__} {pk} does not exist")
+        raise ValueError(f"{model_cls.__name__} {instance.pk} does not exist")
+
+
+def _bulk_write_immutable_rows(queryset, **changes):
+    """Batch equivalent of _write_immutable_row_fields(), for updating
+    many rows of the same protected model at once (e.g. marking several
+    OutboxMessage rows DELIVERED together). `queryset` must already be
+    filtered by the caller to the exact target rows; the mutable-field
+    allow-list is still resolved from this trust boundary's own
+    model-fixed mapping, never from the caller. Returns the number of
+    rows actually updated -- 0 is a legitimate, safe outcome (e.g. a
+    stale/fenced claim that no longer matches the caller's precondition
+    filter), not an error.
+    """
+    model_cls = queryset.model
+    allowed = _MUTABLE_FIELDS_BY_MODEL[model_cls]
+    unexpected = set(changes) - allowed
+    if unexpected:
+        raise ValueError(
+            f"cannot write non-mutable {model_cls.__name__} fields: {sorted(unexpected)}"
+        )
+
+    return models.QuerySet.update(queryset, **changes)
 
 
 class InstalledPublication(ImmutableArtifact):
@@ -492,3 +527,42 @@ class InboxMessage(ImmutableArtifact):
                 name="inbox_message_processing_state_allowed_values",
             ),
         ]
+
+
+# Task 14 corrective: the ONE fixed source of truth for which fields
+# _write_immutable_row_fields()/_bulk_write_immutable_rows() may ever
+# write on each protected model -- populated here, after every class
+# above is defined, rather than accepted from any caller.
+_MUTABLE_FIELDS_BY_MODEL.update(
+    {
+        NodeRegistration: frozenset(
+            {
+                "current_secret_hash",
+                "previous_secret_hash",
+                "previous_valid_until",
+                "enabled",
+                "rotated_at",
+                "revoked_at",
+            }
+        ),
+        OutboxMessage: frozenset(
+            {
+                "state",
+                "attempts",
+                "next_attempt_at",
+                "claimed_at",
+                "lease_until",
+                "delivered_at",
+                "rejection_code",
+                "rejection_reason",
+            }
+        ),
+        InboxMessage: frozenset(
+            {
+                "processing_state",
+                "processed_at",
+                "processing_error",
+            }
+        ),
+    }
+)

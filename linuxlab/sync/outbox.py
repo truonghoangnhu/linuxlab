@@ -13,16 +13,20 @@ release_auth_failure() are the only controlled writers of Outbox
 delivery metadata (state, attempts, next_attempt_at, claimed_at,
 lease_until, delivered_at, rejection_code, rejection_reason). None of
 them can touch the immutable wire-envelope fields (event_id through
-payload) -- the field allow-list in _bulk_write_outbox_fields()
-enforces that the same way linuxlab.sync.authentication enforces it
-for NodeRegistration.
+payload) -- this module never bypasses the ORM guard directly; every
+write goes through linuxlab.sync.models' own model-fixed allow-list
+(_write_immutable_row_fields()/_bulk_write_immutable_rows()), the same
+single trust boundary linuxlab.sync.authentication and
+linuxlab.sync.processing use (corrective, independent review finding
+#2 -- the allow-list is fixed inside that boundary, never passed in by
+this or any other caller).
 """
 
 import random
 from dataclasses import dataclass
 from datetime import timedelta
 
-from django.db import models, transaction
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -41,20 +45,8 @@ from .models import (
     OUTBOX_IN_FLIGHT,
     OUTBOX_PENDING,
     OutboxMessage,
+    _bulk_write_immutable_rows,
     _write_immutable_row_fields,
-)
-
-_OUTBOX_MUTABLE_FIELDS = frozenset(
-    {
-        "state",
-        "attempts",
-        "next_attempt_at",
-        "claimed_at",
-        "lease_until",
-        "delivered_at",
-        "rejection_code",
-        "rejection_reason",
-    }
 )
 
 # Task 5 owns sane self-contained defaults; Task 6/10 may later thread
@@ -65,21 +57,18 @@ _DEFAULT_BACKOFF_CAP_SECONDS = 3600.0
 
 
 def _bulk_write_outbox_fields(event_ids, **fields):
-    """Batch equivalent of linuxlab.sync.models._write_immutable_row_fields,
-    keyed by the public event_id (the natural key every caller here
-    already has) rather than a local pk. Same allow-list enforcement;
-    silently affects zero rows for an unknown event_id rather than
-    raising, since a delivery-metadata write racing a message that no
-    longer matches the caller's expected precondition is a normal,
-    safe no-op here (the caller's next claim cycle will simply not see
-    that row again)."""
-    unexpected = set(fields) - _OUTBOX_MUTABLE_FIELDS
-    if unexpected:
-        raise ValueError(f"cannot write non-mutable OutboxMessage fields: {sorted(unexpected)}")
+    """Thin event_id-keyed convenience wrapper over
+    linuxlab.sync.models._bulk_write_immutable_rows() -- the public
+    event_id is the natural key every caller in this module already
+    has, rather than a local pk. The mutable-field allow-list itself is
+    resolved entirely inside that shared helper, not here. Affecting
+    zero rows for an unknown/no-longer-matching event_id is a normal,
+    safe no-op (the caller's next claim cycle simply will not see that
+    row again), not an error."""
     event_ids = list(event_ids)
     if not event_ids:
         return 0
-    return models.QuerySet.update(
+    return _bulk_write_immutable_rows(
         OutboxMessage.objects.filter(event_id__in=event_ids), **fields
     )
 
@@ -148,7 +137,7 @@ def claim_outbox_batch(*, max_events, max_bytes, lease_seconds, now=None):
 
         claimed_pks = [row.pk for row in selected]
         if claimed_pks:
-            models.QuerySet.update(
+            _bulk_write_immutable_rows(
                 OutboxMessage.objects.filter(pk__in=claimed_pks),
                 state=OUTBOX_IN_FLIGHT,
                 claimed_at=now,
@@ -197,9 +186,7 @@ def release_transient(event_ids, error_kind, now=None):
             random_source=random.random,
         )
         _write_immutable_row_fields(
-            OutboxMessage,
-            row.pk,
-            _OUTBOX_MUTABLE_FIELDS,
+            row,
             state=OUTBOX_PENDING,
             attempts=new_attempts,
             next_attempt_at=now + timedelta(seconds=delay),

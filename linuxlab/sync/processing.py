@@ -15,10 +15,6 @@ from django.utils import timezone
 
 from .models import INBOX_FAILED, INBOX_PROCESSED, InboxMessage, _write_immutable_row_fields
 
-_INBOX_PROCESSING_MUTABLE_FIELDS = frozenset(
-    {"processing_state", "processed_at", "processing_error"}
-)
-
 
 class SyncEventProcessor(Protocol):
     """Caller-supplied processing logic for one accepted InboxMessage.
@@ -44,18 +40,14 @@ def process_inbox_event(inbox_message, processor, now=None):
         # or roll back the durable ingestion/ACK path that already
         # completed before processing ever runs.
         _write_immutable_row_fields(
-            InboxMessage,
-            inbox_message.pk,
-            _INBOX_PROCESSING_MUTABLE_FIELDS,
+            inbox_message,
             processing_state=INBOX_FAILED,
             processing_error=str(exc),
         )
         return INBOX_FAILED
 
     _write_immutable_row_fields(
-        InboxMessage,
-        inbox_message.pk,
-        _INBOX_PROCESSING_MUTABLE_FIELDS,
+        inbox_message,
         processing_state=INBOX_PROCESSED,
         processed_at=now,
     )

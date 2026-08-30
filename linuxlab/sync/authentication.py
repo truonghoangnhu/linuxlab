@@ -10,24 +10,13 @@ rotate_node_credential() -- it is never persisted by Central at all.
 """
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 
 from .models import NodeRegistration, _insert_immutable_row, _write_immutable_row_fields
-
-_NODE_REGISTRATION_MUTABLE_FIELDS = frozenset(
-    {
-        "current_secret_hash",
-        "previous_secret_hash",
-        "previous_valid_until",
-        "enabled",
-        "rotated_at",
-        "revoked_at",
-    }
-)
 
 
 class NodeAuthenticationError(Exception):
@@ -41,10 +30,15 @@ class NodeAuthenticationError(Exception):
 class IssuedNodeCredential:
     """The one and only place a plaintext Node secret is ever exposed --
     the return value of issue_node_registration()/rotate_node_credential().
-    Central never persists this; the operator/Node stores it locally."""
+    Central never persists this; the operator/Node stores it locally.
+    `secret` is excluded from repr() (corrective, independent review
+    finding #8) so it can never leak through a log statement, debugger,
+    or exception traceback that happens to print this value object --
+    the one authorized place it is still surfaced is the CLI's explicit,
+    one-time `self.stdout.write(f"secret: {credential.secret}")`."""
 
     node_id: UUID
-    secret: str
+    secret: str = field(repr=False)
 
 
 def _generate_secret():
@@ -75,9 +69,7 @@ def rotate_node_credential(node_id, grace_period):
     secret = _generate_secret()
     now = timezone.now()
     _write_immutable_row_fields(
-        NodeRegistration,
-        registration.pk,
-        _NODE_REGISTRATION_MUTABLE_FIELDS,
+        registration,
         current_secret_hash=make_password(secret),
         previous_secret_hash=registration.current_secret_hash,
         previous_valid_until=now + grace_period,
@@ -93,9 +85,7 @@ def revoke_node_registration(node_id):
     a disabled registration can never authenticate via either hash."""
     registration = NodeRegistration.objects.get(node_id=node_id)
     _write_immutable_row_fields(
-        NodeRegistration,
-        registration.pk,
-        _NODE_REGISTRATION_MUTABLE_FIELDS,
+        registration,
         enabled=False,
         revoked_at=timezone.now(),
     )
