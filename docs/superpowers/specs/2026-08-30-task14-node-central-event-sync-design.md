@@ -530,7 +530,7 @@ Examples:
 
 ```text
 401/403 → auth/channel failure
-400     → malformed request/batch (see §18.3 deterministic-400 handling)
+400     → malformed request/batch (see §18.3 / T14-D41 isolation)
 413     → request exceeds accepted batch limits (see §18.3 / T14-D40)
 5xx     → transient Central failure
 2xx     → authenticated structurally valid batch with per-event results
@@ -586,7 +586,16 @@ Malformed/oversized request:
 - good neighboring events already claimed in the same cycle must still reach `DELIVERED` independently — an oversized event must never starve them;
 - this does not introduce a new Outbox state; `DEAD_LETTER` already exists (T14-D09, §10).
 
-**Deterministic 400 (T14-D40, corrective).** A 400 is not automatically `EVENT_TOO_LARGE` and must not be treated as a per-event payload rejection merely because the request as a whole was malformed — only a valid per-event `rejected` result from Central does that (T14-D09, T14-D17). A stable/deterministic 400 (the same malformed request would recur unchanged on an identical retry) must not be retried as a tight loop; the worker takes an operator-visible/degraded path with safe long backoff instead of rebuilding and resending the identical blocking request indefinitely.
+**Deterministic HTTP 400 isolation (T14-D41, second corrective).** A 400 is not automatically `EVENT_TOO_LARGE` and must not be treated as a per-event payload rejection merely because the request as a whole was malformed — only a valid per-event `rejected` result from Central does that (T14-D09, T14-D17):
+
+- if the rejected batch contained more than one event, the Node bisects/splits it and retries the smaller subsets, outside any open DB transaction, isolating exactly which subset (down to a single event, if necessary) is actually the source of the 400;
+- unaffected subsets/events in the same claimed batch must still be allowed to reach `DELIVERED` independently — a 400 caused by one event must never starve its good neighbors;
+- if a single already-claimed event alone still receives 400, that event is NOT permanently unsendable the way a 413 singleton is: it remains retryable, released back to `PENDING` with a protocol-specific LONG backoff (deliberately longer than an ordinary transient-failure backoff), and the flush/worker result reports the condition as an operator-visible/degraded protocol fault;
+- a singleton 400 never transitions to `DEAD_LETTER` and is never assigned `EVENT_TOO_LARGE` — those remain exclusively a 413-singleton outcome (T14-D40);
+- the worker must not silently reconstruct and resend the identical original multi-event batch on its next cycle once due; isolation must actually narrow which events are retried together, and other eligible events must remain claimable/processable independently of the isolated singleton;
+- this does not introduce a new Outbox state; the singleton stays `PENDING` (T14-D09, §10).
+
+T14-D41 is deliberately asymmetric with T14-D40's 413 handling: a 413 singleton reflects a genuine transport-contract limit that retrying can never overcome, so it is permanently dead-lettered; a 400 singleton reflects a request-shape fault in what this Task 14 implementation itself constructed, not an inherent property of the event, so it stays retryable rather than being permanently rejected on the strength of one Central response.
 
 ### 18.4 Permanent event rejection
 

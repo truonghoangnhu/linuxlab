@@ -462,6 +462,24 @@ No automatic state transition to `DELIVERED` may be justified solely by a `FileS
 
 This decision is a corrective addition approved 2026-08-31, following the independent Task 14 architecture/security review (verdict B, TASK 14 CONDITIONAL). It does not change T14-D01 through T14-D39; it resolves an underspecified gap in T14-D16 (batch limits are count + bytes) and T14-D09 (permanent rejection and dead letter) by defining exactly what happens when the byte limit Task 14 itself enforces locally is still rejected by Central as oversized.
 
+## T14-D41 — Deterministic HTTP 400 isolation
+
+- HTTP 400 is a request/protocol fault, not proof that every event in the
+  request is permanently invalid.
+- For a multi-event batch that receives 400, the Node must bisect/split the
+  batch to isolate the failing subset and allow unaffected events to progress.
+- If a singleton event still receives 400, it remains retryable and returns to
+  PENDING with protocol-specific long backoff.
+- Singleton 400 does not transition to DEAD_LETTER.
+- The condition must remain operator-visible/degraded.
+- The worker must continue processing other eligible events rather than
+  repeatedly reconstructing the same blocking batch.
+- No new Outbox state is introduced.
+- This does not change T14-D40: singleton 413 remains
+  DEAD_LETTER(EVENT_TOO_LARGE).
+
+This decision is a second corrective addition approved 2026-08-31, following the focused independent Task 14 corrective re-review (verdict B, TASK 14 STILL CONDITIONAL). It does not change T14-D01 through T14-D40. It closes a gap T14-D40 left open: T14-D40 established that a deterministic 400 "must enter an operator-visible/degraded non-tight-loop path" but did not specify HOW a multi-event batch's 400 fault should be isolated from good neighbors, nor what a singleton event's terminal-vs-retryable state should be. T14-D41 answers both, deliberately asymmetrically from T14-D40's singleton-413 handling: a 413 singleton is a genuine transport-contract limit (the event can never fit, ever, under the current byte budget) and is therefore permanently unsendable (DEAD_LETTER); a 400 singleton is a request-shape fault that this Task 14 implementation itself constructed, not an inherent property of the event's size, so it remains retryable (PENDING) rather than being permanently dead-lettered on the strength of one Central response.
+
 ## Approved component layout
 
 Task 14 remains inside the existing `linuxlab.sync` Django app. No new Django app is created.
