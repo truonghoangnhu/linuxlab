@@ -427,6 +427,66 @@ def test_inbox_legitimate_processing_metadata_still_works():
     assert reloaded.processing_error == "boom"
 
 
+# --- second corrective (independent re-review finding #1): the mutable-field
+# policy itself must be non-widenable at runtime, not just fixed inside the
+# trust boundary -- a MappingProxyType of frozensets, never a plain dict.
+
+
+def test_mutable_fields_policy_mapping_rejects_item_assignment():
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    with pytest.raises(TypeError):
+        _MUTABLE_FIELDS_BY_MODEL[OutboxMessage] = frozenset({"payload"})
+
+    # The policy is unchanged: an attempted tampered write still fails.
+    outbox = _make_outbox_message()
+    with pytest.raises(ValueError, match="non-mutable"):
+        _write_immutable_row_fields(outbox, payload={"tampered": True})
+    assert OutboxMessage.objects.get(pk=outbox.pk).payload == {"score": 1, "max_score": 1}
+
+
+@pytest.mark.parametrize("model_cls", [NodeRegistration, OutboxMessage, InboxMessage])
+def test_mutable_fields_policy_per_model_value_rejects_mutation(model_cls):
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    allowed = _MUTABLE_FIELDS_BY_MODEL[model_cls]
+    assert isinstance(allowed, frozenset)
+
+    with pytest.raises(AttributeError):
+        allowed.add("payload")
+
+
+def test_mutable_fields_policy_mapping_rejects_item_deletion():
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    with pytest.raises(TypeError):
+        del _MUTABLE_FIELDS_BY_MODEL[OutboxMessage]
+
+
+def test_node_registration_immutable_field_still_rejected_after_mutation_attempt():
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    with pytest.raises(TypeError):
+        _MUTABLE_FIELDS_BY_MODEL[NodeRegistration] = frozenset({"display_name"})
+
+    node = _make_node_registration()
+    with pytest.raises(ValueError, match="non-mutable"):
+        _write_immutable_row_fields(node, display_name="hacked")
+    assert NodeRegistration.objects.get(pk=node.pk).display_name == node.display_name
+
+
+def test_inbox_immutable_field_still_rejected_after_mutation_attempt():
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    with pytest.raises(TypeError):
+        _MUTABLE_FIELDS_BY_MODEL[InboxMessage] = frozenset({"event_type"})
+
+    inbox = _make_inbox_message()
+    with pytest.raises(ValueError, match="non-mutable"):
+        _write_immutable_row_fields(inbox, event_type="hacked.event")
+    assert InboxMessage.objects.get(pk=inbox.pk).event_type == inbox.event_type
+
+
 # --- historical Task 12 rows remain readable --------------------------------
 
 

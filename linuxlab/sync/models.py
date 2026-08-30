@@ -30,6 +30,7 @@ controlled writer, which calls _write_immutable_row_fields() below.
 """
 
 import uuid
+from types import MappingProxyType
 from typing import ClassVar
 
 from django.core.validators import MinValueValidator
@@ -259,9 +260,17 @@ def _insert_immutable_row(model_cls, **fields):
 # a caller. The old signature let any caller pass its own allowed_fields,
 # which meant the "allow-list" was only as trustworthy as whichever call
 # site constructed it; a model-fixed mapping cannot be widened or
-# swapped by a caller, buggy or otherwise. Populated after each
-# protected model class is defined, at the bottom of this module.
-_MUTABLE_FIELDS_BY_MODEL = {}
+# swapped by a caller, buggy or otherwise.
+#
+# Second corrective (independent re-review finding #1): _MUTABLE_FIELDS_BY_MODEL
+# is defined once, in full, near the bottom of this module (after every
+# protected model class exists) as a types.MappingProxyType over frozenset
+# values -- both the mapping itself and each per-model value reject
+# mutation outright (item assignment/deletion on a mappingproxy raises
+# TypeError; .add() on a frozenset raises AttributeError). The two
+# functions below only reference the name at CALL time (ordinary Python
+# late-binding for module globals), so they do not need it to already
+# hold its final value when they are themselves defined.
 
 
 def _write_immutable_row_fields(instance, **changes):
@@ -538,9 +547,18 @@ class InboxMessage(ImmutableArtifact):
 
 # Task 14 corrective: the ONE fixed source of truth for which fields
 # _write_immutable_row_fields()/_bulk_write_immutable_rows() may ever
-# write on each protected model -- populated here, after every class
+# write on each protected model -- defined here, after every class
 # above is defined, rather than accepted from any caller.
-_MUTABLE_FIELDS_BY_MODEL.update(
+#
+# Second corrective: a MappingProxyType over frozenset values, built in
+# one shot and never mutated afterward. `_MUTABLE_FIELDS_BY_MODEL[X] = ...`
+# and `del _MUTABLE_FIELDS_BY_MODEL[X]` both raise TypeError (mappingproxy
+# rejects item assignment/deletion); `_MUTABLE_FIELDS_BY_MODEL[X].add(...)`
+# raises AttributeError (frozenset has no add()). There is no public name
+# anywhere in this module bound to the underlying plain dict -- the dict
+# literal is constructed and wrapped in the same expression, so nothing
+# outside this statement ever holds a mutable reference to it.
+_MUTABLE_FIELDS_BY_MODEL = MappingProxyType(
     {
         NodeRegistration: frozenset(
             {
