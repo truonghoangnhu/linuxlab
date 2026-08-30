@@ -36,6 +36,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -59,11 +60,19 @@ from .models import (
     _bulk_write_immutable_rows,
 )
 
-# Task 5 owns sane self-contained defaults; Task 6/10 may later thread
-# LINUXLAB_SYNC_BACKOFF_BASE_SECONDS/CAP_SECONDS settings through
-# release_transient()'s caller without changing this module's contract.
-_DEFAULT_BACKOFF_BASE_SECONDS = 5.0
-_DEFAULT_BACKOFF_CAP_SECONDS = 3600.0
+
+def _configured_backoff_base_seconds():
+    """Task 15: LINUXLAB_SYNC_BACKOFF_BASE_SECONDS actually drives
+    ordinary transient retry timing (closing the accepted Task 14
+    Minor -- this used to be a hardcoded module constant the setting
+    never reached). Read at call time so a test/operator settings
+    change takes effect immediately, with no separate validation
+    boundary to duplicate: base.py already parses/defaults it."""
+    return settings.LINUXLAB_SYNC_BACKOFF_BASE_SECONDS
+
+
+def _configured_backoff_cap_seconds():
+    return settings.LINUXLAB_SYNC_BACKOFF_CAP_SECONDS
 
 
 def _write_fenced(row, **changes):
@@ -205,8 +214,8 @@ def release_transient(claimed_rows, error_kind, now=None):
         new_attempts = row.attempts + 1
         delay = compute_retry_delay(
             new_attempts,
-            base=_DEFAULT_BACKOFF_BASE_SECONDS,
-            cap=_DEFAULT_BACKOFF_CAP_SECONDS,
+            base=_configured_backoff_base_seconds(),
+            cap=_configured_backoff_cap_seconds(),
             random_source=random.random,
         )
         _write_fenced(
@@ -284,15 +293,6 @@ def _merge_flush_summaries(a, b):
     )
 
 
-# T14-D41: deliberately much longer than the exponential transient-backoff
-# cap -- a 400 singleton has already been isolated as the specific cause
-# of a request-level fault this Task 14 implementation itself constructed,
-# so it is not retried on the ordinary short cadence, but it is also never
-# permanently unsendable the way a 413 singleton is (T14-D40), so it stays
-# PENDING rather than DEAD_LETTER.
-_PROTOCOL_400_SINGLETON_BACKOFF_SECONDS = _DEFAULT_BACKOFF_CAP_SECONDS
-
-
 def _dead_letter_event_too_large(row, now):
     mark_dead_letter(
         row,
@@ -304,11 +304,22 @@ def _dead_letter_event_too_large(row, now):
 
 
 def _release_singleton_protocol_fault(row, now):
+    # T14-D41: deliberately much longer than the ordinary base-driven
+    # exponential backoff -- a 400 singleton has already been isolated
+    # as the specific cause of a request-level fault this Task 14
+    # implementation itself constructed, so it is not retried on the
+    # ordinary short cadence, but it is also never permanently
+    # unsendable the way a 413 singleton is (T14-D40), so it stays
+    # PENDING rather than DEAD_LETTER. Deliberately tracks the
+    # configured cap (Task 15) rather than a fixed number, but is read
+    # independently of `base` -- it must never collapse to the ordinary
+    # transient schedule regardless of how `base` is configured.
     now = now or timezone.now()
+    long_backoff_seconds = _configured_backoff_cap_seconds()
     _write_fenced(
         row,
         state=OUTBOX_PENDING,
-        next_attempt_at=now + timedelta(seconds=_PROTOCOL_400_SINGLETON_BACKOFF_SECONDS),
+        next_attempt_at=now + timedelta(seconds=long_backoff_seconds),
         claimed_at=None,
         lease_until=None,
         claim_token=None,
