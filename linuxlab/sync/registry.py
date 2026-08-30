@@ -27,3 +27,18 @@ def get_sync_event_contract(event_type, schema_version):
     (event_type, schema_version), or None if it is not registered (i.e.
     LOCAL-ONLY / unsupported). Never falls back to a different version."""
     return _REGISTRY.get((event_type, schema_version))
+
+
+def get_current_sync_event_contract(event_type):
+    """Return the contract for the highest registered schema_version of
+    this event_type, or None if the event_type has no registered contract
+    at all (LOCAL-ONLY, T14-D20). Used by enqueue_sync_event(), which
+    knows only a DomainEvent's event_type (DomainEvent itself carries no
+    schema_version field) and needs to resolve which registered contract
+    currently applies. Task 14 registers exactly one schema_version for
+    its one real event type, so this is unambiguous today; it resolves
+    deterministically if that ever changes."""
+    candidates = [contract for (t, _v), contract in _REGISTRY.items() if t == event_type]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda contract: contract.schema_version)

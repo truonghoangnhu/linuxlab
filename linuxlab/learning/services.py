@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -10,6 +11,7 @@ from linuxlab.identity.models import Learner
 from linuxlab.identity.services import ensure_learner
 from linuxlab.learning.models import Attempt, Result
 from linuxlab.learning.projections import refresh_progress
+from linuxlab.sync.enqueue import enqueue_sync_event
 
 _GUEST_CLAIM_SOURCE = "guest_claim"
 _CLAIM_ITEM_KEYS = {"activity_public_id", "activity_version"}
@@ -112,7 +114,7 @@ def claim_activity_completion(learner, activity_version):
 
         refresh_progress(locked_learner.pk, activity_version.definition_id)
 
-        publish_event(
+        domain_event = publish_event(
             "activity.completed",
             {
                 "attempt_public_id": str(attempt.public_id),
@@ -124,6 +126,11 @@ def claim_activity_completion(learner, activity_version):
                 "source": _GUEST_CLAIM_SOURCE,
             },
             aggregate_id=attempt.public_id,
+        )
+        enqueue_sync_event(
+            domain_event,
+            node_id=settings.LINUXLAB_NODE_ID,
+            sync_enabled=settings.LINUXLAB_SYNC_ENABLED,
         )
 
         return result
@@ -256,7 +263,7 @@ def submit_attempt(attempt, submission, registry):
 
         refresh_progress(locked_attempt.learner_id, activity_version.definition_id)
 
-        publish_event(
+        domain_event = publish_event(
             "activity.completed",
             {
                 "attempt_public_id": str(locked_attempt.public_id),
@@ -267,6 +274,11 @@ def submit_attempt(attempt, submission, registry):
                 "max_score": max_score,
             },
             aggregate_id=locked_attempt.public_id,
+        )
+        enqueue_sync_event(
+            domain_event,
+            node_id=settings.LINUXLAB_NODE_ID,
+            sync_enabled=settings.LINUXLAB_SYNC_ENABLED,
         )
 
         return result

@@ -89,6 +89,15 @@ LINUXLAB_CAN_AUTHOR = False
 LINUXLAB_CAN_IMPORT_PACKAGES = False
 LINUXLAB_CAN_SERVE_LEARNER_CONTENT = False
 
+# Task 14: Node -> Central event sync configuration. Sync-enablement is
+# per-Node-instance runtime configuration (not a fixed profile capability
+# like LINUXLAB_CAN_*), so it is read from the environment with a safe
+# default of "disabled" everywhere, including Node -- a Node must be
+# explicitly provisioned and configured before it enqueues syncable
+# events (T14-D38).
+LINUXLAB_SYNC_ENABLED = os.environ.get("LINUXLAB_SYNC_ENABLED", "false").lower() == "true"
+LINUXLAB_NODE_ID = os.environ.get("LINUXLAB_NODE_ID") or None
+
 
 def database_config(default_name):
     """Build a PostgreSQL DATABASES entry for a deployment profile.
