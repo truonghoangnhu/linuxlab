@@ -382,6 +382,48 @@ def test_flush_treats_rejected_without_code_as_unconfirmed_never_dead_letters():
     assert refreshed.state == OUTBOX_PENDING
 
 
+def test_flush_through_real_http_transport_never_delivers_a_masked_duplicate_id():
+    """End-to-end through the REAL HttpSyncTransport response parser
+    (parse_ack_results()), not a hand-built BatchAck: a malformed
+    rejected-without-code entry must not mask that its event_id was
+    also claimed by a valid `accepted` entry (second-corrective finding
+    #3) -- the event stays PENDING, a real unrelated neighbor still
+    delivers."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from linuxlab.sync.transports import HttpSyncTransport
+
+    ambiguous = _make_outbox()
+    good = _make_outbox(next_attempt_at=ambiguous.next_attempt_at)
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+
+    def _fake_urlopen(request, timeout=None):
+        del timeout
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(
+            {
+                "results": [
+                    {"event_id": str(ambiguous.event_id), "status": ACCEPTED},
+                    {"event_id": str(ambiguous.event_id), "status": REJECTED},
+                    {"event_id": str(good.event_id), "status": ACCEPTED},
+                ]
+            }
+        ).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    with patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen):
+        summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.delivered == 1
+    assert summary.dead_lettered == 0
+    assert OutboxMessage.objects.get(pk=good.pk).state == OUTBOX_DELIVERED
+    assert OutboxMessage.objects.get(pk=ambiguous.pk).state == OUTBOX_PENDING
+
+
 # --- T14-D40: deterministic HTTP 400 handling --------------------------------
 
 

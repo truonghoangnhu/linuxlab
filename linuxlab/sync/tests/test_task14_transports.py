@@ -304,6 +304,126 @@ def test_mixture_of_valid_and_malformed_results_only_the_malformed_stays_unconfi
     assert ack.status_for(malformed.event_id) is None
 
 
+# --- second corrective (independent re-review finding #3): a malformed
+# entry for the same event_id must not be silently discarded BEFORE
+# duplicate-ID detection runs -- that would let the OTHER, otherwise-valid
+# entry for that same ID slip through as if it were unambiguous.
+
+
+def test_accepted_then_malformed_rejection_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": ACCEPTED},
+        {"event_id": str(envelope.event_id), "status": REJECTED},  # missing code
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_malformed_rejection_then_accepted_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": REJECTED},  # missing code
+        {"event_id": str(envelope.event_id), "status": ACCEPTED},
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_accepted_then_unknown_status_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": ACCEPTED},
+        {"event_id": str(envelope.event_id), "status": "bogus-status"},
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_unknown_status_then_accepted_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": "bogus-status"},
+        {"event_id": str(envelope.event_id), "status": ACCEPTED},
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_duplicate_then_malformed_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": DUPLICATE},
+        {"event_id": str(envelope.event_id), "status": REJECTED},  # missing code
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_malformed_then_duplicate_same_id_is_unconfirmed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    body = [
+        {"event_id": str(envelope.event_id), "status": REJECTED},  # missing code
+        {"event_id": str(envelope.event_id), "status": DUPLICATE},
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((envelope,))
+
+    assert ack.status_for(envelope.event_id) is None
+
+
+def test_unrelated_valid_entry_is_unaffected_by_a_different_ids_ambiguity():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    good, ambiguous = _make_envelope(), _make_envelope()
+    body = [
+        {"event_id": str(good.event_id), "status": ACCEPTED},
+        {"event_id": str(ambiguous.event_id), "status": ACCEPTED},
+        {"event_id": str(ambiguous.event_id), "status": REJECTED},  # missing code
+    ]
+
+    with patch(
+        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+    ):
+        ack = transport.send_batch((good, ambiguous))
+
+    assert ack.status_for(good.event_id) == ACCEPTED
+    assert ack.status_for(ambiguous.event_id) is None
+
+
 def test_http_transport_malformed_json_response_is_transient():
     transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
     envelope = _make_envelope()

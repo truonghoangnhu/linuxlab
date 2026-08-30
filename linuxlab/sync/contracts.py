@@ -297,37 +297,55 @@ _ACK_STATUSES = frozenset({ACCEPTED, DUPLICATE, REJECTED})
 
 def parse_ack_results(raw_results):
     """Build a BatchAck from an untrusted list of raw per-event result
-    dicts (T14-D30 corrective, independent review finding #7): the
+    dicts (T14-D30 corrective, independent review finding #7; duplicate-
+    detection ordering hardened per second-corrective finding #3): the
     conservative safety rules below apply BEFORE BatchAck is even
     constructed, so every transport implementation gets them for free
     rather than reimplementing its own ad hoc parser.
 
-    Dropped entirely (that event stays unconfirmed/retryable, never
-    inferred delivered or dead-lettered):
-    - a malformed entry (not an object, unknown/missing status, an
-      event_id that isn't a parseable UUID);
-    - a `rejected` entry with no rejection code (a rejection reason
-      without a code is not actionable -- never dead-letter on it);
-    - EVERY entry for an event_id that appears more than once among the
-      otherwise-valid candidates, even if the repeated entries are
-      identical -- a duplicated or conflicting event_id in a response is
-      itself the ambiguous condition, regardless of what the entries say.
+    Two phases, deliberately in this order:
+
+    Phase 1 -- count every occurrence of each PARSEABLE event_id across
+    ALL raw entries, BEFORE validating status/code. An entry whose
+    event_id cannot be parsed as a UUID at all is excluded from this
+    count (it cannot be attributed to any sent event). This is the
+    second-corrective fix: the original implementation discarded a
+    malformed entry (bad status, or a `rejected` entry with no code)
+    before it was ever counted, which meant a malformed duplicate could
+    silently mask that its event_id was ALSO claimed by a different,
+    otherwise-valid entry -- letting that other entry's verdict
+    (`accepted`, say) slip through as if it were unambiguous.
+
+    Phase 2 -- only an event_id that occurred EXACTLY ONCE in phase 1
+    proceeds to status/code validation and, if it passes, becomes one
+    actionable EventAck. An event_id that occurred more than once is
+    ambiguous regardless of what its entries say (even if they are
+    byte-for-byte identical) and never produces an actionable EventAck
+    for that event -- it stays unconfirmed/retryable, never inferred
+    delivered or dead-lettered.
     """
-    candidates_by_event_id: dict[UUID, list[EventAck]] = {}
+    items_by_event_id: dict[UUID, list[dict]] = {}
     for item in raw_results:
         if not isinstance(item, dict):
-            continue
-        status_value = item.get("status")
-        if status_value not in _ACK_STATUSES:
             continue
         try:
             event_id = UUID(str(item.get("event_id")))
         except (ValueError, TypeError, AttributeError):
             continue
+        items_by_event_id.setdefault(event_id, []).append(item)
+
+    acks = []
+    for event_id, items in items_by_event_id.items():
+        if len(items) != 1:
+            continue
+        item = items[0]
+        status_value = item.get("status")
+        if status_value not in _ACK_STATUSES:
+            continue
         code = str(item.get("code") or "")
         if status_value == REJECTED and not code:
             continue
-        candidates_by_event_id.setdefault(event_id, []).append(
+        acks.append(
             EventAck(
                 event_id=event_id,
                 status=status_value,
@@ -336,7 +354,4 @@ def parse_ack_results(raw_results):
             )
         )
 
-    acks = tuple(
-        candidates[0] for candidates in candidates_by_event_id.values() if len(candidates) == 1
-    )
-    return BatchAck(results=acks)
+    return BatchAck(results=tuple(acks))
