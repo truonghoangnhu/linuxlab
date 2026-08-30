@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-30
 **Project:** LinuxLab.vn / LinuxLab Open Lab
-**Status:** CORRECTIVE APPLIED — independent review returned verdict B (TASK 14 CONDITIONAL); all eight Important findings corrected, see "Corrective implementation record" at the end of this file; awaiting independent focused corrective re-review
+**Status:** SECOND CORRECTIVE APPLIED — focused re-review returned verdict B (TASK 14 STILL CONDITIONAL) on the first corrective; all three remaining Important findings corrected, see "Second corrective implementation record" at the end of this file; awaiting another focused independent re-review
 **Predecessor:** Task 13 FINAL PASS at `63a2baa2c33f4d8792befa85c1bb6835e3aa8b60`, 566 tests passing
 
 This file records the architecture choices approved for Task 14. These decisions are normative for the Task 14 spec and future implementation plan. They must not be silently changed during implementation.
@@ -769,3 +769,57 @@ Added `parse_ack_results()` (`contracts.py`): the one shared, conservative ACK p
 ### Minor backlog (unchanged, not addressed by this corrective)
 
 Dead backoff settings (`LINUXLAB_SYNC_BACKOFF_BASE_SECONDS`/`CAP_SECONDS` still unused by `release_transient()`), `FileSyncTransport` deterministic-output hardening, a durable idempotency-conflict audit trail, and a claim-path index/schema-version constraint remain backlog — none were mechanically necessary to fix an Important finding, so none were touched.
+
+---
+
+## Second corrective implementation record (2026-08-31)
+
+A focused independent re-review of the first corrective returned **verdict B, TASK 14 STILL CONDITIONAL**, with exactly three Important findings remaining open. All three are now closed. T14-D01 through T14-D40 are unchanged; the one new decision approved for this second corrective is **T14-D41** (above) — no T14-D42 was invented. Already-CLOSED areas (profile authority, lease fencing, T14-D40 413 split/singleton, envelope validation/poison isolation, timestamp normalization/idempotency, credential repr) were not redesigned — only re-run as regression.
+
+**Second corrective commit range:** `c7a3f6c..a297578` (4 commits), on top of the first-corrective HEAD `c4517e2d6a0701c93f222d96bdcc27d96aceb440`.
+
+```
+c7a3f6c docs: record Task 14 HTTP 400 isolation
+94d2ffd fix: freeze sync mutable-field policy
+d224ca0 fix: isolate deterministic HTTP 400 batches
+a297578 fix: fail closed on malformed duplicate ACKs
+```
+
+### Finding 1 — Immutable-write policy remained runtime-widenable
+
+`_MUTABLE_FIELDS_BY_MODEL` was a plain module-level `dict`, populated once via `.update()` at import time but never protected against being widened afterward — `_MUTABLE_FIELDS_BY_MODEL[OutboxMessage] = frozenset({"payload"})` would have silently succeeded at runtime. It is now built once, in full, as `types.MappingProxyType({...})` over `frozenset` values, with no plain-dict reference left reachable anywhere in the module — item assignment/deletion on the mapping raises `TypeError`; per-model `frozenset` values already rejected `.add()` (`AttributeError`) before this change. `_write_immutable_row_fields()`/`_bulk_write_immutable_rows()` needed no change: they reference the name only at call time (ordinary Python late-binding for module globals), so moving the policy's single definition to the bottom of the module — after every protected model class exists — was sufficient. Permanent tests attempt mapping-level assignment and deletion and per-model `frozenset` mutation against all three protected models, then confirm a tampered write still fails and every legitimate controlled mutation still works.
+
+### Finding 2 — Deterministic HTTP 400 could reconstruct the same starving batch
+
+Before this corrective, any `ProtocolTransportError` (400) released the *whole* claimed batch as retryable in one shot, with no isolation — a persistently malformed multi-event batch would keep coming back together, once due, potentially starving good neighbors behind the same blocking request indefinitely.
+
+Implemented **T14-D41**: `flush_outbox()`'s `_send_claimed_rows()` now bisects a multi-event 400 through the same `_isolate_and_retry()` helper it already used for 413 (bounded halving recursion, O(log n) deep), with deliberately distinct terminal semantics once isolation narrows a fault to one event: a 413 singleton stays permanently `DEAD_LETTER(EVENT_TOO_LARGE)` (T14-D40, unchanged); a 400 singleton returns to `PENDING` with a long protocol-specific backoff (`_PROTOCOL_400_SINGLETON_BACKOFF_SECONDS`, reusing the existing transient-backoff cap of 3600s) and `protocol_fault=True` — never dead-lettered, never `EVENT_TOO_LARGE`. No new Outbox state. Unaffected subsets/events in the same claimed batch always complete independently once isolation separates them. Proven with the exact scripted scenario from the corrective plan (`[A,B,C,D]→400, [A,B]→400, [A]→accepted, [B]→400, [C,D]→accepted`: A/C/D deliver, B isolates), a real worker-delay regression (advancing the clock well past the old fixed interval no longer reconstructs the identical `[A,B]` pair, since A is already `DELIVERED` and B's `next_attempt_at` is now far in the future), and a test proving an unrelated eligible event still reaches `DELIVERED` in the same cycle as an isolated singleton 400.
+
+### Finding 3 — Malformed duplicate ACK could authorize delivery
+
+`parse_ack_results()` discarded a malformed entry (unknown status, or a `rejected` entry with no code) **before** counting how many times its `event_id` appeared in the raw response — so a malformed duplicate for the same `event_id` as a valid `accepted` entry could mask the ambiguity entirely, letting the `accepted` verdict through as if unambiguous.
+
+Rewrote `parse_ack_results()` as two explicit phases: phase 1 counts every occurrence of each *parseable* `event_id` across all raw entries before any status/code validation; phase 2 only lets an `event_id` that occurred exactly once proceed to validation and become an actionable `EventAck`. An `event_id` occurring more than once — in any combination of valid, malformed, or identical repeated entries, in either order — never produces an actionable ACK for that event. Proven with the full ordered matrix (`accepted`+malformed-`rejected`, malformed-`rejected`+`accepted`, `accepted`+unknown-status, unknown-status+`accepted`, `duplicate`+malformed, malformed+`duplicate`, both directions each), a test confirming an unrelated `event_id`'s valid verdict is unaffected by a different id's ambiguity, and one end-to-end test through the real `HttpSyncTransport` + `flush_outbox()` pipeline (not a hand-built `BatchAck`).
+
+### Regression confirmation for previously CLOSED areas
+
+Re-run as part of the full sync suite, no changes required:
+
+- profile authority — `test_task14_profiles.py` (7), `core/tests/test_settings_profiles.py`.
+- lease fencing — `test_task14_outbox.py`'s two real two-connection stale-worker tests.
+- T14-D40 413 split/singleton — `test_task14_flush.py`'s 413 tests, `test_task14_e2e.py::test_413_split_and_singleton_dead_letter_through_real_http_transport`.
+- envelope validation / poison isolation — `test_task14_validation.py`, `test_task14_api.py`'s overlong-aggregate/naive-timestamp tests.
+- timestamp normalization / idempotency — `test_task14_ingestion.py::test_replay_with_different_utc_offset_for_the_same_instant_is_duplicate_not_conflict`, `test_task14_e2e.py::test_ack_lost_replay_with_non_utc_offset_becomes_duplicate_not_conflict`.
+- credential repr — `test_task14_authentication.py::test_issued_credential_repr_excludes_secret`, `test_rotated_credential_repr_excludes_secret`.
+
+### Verification
+
+- Focused sync suite: `linuxlab/sync/tests` — **340 passed**.
+- Complete suite: `env -u DJANGO_SETTINGS_MODULE pytest -q` — **826 passed** (806 first-corrective baseline + 20 new second-corrective tests).
+- `ruff check .` — clean.
+- `manage.py check` (central, node) — clean.
+- `manage.py makemigrations --check --dry-run` (central, node) — no drift.
+
+### Minor backlog (still unchanged)
+
+Dead backoff settings, `FileSyncTransport` deterministic-output hardening, a durable idempotency-conflict audit trail, and a claim-path index/schema-version constraint remain backlog, exactly as before — none were incidentally fixed by this second corrective.
