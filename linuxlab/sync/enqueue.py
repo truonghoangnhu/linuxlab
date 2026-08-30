@@ -13,6 +13,8 @@ submit_attempt() (both immediately after Result.objects.create(), in the
 same transaction). No other event type is registered/syncable.
 """
 
+import uuid
+
 from .contracts import SyncEventContract, WireEventEnvelope
 from .models import OutboxMessage, _insert_immutable_row
 from .registry import get_current_sync_event_contract, register_sync_event_contract
@@ -129,6 +131,17 @@ def _validate_activity_completed_payload(payload):
     for key in ("attempt_public_id", "learner_public_id", "activity_definition_public_id"):
         if not isinstance(payload[key], str) or not payload[key]:
             raise ValueError(f"activity.completed payload {key} must be a non-empty string")
+        try:
+            uuid.UUID(payload[key])
+        except ValueError as exc:
+            raise ValueError(f"activity.completed payload {key} must be a valid UUID") from exc
+
+
+def _activity_completed_payload_aggregate_public_id(payload):
+    """The payload's own canonical attempt identity -- normalize_wire_event()
+    rejects any envelope whose top-level aggregate_public_id doesn't
+    match this (corrective, independent review finding #5)."""
+    return uuid.UUID(payload["attempt_public_id"])
 
 
 ACTIVITY_COMPLETED_V1 = SyncEventContract(
@@ -136,6 +149,8 @@ ACTIVITY_COMPLETED_V1 = SyncEventContract(
     schema_version=1,
     serialize_domain_event=_serialize_activity_completed,
     validate_payload=_validate_activity_completed_payload,
+    expected_aggregate_type="attempt",
+    payload_aggregate_public_id=_activity_completed_payload_aggregate_public_id,
 )
 
 

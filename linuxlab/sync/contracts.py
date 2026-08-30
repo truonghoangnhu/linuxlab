@@ -7,9 +7,16 @@ storage shape. Nothing here is Django-aware.
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
+
+# Matches OutboxMessage/InboxMessage's event_type CharField(max_length=255)
+# and aggregate_type CharField(max_length=100) exactly -- validated here,
+# BEFORE any insert, so an oversized value never reaches the database as
+# an uncaught DataError (corrective, independent review finding #5).
+_MAX_EVENT_TYPE_LENGTH = 255
+_MAX_AGGREGATE_TYPE_LENGTH = 100
 
 ACCEPTED = "accepted"
 DUPLICATE = "duplicate"
@@ -118,12 +125,28 @@ class SyncEventContract:
     `validate_payload(payload)` raises ValueError for a structurally
     invalid wire payload; used at Central ingestion before anything is
     persisted.
+
+    `expected_aggregate_type`, if non-empty, is the ONLY aggregate_type
+    normalize_wire_event() accepts for this event type -- an envelope
+    claiming a different aggregate_type is rejected before insert
+    (corrective, independent review finding #5).
+
+    `payload_aggregate_public_id(payload)`, if provided, extracts the
+    payload's own canonical aggregate identity (e.g. an attempt's
+    public_id) so normalize_wire_event() can reject an envelope whose
+    top-level aggregate_public_id doesn't match what its own payload
+    claims -- a defense against a tampered/buggy Node, not something
+    the legitimate enqueue path can ever produce inconsistently.
     """
 
     event_type: str
     schema_version: int
     serialize_domain_event: Callable[[object], tuple[str, UUID, Mapping[str, object]]]
     validate_payload: Callable[[Mapping[str, object]], None] = field(
+        default=lambda payload: None
+    )
+    expected_aggregate_type: str = ""
+    payload_aggregate_public_id: Callable[[Mapping[str, object]], UUID | None] = field(
         default=lambda payload: None
     )
 
@@ -168,3 +191,98 @@ def serialize_sync_batch(envelopes):
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+
+
+class WireEventValidationError(ValueError):
+    """Raised by normalize_wire_event() for any structurally or
+    semantically invalid inbound envelope. Always maps to a per-event
+    REJECTED ACK at Central ingestion -- never a 500, and never an
+    uncaught database exception (corrective, independent review finding
+    #5): every check here exists specifically to catch, before any
+    insert is attempted, something that would otherwise only surface as
+    a DB-level failure (an oversized CharField) or a silent data-quality
+    problem (a spoofed aggregate identity, a naive timestamp)."""
+
+
+@dataclass(frozen=True)
+class NormalizedWireEvent:
+    """The result of normalize_wire_event(): identical shape to
+    WireEventEnvelope, except occurred_at is guaranteed UTC-normalized.
+    Central persists and compares using ONLY this normalized form, never
+    the raw incoming envelope, so two exact-duplicate replays that
+    differ only in UTC offset representation (+07:00 vs Z vs +00:00 for
+    the same instant) are correctly recognized as the same event
+    (corrective, independent review finding #6)."""
+
+    event_id: UUID
+    event_type: str
+    occurred_at: datetime
+    source_node_id: UUID
+    aggregate_type: str
+    aggregate_public_id: UUID
+    schema_version: int
+    payload: Mapping[str, object]
+
+
+def normalize_wire_event(envelope, contract):
+    """Validate and normalize one inbound WireEventEnvelope against its
+    resolved SyncEventContract, BEFORE any persistence or duplicate
+    comparison. Raises WireEventValidationError for any defect; the
+    caller (linuxlab.sync.ingestion.ingest_event()) maps that
+    uniformly to a per-event REJECTED ACK."""
+    if not isinstance(envelope.event_id, UUID):
+        raise WireEventValidationError("event_id must be a UUID")
+    if not isinstance(envelope.source_node_id, UUID):
+        raise WireEventValidationError("source_node_id must be a UUID")
+    if not isinstance(envelope.aggregate_public_id, UUID):
+        raise WireEventValidationError("aggregate_public_id must be a UUID")
+    if type(envelope.schema_version) is not int or envelope.schema_version < 1:
+        raise WireEventValidationError("schema_version must be an integer >= 1")
+
+    if not isinstance(envelope.event_type, str) or not envelope.event_type:
+        raise WireEventValidationError("event_type must be a non-empty string")
+    if len(envelope.event_type) > _MAX_EVENT_TYPE_LENGTH:
+        raise WireEventValidationError(
+            f"event_type exceeds maximum length of {_MAX_EVENT_TYPE_LENGTH}"
+        )
+
+    if not isinstance(envelope.aggregate_type, str) or not envelope.aggregate_type:
+        raise WireEventValidationError("aggregate_type must be a non-empty string")
+    if len(envelope.aggregate_type) > _MAX_AGGREGATE_TYPE_LENGTH:
+        raise WireEventValidationError(
+            f"aggregate_type exceeds maximum length of {_MAX_AGGREGATE_TYPE_LENGTH}"
+        )
+    if contract.expected_aggregate_type and envelope.aggregate_type != contract.expected_aggregate_type:
+        raise WireEventValidationError(
+            f"aggregate_type {envelope.aggregate_type!r} does not match the expected "
+            f"{contract.expected_aggregate_type!r} for event_type {envelope.event_type!r}"
+        )
+
+    occurred_at = envelope.occurred_at
+    if not isinstance(occurred_at, datetime):
+        raise WireEventValidationError("occurred_at must be a datetime")
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise WireEventValidationError("occurred_at must be timezone-aware, not naive")
+    occurred_at_utc = occurred_at.astimezone(UTC)
+
+    try:
+        contract.validate_payload(envelope.payload)
+    except ValueError as exc:
+        raise WireEventValidationError(str(exc)) from exc
+
+    canonical_aggregate_id = contract.payload_aggregate_public_id(envelope.payload)
+    if canonical_aggregate_id is not None and canonical_aggregate_id != envelope.aggregate_public_id:
+        raise WireEventValidationError(
+            "aggregate_public_id does not match the payload's own canonical identity"
+        )
+
+    return NormalizedWireEvent(
+        event_id=envelope.event_id,
+        event_type=envelope.event_type,
+        occurred_at=occurred_at_utc,
+        source_node_id=envelope.source_node_id,
+        aggregate_type=envelope.aggregate_type,
+        aggregate_public_id=envelope.aggregate_public_id,
+        schema_version=envelope.schema_version,
+        payload=envelope.payload,
+    )

@@ -4,6 +4,7 @@ detection (T14-D12, T14-D26, T14-D27).
 
 import threading
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from django.db import close_old_connections, connection
@@ -23,16 +24,21 @@ def _make_node():
 
 
 def _make_envelope(**overrides):
+    # aggregate_public_id must equal the payload's own attempt_public_id
+    # (normalize_wire_event()'s aggregate/payload consistency check,
+    # corrective independent review finding #5) -- exactly how the real
+    # enqueue path always produces it.
+    attempt_public_id = uuid.uuid4()
     fields = {
         "event_id": uuid.uuid4(),
         "event_type": "activity.completed",
         "occurred_at": timezone.now(),
         "source_node_id": uuid.uuid4(),
         "aggregate_type": "attempt",
-        "aggregate_public_id": uuid.uuid4(),
+        "aggregate_public_id": attempt_public_id,
         "schema_version": 1,
         "payload": {
-            "attempt_public_id": str(uuid.uuid4()),
+            "attempt_public_id": str(attempt_public_id),
             "learner_public_id": str(uuid.uuid4()),
             "activity_definition_public_id": str(uuid.uuid4()),
             "activity_version": 1,
@@ -116,6 +122,34 @@ def test_exact_duplicate_returns_duplicate_with_one_inbox_row():
 
     first = ingest_event(node, envelope)
     second = ingest_event(node, envelope)
+
+    assert first.status == ACCEPTED
+    assert second.status == DUPLICATE
+    assert InboxMessage.objects.filter(event_id=envelope.event_id).count() == 1
+
+
+def test_replay_with_different_utc_offset_for_the_same_instant_is_duplicate_not_conflict():
+    """Corrective (independent review finding #6): a retry that encodes
+    the exact same instant with a different UTC offset (e.g. the Node
+    resends with local +07:00 while the first attempt used Z) must
+    still be recognized as an exact duplicate, not IDEMPOTENCY_CONFLICT."""
+    from datetime import timedelta
+    from datetime import timezone as dt_timezone
+
+    node = _make_node()
+    as_utc = datetime(2026, 8, 31, 3, 0, 0, tzinfo=UTC)
+    as_plus_seven = datetime(2026, 8, 31, 10, 0, 0, tzinfo=dt_timezone(timedelta(hours=7)))
+    envelope = _make_envelope(source_node_id=node.node_id, occurred_at=as_utc)
+    replay = _make_envelope(
+        event_id=envelope.event_id,
+        source_node_id=node.node_id,
+        occurred_at=as_plus_seven,
+        aggregate_public_id=envelope.aggregate_public_id,
+        payload=envelope.payload,
+    )
+
+    first = ingest_event(node, envelope)
+    second = ingest_event(node, replay)
 
     assert first.status == ACCEPTED
     assert second.status == DUPLICATE

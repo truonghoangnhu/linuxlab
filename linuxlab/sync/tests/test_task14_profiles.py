@@ -27,16 +27,21 @@ _URL = "/api/v1/sync/events/"
 
 
 def _make_envelope(**overrides):
+    # aggregate_public_id must equal the payload's own attempt_public_id
+    # (normalize_wire_event()'s aggregate/payload consistency check,
+    # corrective independent review finding #5) -- exactly how the real
+    # enqueue path always produces it.
+    attempt_public_id = uuid.uuid4()
     fields = {
         "event_id": uuid.uuid4(),
         "event_type": "activity.completed",
         "occurred_at": timezone.now(),
         "source_node_id": uuid.uuid4(),
         "aggregate_type": "attempt",
-        "aggregate_public_id": uuid.uuid4(),
+        "aggregate_public_id": attempt_public_id,
         "schema_version": 1,
         "payload": {
-            "attempt_public_id": str(uuid.uuid4()),
+            "attempt_public_id": str(attempt_public_id),
             "learner_public_id": str(uuid.uuid4()),
             "activity_definition_public_id": str(uuid.uuid4()),
             "activity_version": 1,

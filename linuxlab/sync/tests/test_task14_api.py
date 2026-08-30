@@ -27,16 +27,21 @@ def _central_sync_authority(settings):
 
 
 def _make_envelope(**overrides):
+    # aggregate_public_id must equal the payload's own attempt_public_id
+    # (normalize_wire_event()'s aggregate/payload consistency check,
+    # corrective independent review finding #5) -- exactly how the real
+    # enqueue path always produces it.
+    attempt_public_id = uuid.uuid4()
     fields = {
         "event_id": uuid.uuid4(),
         "event_type": "activity.completed",
         "occurred_at": timezone.now(),
         "source_node_id": uuid.uuid4(),
         "aggregate_type": "attempt",
-        "aggregate_public_id": uuid.uuid4(),
+        "aggregate_public_id": attempt_public_id,
         "schema_version": 1,
         "payload": {
-            "attempt_public_id": str(uuid.uuid4()),
+            "attempt_public_id": str(attempt_public_id),
             "learner_public_id": str(uuid.uuid4()),
             "activity_definition_public_id": str(uuid.uuid4()),
             "activity_version": 1,
@@ -205,6 +210,51 @@ def test_mixed_batch_returns_independent_per_event_results(client):
     assert InboxMessage.objects.filter(event_id=good_new.event_id).exists()
     assert InboxMessage.objects.filter(event_id=good_duplicate.event_id).count() == 1
     assert not InboxMessage.objects.filter(event_id=invalid.event_id).exists()
+
+
+# --- corrective (independent review finding #5): a poison envelope that
+# would otherwise hit a raw database constraint must instead reject cleanly
+# as a per-event REJECTED result, never a 500, and never block its neighbors.
+
+
+def test_mixed_batch_with_overlong_aggregate_type_never_500s_and_good_neighbors_deliver(client):
+    credential = issue_node_registration("Node A")
+    good_before = _make_envelope(source_node_id=credential.node_id)
+    poison = _make_envelope(source_node_id=credential.node_id, aggregate_type="x" * 200)
+    good_after = _make_envelope(source_node_id=credential.node_id)
+
+    response = _post_events(
+        client, credential.node_id, credential.secret, [good_before, poison, good_after]
+    )
+
+    assert response.status_code == 200
+    results = {r["event_id"]: r for r in json.loads(response.content)["results"]}
+    assert results[str(good_before.event_id)]["status"] == ACCEPTED
+    assert results[str(good_after.event_id)]["status"] == ACCEPTED
+    assert results[str(poison.event_id)]["status"] == REJECTED
+    assert results[str(poison.event_id)]["code"] == "INVALID_PAYLOAD"
+    assert InboxMessage.objects.filter(event_id=good_before.event_id).exists()
+    assert InboxMessage.objects.filter(event_id=good_after.event_id).exists()
+    assert not InboxMessage.objects.filter(event_id=poison.event_id).exists()
+
+
+def test_naive_timestamp_is_rejected_as_invalid_payload_not_500(client):
+    credential = issue_node_registration("Node A")
+    envelope = _make_envelope(source_node_id=credential.node_id)
+    event_dict = canonical_event_dict(envelope)
+    event_dict["occurred_at"] = "2026-08-31T10:00:00"  # naive -- no offset
+
+    response = client.post(
+        _URL,
+        data=json.dumps({"events": [event_dict]}),
+        content_type="application/json",
+        **_headers(credential.node_id, credential.secret),
+    )
+
+    assert response.status_code == 200
+    body = json.loads(response.content)["results"][0]
+    assert body["status"] == REJECTED
+    assert not InboxMessage.objects.filter(event_id=envelope.event_id).exists()
 
 
 # --- source spoofing -----------------------------------------------------
