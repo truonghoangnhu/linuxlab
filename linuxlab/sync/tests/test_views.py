@@ -93,6 +93,27 @@ def test_learner_route_response_has_no_grading_material(quiz_world, keypair):
 
 
 @override_settings(**_NODE_SETTINGS)
+def test_learner_route_never_exposes_context_provenance(quiz_world, keypair):
+    """Task 13 corrective (context provenance seal): the learner route
+    passes RuntimePackageContext into the template context internally,
+    but must never render its `_provenance_tag` -- neither the raw bytes
+    nor the field name itself -- into the response body or repr."""
+    private_key, public_key = keypair
+    package = _stage(quiz_world, private_key, public_key)
+    activate_package(package)
+
+    client = Client()
+    response = client.get(f"/learn/{quiz_world['snapshot'].source_public_id}/")
+
+    runtime_context = response.context["runtime_context"]
+    assert "_provenance_tag" not in repr(runtime_context)
+
+    rendered = response.content.decode()
+    assert "_provenance_tag" not in rendered
+    assert runtime_context._provenance_tag.hex() not in rendered
+
+
+@override_settings(**_NODE_SETTINGS)
 def test_switching_active_package_affects_only_new_requests(quiz_world, keypair):
     """A response already rendered from v1 is unaffected by a later
     activation; a subsequent request picks up the new ACTIVE package."""

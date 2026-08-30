@@ -84,10 +84,25 @@ def test_runtime_package_context_is_frozen():
         source_public_id=uuid4(),
         package_version=1,
         payload_sha256="0" * 64,
+        _provenance_tag=b"0" * 32,
     )
 
     with pytest.raises(FrozenInstanceError):
         context.package_pk = 2
+
+
+def test_runtime_package_context_provenance_tag_is_excluded_from_repr():
+    context = RuntimePackageContext(
+        package_pk=1,
+        package_type="learning_path",
+        source_public_id=uuid4(),
+        package_version=1,
+        payload_sha256="0" * 64,
+        _provenance_tag=b"super-secret-tag-bytes",
+    )
+
+    assert "super-secret-tag-bytes" not in repr(context)
+    assert "_provenance_tag" not in repr(context)
 
 
 def test_runtime_publication_is_frozen_with_immutable_payload():

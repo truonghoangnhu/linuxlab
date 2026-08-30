@@ -355,4 +355,33 @@ linuxlab/settings/{base,central,node,test}.py
 
 **Full suite at completion:** see the Task 13 Implementation Report for exact counts (full verification run separately, after this record).
 
-Do not silently change Task 13 runtime semantics in code alone.
+---
+
+## Corrective: seal RuntimePackageContext opening provenance (2026-08-30)
+
+An independent review of the Task 13 implementation (commit `856b66e`) returned a CONDITIONAL PASS with one Important finding: `_rebind_runtime_context()` only compared `RuntimePackageContext`'s claimed identity fields against the persisted `InstalledPackage` row — it never proved the context had actually been *issued* by `open_runtime_context()` while that package was ACTIVE. A manually constructed `RuntimePackageContext` carrying an ARCHIVED or STAGED package's exact persisted identity therefore passed rebind undetected. The public HTTP route was not directly exploitable (it always opens a fresh ACTIVE context), but the runtime service boundary itself did not prove opening provenance. This was reproduced directly before any fix: a hand-built context for a just-archived package resolved a real `RuntimePublication` through `get_runtime_publication()`.
+
+This corrective **completes** T13-D10's existing trust semantics ("a frozen dataclass is constructible by ordinary Python code, so it is never trusted on its own") rather than replacing them — T13-D01 through T13-D15 are unchanged.
+
+**Mechanism:** a process-local HMAC-SHA256 seal, added to `linuxlab/runtime/context.py`:
+
+- `_CONTEXT_PROVENANCE_KEY = secrets.token_bytes(32)`, generated once at process start. Never persisted, never derived from Django `SECRET_KEY`, unrelated to Task 11/12 package signing keys. A `RuntimePackageContext` is a request/use-case scoped capability that was never expected to survive a process restart, so there is nothing to migrate or rotate.
+- `_seal_runtime_context_identity(...)` computes `hmac.new(key, canonical_json_bytes, hashlib.sha256).digest()` over the exact five identity fields (`package_pk`, `package_type`, `source_public_id`, `package_version`, `payload_sha256`), canonicalized via `json.dumps(..., sort_keys=True, separators=(",", ":"))` to avoid any delimiter ambiguity.
+- Only `open_runtime_context()` (via `_context_from_package()`) mints a valid tag in normal production code. No public `mint_context()` helper exists.
+- `RuntimePackageContext` gained a new field, `_provenance_tag: bytes = field(repr=False, compare=False)` — excluded from `repr()` and from dataclass equality/hash (context *identity* is still just the five claim fields); no default, so a context missing the field entirely fails construction from ordinary keyword use exactly like one with a wrong value fails validation.
+- `_rebind_runtime_context()` now validates provenance **first** (`hmac.compare_digest`, fail-closed to `RuntimeContextInvalid` on any non-`bytes` or mismatched tag), *then* performs the existing persisted-identity comparison. Either failing raises `RuntimeContextInvalid`.
+
+**T13-D11 is unaffected:** `_rebind_runtime_context()` still never checks `package.state`. A context legitimately minted while its package was ACTIVE keeps working after that package becomes ARCHIVED (proven by a dedicated regression test); the HMAC proves *legitimate issuance*, not *current state* — those remain two independent questions, exactly as before.
+
+**Trust model, stated precisely:** this seal is same-process API provenance — proof a context came from `open_runtime_context()` in *this* process. It is explicitly **not** a defense against arbitrary code already executing inside this same trusted process with unrestricted introspection (such code could read `_CONTEXT_PROVENANCE_KEY` itself). If a caller already possesses a legitimate sealed context and copies it, that copy is the same valid capability — this is acceptable and unchanged from the original design's framing of a context as "a locator + identity claim."
+
+**Verified fail-closed:**
+
+- an exact-match, never-minted context for an ARCHIVED package → `RuntimeContextInvalid` (reproduces and closes the reported finding);
+- an exact-match, never-minted context for a STAGED (never-activated) package → `RuntimeContextInvalid`;
+- a legitimately minted context, individually tampered on any one of the five identity fields via `dataclasses.replace()` without re-minting → `RuntimeContextInvalid` for every field;
+- a legitimately minted context, after its package transitions ACTIVE → ARCHIVED → still resolves content correctly (unchanged).
+
+**No DB write, no migration:** confirmed via `makemigrations --check --dry-run` on both Central and Node (no changes detected). No model gained a field; nothing about `InstalledPackage` changed.
+
+**No T13-D16:** this is a completion of T13-D10, not a new architectural decision — no new numbered decision was added.

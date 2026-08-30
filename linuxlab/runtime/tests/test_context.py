@@ -107,12 +107,17 @@ def test_rebind_rejects_fabricated_identity_claim(installed_active_world):
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
 def test_rebind_rejects_a_context_pointing_at_a_missing_package():
+    # An arbitrary/invalid provenance tag is fine here: this test's
+    # target is the "package no longer exists" path, and an unsealed
+    # context is correctly rejected before ever reaching it anyway (see
+    # test_context_provenance.py for the dedicated provenance tests).
     fake_context = RuntimePackageContext(
         package_pk=999999,
         package_type="learning_path",
         source_public_id=uuid.uuid4(),
         package_version=1,
         payload_sha256="0" * 64,
+        _provenance_tag=b"not a real provenance tag",
     )
 
     with pytest.raises(RuntimeContextInvalid):
