@@ -19,13 +19,22 @@ for NodeRegistration.
 """
 
 import random
+from dataclasses import dataclass
 from datetime import timedelta
 
 from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from .contracts import WireEventEnvelope
+from .contracts import (
+    ACCEPTED,
+    DUPLICATE,
+    REJECTED,
+    AuthTransportError,
+    ProtocolTransportError,
+    TransientTransportError,
+    WireEventEnvelope,
+)
 from .models import (
     OUTBOX_DEAD_LETTER,
     OUTBOX_DELIVERED,
@@ -227,3 +236,74 @@ def compute_retry_delay(attempts, *, base, cap, random_source):
     safe_attempts = min(attempts, 64)
     ceiling = min(cap, base * (2**safe_attempts))
     return ceiling * random_source()
+
+
+@dataclass(frozen=True)
+class FlushSummary:
+    """The outcome of one flush_outbox() cycle -- owns no business
+    mutation and no Central projection; purely a report of what
+    happened to claimed Outbox rows."""
+
+    claimed: int = 0
+    delivered: int = 0
+    dead_lettered: int = 0
+    released_transient: int = 0
+    released_auth_failure: int = 0
+    auth_fault: bool = False
+
+
+def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
+    """Claim a bounded batch, send it through `transport` OUTSIDE any
+    open DB transaction, then update delivery metadata only for
+    confirmed event IDs (T14-D08, T14-D16, T14-D17). Never reserializes
+    from current domain state -- every envelope sent is exactly what
+    claim_outbox_batch() returned. Owns no business mutation and no
+    Central projection.
+    """
+    claimed = claim_outbox_batch(
+        max_events=max_events, max_bytes=max_bytes, lease_seconds=lease_seconds, now=now
+    )
+    if not claimed:
+        return FlushSummary()
+
+    event_ids = [row.event_id for row in claimed]
+    envelopes = tuple(envelope_for(row) for row in claimed)
+
+    try:
+        batch_ack = transport.send_batch(envelopes)
+    except AuthTransportError:
+        release_auth_failure(event_ids, now=now)
+        return FlushSummary(claimed=len(claimed), released_auth_failure=len(claimed), auth_fault=True)
+    except (TransientTransportError, ProtocolTransportError) as exc:
+        release_transient(event_ids, type(exc).__name__, now=now)
+        return FlushSummary(claimed=len(claimed), released_transient=len(claimed))
+
+    acks_by_event_id = {ack.event_id: ack for ack in batch_ack.results}
+
+    delivered_ids = []
+    dead_lettered = 0
+    unconfirmed_ids = []
+    for event_id in event_ids:
+        ack = acks_by_event_id.get(event_id)
+        if ack is None:
+            unconfirmed_ids.append(event_id)
+            continue
+        if ack.status in (ACCEPTED, DUPLICATE):
+            delivered_ids.append(event_id)
+        elif ack.status == REJECTED:
+            mark_dead_letter(event_id, ack.code, ack.reason, now=now)
+            dead_lettered += 1
+        else:
+            unconfirmed_ids.append(event_id)
+
+    if delivered_ids:
+        mark_delivered(delivered_ids, now=now)
+    if unconfirmed_ids:
+        release_transient(unconfirmed_ids, "missing_or_unconfirmed_ack", now=now)
+
+    return FlushSummary(
+        claimed=len(claimed),
+        delivered=len(delivered_ids),
+        dead_lettered=dead_lettered,
+        released_transient=len(unconfirmed_ids),
+    )
