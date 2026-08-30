@@ -1,4 +1,5 @@
-"""Node package lifecycle inventory (ADR-008, ADR-010, ADR-014, Task 12).
+"""Node package lifecycle inventory (ADR-008, ADR-010, ADR-014, Task 12) and
+Node <-> Central event sync persistence (ADR-010, Task 14).
 
 Task 11's `.llpkg` format (linuxlab/publication/package.py) proves a package
 is authentic and self-contained; this module stores what a Node has locally
@@ -15,13 +16,28 @@ insertion/lifecycle helpers in linuxlab.sync.services, which bypass these
 guards deliberately via Django's own underlying primitives (the same
 bypass spirit as Task 09's PublicationSnapshot _insert_published_snapshot()
 calling Model.save_base() directly).
+
+Task 14 (T14-D10, T14-D11, T14-D26, T14-D31): NodeRegistration,
+OutboxMessage, and InboxMessage reuse the exact same ImmutableArtifact
+trust boundary defined below for Task 12's staged package artifacts --
+ordinary create/save/bulk_create/update/bulk_update/delete are blocked
+outright for all three. Unlike Task 12's fully-immutable artifacts, each
+of these three has a small, explicitly allow-listed subset of fields that
+*is* expected to change after creation (credential rotation/revocation,
+Outbox delivery state, Inbox processing state) -- never through ordinary
+save()/QuerySet.update(), only through the owning service module's private
+controlled writer, which calls _write_immutable_row_fields() below.
 """
 
+import uuid
 from typing import ClassVar
 
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
+
+from linuxlab.core.models import DomainEvent
 
 STAGED = "staged"
 ACTIVE = "active"
@@ -221,6 +237,43 @@ class ImmutableArtifact(models.Model):
         raise ValueError(f"{type(self).__name__} rows are immutable and cannot be deleted")
 
 
+def _insert_immutable_row(model_cls, **fields):
+    """Task 14 shared private insertion bypass for ImmutableArtifact
+    subclasses (the same pattern as Task 12's own _insert_trusted() in
+    services.py, kept as a separate helper here rather than importing that
+    one directly -- that one is scoped to Task 12's five models and is
+    never touched by Task 14). Construct and force-insert one row,
+    bypassing save()'s unconditional rejection via Model.save_base(),
+    exactly the call save() itself would make had it not been overridden.
+    `model_cls` is never accepted from an external caller -- every call
+    site hardcodes one of the owning service module's own models.
+    """
+    instance = model_cls(**fields)
+    models.Model.save_base(instance, force_insert=True)
+    return instance
+
+
+def _write_immutable_row_fields(model_cls, pk, allowed_fields, **fields):
+    """Task 14 shared private controlled-mutation bypass for
+    ImmutableArtifact subclasses: update ONLY an explicit allow-listed
+    subset of fields on an existing row (credential rotation/revocation
+    for NodeRegistration; delivery metadata for OutboxMessage; processing
+    metadata for InboxMessage), bypassing the guarded QuerySet.update()
+    rejection by calling Django's underlying QuerySet.update() directly --
+    the same bypass spirit as Task 12's _write_installed_package_lifecycle().
+    Never accepts arbitrary **kwargs without the allow-list check below.
+    """
+    unexpected = set(fields) - set(allowed_fields)
+    if unexpected:
+        raise ValueError(
+            f"cannot write non-mutable {model_cls.__name__} fields: {sorted(unexpected)}"
+        )
+
+    updated = models.QuerySet.update(model_cls.objects.filter(pk=pk), **fields)
+    if updated != 1:
+        raise ValueError(f"{model_cls.__name__} {pk} does not exist")
+
+
 class InstalledPublication(ImmutableArtifact):
     """The Task 11 payload.publication section, staged verbatim for exactly
     one InstalledPackage."""
@@ -295,3 +348,147 @@ class InstalledQuestionGrading(ImmutableArtifact):
 
     class Meta(ImmutableArtifact.Meta):
         pass
+
+
+# --- Task 14: Node <-> Central event sync -----------------------------------
+
+OUTBOX_PENDING = "pending"
+OUTBOX_IN_FLIGHT = "in_flight"
+OUTBOX_DELIVERED = "delivered"
+OUTBOX_DEAD_LETTER = "dead_letter"
+
+OUTBOX_STATE_CHOICES = [
+    (OUTBOX_PENDING, "Pending"),
+    (OUTBOX_IN_FLIGHT, "In flight"),
+    (OUTBOX_DELIVERED, "Delivered"),
+    (OUTBOX_DEAD_LETTER, "Dead letter"),
+]
+
+INBOX_RECEIVED = "received"
+INBOX_PROCESSED = "processed"
+INBOX_FAILED = "failed"
+
+INBOX_STATE_CHOICES = [
+    (INBOX_RECEIVED, "Received"),
+    (INBOX_PROCESSED, "Processed"),
+    (INBOX_FAILED, "Failed"),
+]
+
+
+class NodeRegistration(ImmutableArtifact):
+    """Central-issued, Central-owned Node identity and credential state
+    (T14-D18, T14-D19, T14-D23, T14-D28). `node_id`/`display_name`/
+    `created_at` are permanent identity; `current_secret_hash`,
+    `previous_secret_hash`, `previous_valid_until`, `enabled`,
+    `rotated_at`, and `revoked_at` are credential-lifecycle state, mutable
+    only through linuxlab.sync.authentication's private controlled writer
+    -- never through ordinary save()/QuerySet.update(). Never stores
+    plaintext; only Django password hashes (T14-D19, T14-D37)."""
+
+    node_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    display_name = models.CharField(max_length=255)
+    current_secret_hash = models.TextField()
+    previous_secret_hash = models.TextField(blank=True, default="")
+    previous_valid_until = models.DateTimeField(null=True, blank=True)
+    enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    rotated_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta(ImmutableArtifact.Meta):
+        pass
+
+
+class OutboxMessage(ImmutableArtifact):
+    """One Node-local queued sync event (T14-D10, T14-D11, T14-D31). The
+    wire envelope fields (event_id through payload) are the immutable
+    snapshot captured at enqueue time -- retries resend exactly this, never
+    a reserialization of current domain state. Delivery metadata (state
+    through created_at) is mutable only through linuxlab.sync.outbox's
+    private controlled writer.
+
+    `domain_event` is a trace/audit link only (T14-D11); wire semantics
+    never depend on re-reading it. PROTECT mirrors the rest of this app's
+    convention of never allowing an ordinary cascade to silently remove
+    retained history.
+    """
+
+    event_id = models.UUIDField(unique=True, editable=False)
+    domain_event = models.ForeignKey(
+        DomainEvent,
+        on_delete=models.PROTECT,
+        related_name="outbox_messages",
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(max_length=255)
+    schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    source_node_id = models.UUIDField()
+    occurred_at = models.DateTimeField()
+    aggregate_type = models.CharField(max_length=100)
+    aggregate_public_id = models.UUIDField()
+    payload = models.JSONField()
+
+    state = models.CharField(max_length=20, choices=OUTBOX_STATE_CHOICES, default=OUTBOX_PENDING)
+    attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    lease_until = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    rejection_code = models.CharField(max_length=100, blank=True, default="")
+    rejection_reason = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta(ImmutableArtifact.Meta):
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            models.CheckConstraint(
+                condition=Q(
+                    state__in=[
+                        OUTBOX_PENDING,
+                        OUTBOX_IN_FLIGHT,
+                        OUTBOX_DELIVERED,
+                        OUTBOX_DEAD_LETTER,
+                    ]
+                ),
+                name="outbox_message_state_allowed_values",
+            ),
+        ]
+
+
+class InboxMessage(ImmutableArtifact):
+    """Central's durable acceptance ledger (T14-D12, T14-D26, T14-D27).
+    Event content fields (event_id through payload) are immutable once
+    accepted -- a same-`event_id`-different-content event is a conflict,
+    never an overwrite (T14-D27), which is enforced entirely at the
+    linuxlab.sync.ingestion service layer since this row's own guard
+    already forbids any ordinary rewrite. Processing metadata
+    (processing_state, processed_at, processing_error) is mutable only
+    through linuxlab.sync.processing's private controlled writer, and
+    never affects Node ACK/delivery semantics (T14-D12).
+    """
+
+    event_id = models.UUIDField(unique=True, editable=False)
+    source_node = models.ForeignKey(
+        NodeRegistration, on_delete=models.PROTECT, related_name="inbox_messages"
+    )
+    event_type = models.CharField(max_length=255)
+    schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    occurred_at = models.DateTimeField()
+    received_at = models.DateTimeField(auto_now_add=True)
+    aggregate_type = models.CharField(max_length=100)
+    aggregate_public_id = models.UUIDField()
+    payload = models.JSONField()
+
+    processing_state = models.CharField(
+        max_length=20, choices=INBOX_STATE_CHOICES, default=INBOX_RECEIVED
+    )
+    processed_at = models.DateTimeField(null=True, blank=True)
+    processing_error = models.TextField(blank=True, default="")
+
+    class Meta(ImmutableArtifact.Meta):
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            models.CheckConstraint(
+                condition=Q(processing_state__in=[INBOX_RECEIVED, INBOX_PROCESSED, INBOX_FAILED]),
+                name="inbox_message_processing_state_allowed_values",
+            ),
+        ]
