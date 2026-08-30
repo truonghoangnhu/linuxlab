@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-30
 **Project:** LinuxLab.vn / LinuxLab Open Lab
-**Status:** IMPLEMENTED — see "Implementation record" at the end of this file; awaiting independent Task 14 architecture/security review
+**Status:** CORRECTIVE APPLIED — independent review returned verdict B (TASK 14 CONDITIONAL); all eight Important findings corrected, see "Corrective implementation record" at the end of this file; awaiting independent focused corrective re-review
 **Predecessor:** Task 13 FINAL PASS at `63a2baa2c33f4d8792befa85c1bb6835e3aa8b60`, 566 tests passing
 
 This file records the architecture choices approved for Task 14. These decisions are normative for the Task 14 spec and future implementation plan. They must not be silently changed during implementation.
@@ -679,3 +679,75 @@ f7611e5 feat: add Node outbox sync worker
 **Full-suite verification:** `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest -q` → 726 passed (566 pre-Task-14 baseline + 160 new Task 14 tests). `.venv/bin/ruff check .` clean. `manage.py check` and `manage.py makemigrations --check --dry-run` clean on both the `central` and `node` settings profiles.
 
 **One real bug found and fixed during TDD** (Task 5): `claim_outbox_batch()`'s initial implementation fetched all due candidates under `select_for_update(skip_locked=True)` before trimming to the byte budget in Python — but `SELECT FOR UPDATE` locks every row a query returns, not just the ones ultimately selected, so an unbounded fetch over-locked rows beyond `max_events` and starved a concurrent claimer. Fixed by bounding the locked query to `max_events` up front (byte-budget trimming only ever removes from the tail of that same window, so no candidate beyond `max_events` is ever eligible anyway). Caught by a real two-thread PostgreSQL concurrency test, not a mock.
+
+---
+
+## Corrective implementation record (2026-08-31)
+
+Following the independent Task 14 architecture/security review (**verdict B, TASK 14 CONDITIONAL**), all eight Important findings were corrected. No semantic change was made to T14-D01 through T14-D39; the one new decision approved for this corrective is **T14-D40** (above) — no T14-D41 was invented.
+
+**Corrective commit range:** `a528070..1795143` (6 fix commits) plus `e0fd873` (T14-D40 docs) and this record's own commit, all on top of the reviewed HEAD `232e70b3935c72fdccd62075546c1483aa2b860d`.
+
+```
+e0fd873 docs: record Task 14 protocol corrective
+a528070 fix: enforce Task 14 deployment boundaries
+27babb4 fix: seal sync trust record writers
+5c21a2f fix: fence stale outbox workers
+5a9eb75 fix: recover deterministic sync protocol failures
+f32f0f2 fix: normalize and validate sync envelopes
+1795143 fix: reject ambiguous sync acknowledgements
+```
+
+### Finding 1 — Central-only authority exposed on the Node profile
+
+Added `linuxlab.sync.capabilities.can_receive_sync_events()`/`can_run_sync_worker()`, reading two new fail-closed settings flags (`LINUXLAB_CAN_RECEIVE_SYNC_EVENTS`, `LINUXLAB_CAN_RUN_SYNC_WORKER`) following the existing `LINUXLAB_CAN_*` pattern — never a `LINUXLAB_PROFILE` string comparison. `central.py` sets the first `True`/second `False`; `node.py` the reverse; both default `False` on `base.py` (inherited unchanged by the `test` profile). `SyncEventsView.post()` checks `can_receive_sync_events()` before any credential parsing (403 if absent); `manage_sync_node`'s `handle()` checks the same (`CommandError` if absent); `sync_events`'s `_build_transport()` checks `can_run_sync_worker()` first, before its existing Node ID/secret/Central URL checks. Proven against both the real `linuxlab.settings.central`/`linuxlab.settings.node` modules and simulated cross-profile flag combinations in `test_task14_profiles.py` (7 tests) plus `core/tests/test_settings_profiles.py`'s existing flag-value convention.
+
+### Finding 2 — Immutable-row writer accepted caller-controlled authorization
+
+`_write_immutable_row_fields(model_cls, pk, allowed_fields, **fields)` let every caller construct its own allow-list. Replaced with `_write_immutable_row_fields(instance, **changes)` (single row) and a new `_bulk_write_immutable_rows(queryset, **changes)` (batch), both resolving the mutable-field allow-list from a model-fixed `_MUTABLE_FIELDS_BY_MODEL` mapping inside `linuxlab.sync.models` itself — never from a parameter. The legacy 4-positional-argument call shape no longer exists at all (`TypeError`, not a runtime rejection). `outbox.py`'s own duplicate `_bulk_write_outbox_fields()`/raw `models.QuerySet.update()` bypasses (including inside `claim_outbox_batch()`'s claim transition) were removed and routed through the same shared authority. Permanent tests probe every immutable field on `NodeRegistration`/`OutboxMessage`/`InboxMessage` individually, prove the old signature is `TypeError`-impossible, and confirm every legitimate mutation (rotation/revoke, delivery metadata, processing metadata) still works.
+
+### Finding 3 — Lease recovery lacked stale-worker fencing
+
+Added an additive `claim_token` UUID field to `OutboxMessage` (migration `0004_outboxmessage_claim_token.py`). `claim_outbox_batch()` mints a fresh token per row on every claim and reclaim. `mark_delivered()`/`mark_dead_letter()`/`release_transient()`/`release_auth_failure()` now take the exact claimed row(s), not a bare `event_id`, and write through a new `_write_fenced()` helper filtering on `event_id` + `state=IN_FLIGHT` + that exact `claim_token`; a stale worker's write matches zero rows. Proven with two real two-thread/two-PostgreSQL-connection tests: a stale worker's late transient-failure report cannot resurrect a row a second worker already reclaimed and delivered, and a stale worker's late success report cannot overwrite a row a second worker already reclaimed and dead-lettered.
+
+### Finding 4 — 400/413 retried forever; byte accounting mismatched actual request bytes
+
+Added `serialize_sync_batch()` (`contracts.py`) as the one shared serializer: `claim_outbox_batch()`'s incremental byte-budget accounting and `HttpSyncTransport.send_batch()`'s actual outgoing body now both build from it, closing the gap where the locally enforced count omitted the `{"events":[...]}` wrapper/separator overhead. Exact-boundary tests prove fit-at-N-bytes / excluded-at-N-minus-1-byte, and a dedicated test shows the old naive per-event sum would have (incorrectly) let two events fit under a budget the real wrapped body cannot.
+
+Implemented **T14-D40**: `HttpSyncTransport` raises the new `RequestTooLargeError` (a `ProtocolTransportError` subclass) specifically for 413. `flush_outbox()`'s new `_send_claimed_rows()` splits a multi-event batch on 413 and retries the halves (bounded recursion, O(log n) deep, never unbounded); a singleton that still 413s dead-letters with code `EVENT_TOO_LARGE`. A plain 400 is never treated as `EVENT_TOO_LARGE`; the whole claimed batch releases as retryable (with the existing backoff) and `FlushSummary.protocol_fault` is set so `sync_events` pauses on the same long interval as an auth fault and prints an operator-visible warning, rather than tight-looping the identical malformed request.
+
+### Finding 5 — Incomplete envelope validation; poison events could reach DB exceptions
+
+Added `normalize_wire_event()` (`contracts.py`): the one boundary every inbound envelope crosses before persistence or duplicate comparison. Validates UUID-typed fields are actually UUIDs, bounds `event_type`/`aggregate_type` to their model `CharField` `max_length`s (255/100), checks `aggregate_type` against a new `SyncEventContract.expected_aggregate_type`, and cross-checks `aggregate_public_id` against a new `SyncEventContract.payload_aggregate_public_id()` extractor (for `activity.completed`, the payload's own `attempt_public_id`). Any failure raises `WireEventValidationError`, mapped uniformly by `ingest_event()` to `REJECTED`/`INVALID_PAYLOAD` — never a 500, never an uncaught `DataError`. `ingest_event()`'s `IntegrityError` handling was also narrowed: on a unique-constraint race it now confirms a row with that exact `event_id` exists before classifying duplicate/conflict; any other `IntegrityError` cause re-raises as a genuine infrastructure fault. `activity.completed`'s own payload validator now parses its three identity fields as actual UUIDs, not just non-empty strings.
+
+### Finding 6 — Timestamp normalization broke exact replay idempotency
+
+`normalize_wire_event()` UTC-normalizes `occurred_at` (`.astimezone(UTC)`) and rejects naive timestamps outright rather than guessing a Node's timezone. Central persists and compares using only the normalized form, so a retry encoding the same instant with a different UTC offset (+07:00 vs Z vs +00:00) is recognized as `DUPLICATE`, never `IDEMPOTENCY_CONFLICT`. Proven at the unit level (`test_task14_validation.py`, `test_task14_ingestion.py::test_replay_with_different_utc_offset_for_the_same_instant_is_duplicate_not_conflict`) and end-to-end through the real `flush_outbox()` → `authenticate_node()`/`ingest_event()` path with a lost-ACK retry (`test_task14_e2e.py::test_ack_lost_replay_with_non_utc_offset_becomes_duplicate_not_conflict`).
+
+### Finding 7 — Duplicate/incomplete ACK entries could authorize irreversible action
+
+Added `parse_ack_results()` (`contracts.py`): the one shared, conservative ACK parser. An `event_id` appearing more than once among otherwise-valid candidates drops *all* of its entries (ambiguous, stays unconfirmed); a `REJECTED` entry with no rejection code is dropped the same way. `HttpSyncTransport` delegates to it instead of building its own list; `BatchAck.status_for()` is hardened identically for any direct caller. `flush_outbox()`'s own ACK consumption is independently hardened too (never trusting that a hand-built `BatchAck` is already deduplicated) — defense in depth, not redundant, since existing tests already construct `BatchAck` directly. Proven with a full ACK ambiguity matrix (duplicate/conflicting entries, missing code, unknown IDs, mixed valid/malformed) at both the transport-parser and flush-orchestration layers.
+
+### Finding 8 — Plaintext Node credential appeared in repr
+
+`IssuedNodeCredential.secret` is now `dataclasses.field(repr=False)`. The CLI's one authorized plaintext disclosure (`manage_sync_node issue`/`rotate`, printed once to the operator via `self.stdout.write(f"secret: {credential.secret}")`) is unaffected since it reads the attribute directly, never through `repr()`.
+
+### Profile authority (final)
+
+| | Central | Node |
+|---|---|---|
+| Ingestion (`POST /api/v1/sync/events/`) | ✅ | ❌ (403) |
+| Provisioning (`manage_sync_node`) | ✅ | ❌ (`CommandError`) |
+| Outbound worker (`sync_events`) | ❌ (`CommandError`) | ✅ |
+
+### Verification
+
+- Focused sync suite: `linuxlab/sync/tests` — **320 passed**.
+- Complete suite: `env -u DJANGO_SETTINGS_MODULE pytest -q` — **806 passed** (726 pre-corrective baseline + 80 new corrective tests).
+- `ruff check .` — clean.
+- `manage.py check` (central, node) — clean.
+- `manage.py makemigrations --check --dry-run` (central, node) — no drift beyond the checked-in additive `0004_outboxmessage_claim_token` migration.
+
+### Minor backlog (unchanged, not addressed by this corrective)
+
+Dead backoff settings (`LINUXLAB_SYNC_BACKOFF_BASE_SECONDS`/`CAP_SECONDS` still unused by `release_transient()`), `FileSyncTransport` deterministic-output hardening, a durable idempotency-conflict audit trail, and a claim-path index/schema-version constraint remain backlog — none were mechanically necessary to fix an Important finding, so none were touched.

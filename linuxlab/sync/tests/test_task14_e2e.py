@@ -11,7 +11,9 @@ end to end.
 """
 
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from datetime import timezone as dt_timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.utils import timezone
@@ -39,9 +41,11 @@ from linuxlab.sync.models import (
     InstalledQuestionVersion,
     NodeRegistration,
     OutboxMessage,
+    _insert_immutable_row,
 )
 from linuxlab.sync.outbox import flush_outbox
 from linuxlab.sync.processing import process_inbox_event
+from linuxlab.sync.transports import HttpSyncTransport
 
 pytestmark = pytest.mark.django_db
 
@@ -339,3 +343,131 @@ def test_full_cycle_never_touches_package_inventory_or_creates_reverse_transport
     # regular sync cycle -- only linuxlab.sync.authentication's explicit
     # controlled issue_node_registration() creates one.
     assert NodeRegistration.objects.count() == node_registration_count_before
+
+
+# --- corrective Task 8 proofs ------------------------------------------------
+
+
+def _fake_http_response(status, body_dict):
+    import json
+
+    response = MagicMock()
+    response.status = status
+    response.read.return_value = json.dumps(body_dict).encode("utf-8")
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    return response
+
+
+def test_413_split_and_singleton_dead_letter_through_real_http_transport(settings):
+    """T14-D40 through the REAL shared serializer (serialize_sync_batch()),
+    the REAL HttpSyncTransport HTTP status classification, and the REAL
+    flush_outbox() split/singleton-dead-letter orchestration -- only the
+    urllib.request.urlopen() network call itself is faked."""
+    import json
+    import urllib.error
+
+    credential = issue_node_registration("413 Node")
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = str(credential.node_id)
+
+    published, _registry = _make_published_activity_version()
+    good_learner = _make_learner()
+    oversized_learner = _make_learner()
+    claim_activity_completion(good_learner, published)
+    claim_activity_completion(oversized_learner, published)
+
+    good_outbox, oversized_outbox = OutboxMessage.objects.order_by("created_at")
+    oversized_event_id = str(oversized_outbox.event_id)
+
+    transport = HttpSyncTransport(
+        "https://central.example.org", credential.node_id, credential.secret
+    )
+
+    def _fake_urlopen(request, timeout=None):
+        del timeout
+        body = json.loads(request.data)
+        events = body["events"]
+        if len(events) > 1 or events[0]["event_id"] == oversized_event_id:
+            raise urllib.error.HTTPError(
+                url="https://central.example.org/api/v1/sync/events/",
+                code=413,
+                msg="too large",
+                hdrs=None,
+                fp=None,
+            )
+        return _fake_http_response(
+            200, {"results": [{"event_id": events[0]["event_id"], "status": "accepted"}]}
+        )
+
+    with patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen):
+        summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.claimed == 2
+    assert summary.delivered == 1
+    assert summary.dead_lettered == 1
+    refreshed_good = OutboxMessage.objects.get(pk=good_outbox.pk)
+    refreshed_oversized = OutboxMessage.objects.get(pk=oversized_outbox.pk)
+    assert refreshed_good.state == OUTBOX_DELIVERED
+    assert refreshed_oversized.state == OUTBOX_DEAD_LETTER
+    assert refreshed_oversized.rejection_code == "EVENT_TOO_LARGE"
+
+
+def test_ack_lost_replay_with_non_utc_offset_becomes_duplicate_not_conflict(settings):
+    """A Node-encoded +07:00 occurred_at must be recognized as the exact
+    same event as its UTC-normalized replica on retry -- through the
+    REAL flush_outbox() -> Central authenticate_node()/ingest_event()
+    path, not just a direct ingest_event() unit call."""
+    credential = issue_node_registration("Offset Node")
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = str(credential.node_id)
+
+    plus_seven = datetime(2026, 8, 31, 10, 0, 0, tzinfo=dt_timezone(timedelta(hours=7)))
+    attempt_public_id = uuid.uuid4()
+    now = timezone.now()
+    outbox = _insert_immutable_row(
+        OutboxMessage,
+        event_id=uuid.uuid4(),
+        domain_event=None,
+        event_type="activity.completed",
+        schema_version=1,
+        source_node_id=credential.node_id,
+        occurred_at=plus_seven,
+        aggregate_type="attempt",
+        aggregate_public_id=attempt_public_id,
+        payload={
+            "attempt_public_id": str(attempt_public_id),
+            "learner_public_id": str(uuid.uuid4()),
+            "activity_definition_public_id": str(uuid.uuid4()),
+            "activity_version": 1,
+            "score": 1,
+            "max_score": 1,
+        },
+        state=OUTBOX_PENDING,
+        attempts=0,
+        next_attempt_at=now,
+        claimed_at=None,
+        lease_until=None,
+        claim_token=None,
+        delivered_at=None,
+        rejection_code="",
+        rejection_reason="",
+    )
+
+    lossy_transport = _BridgeTransport(credential.node_id, credential.secret, fail_first_n_sends=1)
+    first_summary = flush_outbox(
+        lossy_transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now
+    )
+    assert first_summary.released_transient == 1
+    inbox = InboxMessage.objects.get(event_id=outbox.event_id)
+    assert inbox.occurred_at == plus_seven.astimezone(UTC)
+
+    later = now + timedelta(hours=1)
+    reliable_transport = _BridgeTransport(credential.node_id, credential.secret)
+    second_summary = flush_outbox(
+        reliable_transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=later
+    )
+
+    assert second_summary.delivered == 1
+    assert OutboxMessage.objects.get(pk=outbox.pk).state == OUTBOX_DELIVERED
+    assert InboxMessage.objects.filter(event_id=outbox.event_id).count() == 1
