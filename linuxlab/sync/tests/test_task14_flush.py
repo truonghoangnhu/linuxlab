@@ -321,6 +321,66 @@ def test_413_split_never_recurses_unboundedly_for_a_realistic_batch():
         assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DEAD_LETTER
 
 
+# --- corrective (independent review finding #7): flush_outbox() itself is
+# ambiguity-safe, even if handed a BatchAck a transport built by hand rather
+# than through the shared parse_ack_results() parser.
+
+
+def test_flush_treats_duplicate_event_id_in_batch_ack_as_unconfirmed():
+    row = _make_outbox()
+    transport = _ScriptedTransport(
+        result=BatchAck(
+            results=(
+                EventAck(event_id=row.event_id, status=ACCEPTED),
+                EventAck(event_id=row.event_id, status=ACCEPTED),
+            )
+        )
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.delivered == 0
+    assert summary.dead_lettered == 0
+    assert summary.released_transient == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_PENDING
+
+
+def test_flush_treats_conflicting_entries_for_same_id_as_unconfirmed_never_dead_letters():
+    row = _make_outbox()
+    transport = _ScriptedTransport(
+        result=BatchAck(
+            results=(
+                EventAck(event_id=row.event_id, status=ACCEPTED),
+                EventAck(event_id=row.event_id, status=REJECTED, code="X"),
+            )
+        )
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.delivered == 0
+    assert summary.dead_lettered == 0
+    assert summary.released_transient == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_PENDING
+
+
+def test_flush_treats_rejected_without_code_as_unconfirmed_never_dead_letters():
+    row = _make_outbox()
+    transport = _ScriptedTransport(
+        result=BatchAck(results=(EventAck(event_id=row.event_id, status=REJECTED, code=""),))
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.delivered == 0
+    assert summary.dead_lettered == 0
+    assert summary.released_transient == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_PENDING
+
+
 # --- T14-D40: deterministic HTTP 400 handling --------------------------------
 
 

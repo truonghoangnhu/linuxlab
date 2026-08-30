@@ -55,15 +55,19 @@ class BatchAck:
     """A batch's independent per-event results (T14-D08, T14-D30).
     `status_for()` returns None -- never a delivered/accepted guess --
     for any event_id not explicitly present in the results, so a missing
-    or malformed result is always treated as unconfirmed."""
+    or malformed result is always treated as unconfirmed. It also
+    returns None for an event_id that appears MORE THAN ONCE in
+    `results` (duplicated or conflicting entries) -- ambiguous data can
+    never authorize an irreversible action (corrective, independent
+    review finding #7)."""
 
     results: tuple[EventAck, ...] = ()
 
     def status_for(self, event_id):
-        for result in self.results:
-            if result.event_id == event_id:
-                return result.status
-        return None
+        matches = [result.status for result in self.results if result.event_id == event_id]
+        if len(matches) != 1:
+            return None
+        return matches[0]
 
 
 class SyncTransport(Protocol):
@@ -286,3 +290,53 @@ def normalize_wire_event(envelope, contract):
         schema_version=envelope.schema_version,
         payload=envelope.payload,
     )
+
+
+_ACK_STATUSES = frozenset({ACCEPTED, DUPLICATE, REJECTED})
+
+
+def parse_ack_results(raw_results):
+    """Build a BatchAck from an untrusted list of raw per-event result
+    dicts (T14-D30 corrective, independent review finding #7): the
+    conservative safety rules below apply BEFORE BatchAck is even
+    constructed, so every transport implementation gets them for free
+    rather than reimplementing its own ad hoc parser.
+
+    Dropped entirely (that event stays unconfirmed/retryable, never
+    inferred delivered or dead-lettered):
+    - a malformed entry (not an object, unknown/missing status, an
+      event_id that isn't a parseable UUID);
+    - a `rejected` entry with no rejection code (a rejection reason
+      without a code is not actionable -- never dead-letter on it);
+    - EVERY entry for an event_id that appears more than once among the
+      otherwise-valid candidates, even if the repeated entries are
+      identical -- a duplicated or conflicting event_id in a response is
+      itself the ambiguous condition, regardless of what the entries say.
+    """
+    candidates_by_event_id: dict[UUID, list[EventAck]] = {}
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        status_value = item.get("status")
+        if status_value not in _ACK_STATUSES:
+            continue
+        try:
+            event_id = UUID(str(item.get("event_id")))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        code = str(item.get("code") or "")
+        if status_value == REJECTED and not code:
+            continue
+        candidates_by_event_id.setdefault(event_id, []).append(
+            EventAck(
+                event_id=event_id,
+                status=status_value,
+                code=code,
+                reason=str(item.get("reason") or ""),
+            )
+        )
+
+    acks = tuple(
+        candidates[0] for candidates in candidates_by_event_id.values() if len(candidates) == 1
+    )
+    return BatchAck(results=acks)

@@ -330,12 +330,28 @@ def _send_claimed_rows(transport, rows, now=None):
         release_transient(rows, "transient", now=now)
         return FlushSummary(claimed=len(rows), released_transient=len(rows))
 
-    acks_by_event_id = {ack.event_id: ack for ack in batch_ack.results}
+    # Never trust that batch_ack.results is already deduplicated --
+    # BatchAck can be constructed directly by any transport (or a test),
+    # so this consumption is ambiguity-safe on its own terms rather than
+    # relying solely on parse_ack_results() upstream (corrective,
+    # independent review finding #7). An event_id that appears more than
+    # once here is ambiguous and stays unconfirmed, exactly like a
+    # REJECTED result with no rejection code.
+    acks_by_event_id = {}
+    ambiguous_event_ids = set()
+    for ack in batch_ack.results:
+        if ack.event_id in acks_by_event_id:
+            ambiguous_event_ids.add(ack.event_id)
+            continue
+        acks_by_event_id[ack.event_id] = ack
 
     delivered_rows = []
     dead_lettered = 0
     unconfirmed_rows = []
     for row in rows:
+        if row.event_id in ambiguous_event_ids:
+            unconfirmed_rows.append(row)
+            continue
         ack = acks_by_event_id.get(row.event_id)
         if ack is None:
             unconfirmed_rows.append(row)
@@ -343,6 +359,9 @@ def _send_claimed_rows(transport, rows, now=None):
         if ack.status in (ACCEPTED, DUPLICATE):
             delivered_rows.append(row)
         elif ack.status == REJECTED:
+            if not ack.code:
+                unconfirmed_rows.append(row)
+                continue
             mark_dead_letter(row, ack.code, ack.reason, now=now)
             dead_lettered += 1
         else:

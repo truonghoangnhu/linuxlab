@@ -19,24 +19,20 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from .contracts import (
-    ACCEPTED,
-    DUPLICATE,
-    REJECTED,
     AuthTransportError,
     BatchAck,
-    EventAck,
     ProtocolTransportError,
     RequestTooLargeError,
     TransientTransportError,
     canonical_event_dict,
+    parse_ack_results,
     serialize_sync_batch,
 )
 
 _EVENTS_PATH = "/api/v1/sync/events/"
-_ACK_STATUSES = frozenset({ACCEPTED, DUPLICATE, REJECTED})
 
 
 class HttpSyncTransport:
@@ -109,26 +105,10 @@ class HttpSyncTransport:
         if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
             raise TransientTransportError("malformed batch response shape")
 
-        acks = []
-        for item in parsed["results"]:
-            if not isinstance(item, dict):
-                continue
-            status_value = item.get("status")
-            if status_value not in _ACK_STATUSES:
-                continue
-            try:
-                event_id = UUID(str(item.get("event_id")))
-            except (ValueError, TypeError, AttributeError):
-                continue
-            acks.append(
-                EventAck(
-                    event_id=event_id,
-                    status=status_value,
-                    code=str(item.get("code") or ""),
-                    reason=str(item.get("reason") or ""),
-                )
-            )
-        return BatchAck(results=tuple(acks))
+        # Conservative ambiguity handling (duplicated/conflicting
+        # event_ids, a REJECTED entry with no code) lives in the one
+        # shared parser so every transport gets it for free.
+        return parse_ack_results(parsed["results"])
 
 
 class FileSyncTransport:
