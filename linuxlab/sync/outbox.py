@@ -11,18 +11,28 @@ any open transaction.
 mark_delivered()/mark_dead_letter()/release_transient()/
 release_auth_failure() are the only controlled writers of Outbox
 delivery metadata (state, attempts, next_attempt_at, claimed_at,
-lease_until, delivered_at, rejection_code, rejection_reason). None of
-them can touch the immutable wire-envelope fields (event_id through
-payload) -- this module never bypasses the ORM guard directly; every
-write goes through linuxlab.sync.models' own model-fixed allow-list
-(_write_immutable_row_fields()/_bulk_write_immutable_rows()), the same
-single trust boundary linuxlab.sync.authentication and
-linuxlab.sync.processing use (corrective, independent review finding
-#2 -- the allow-list is fixed inside that boundary, never passed in by
-this or any other caller).
+lease_until, claim_token, delivered_at, rejection_code,
+rejection_reason). None of them can touch the immutable wire-envelope
+fields (event_id through payload) -- this module never bypasses the
+ORM guard directly; every write goes through linuxlab.sync.models' own
+model-fixed allow-list (_write_immutable_row_fields()/
+_bulk_write_immutable_rows()), the same single trust boundary
+linuxlab.sync.authentication and linuxlab.sync.processing use
+(corrective, independent review finding #2 -- the allow-list is fixed
+inside that boundary, never passed in by this or any other caller).
+
+Every one of those four writers also requires the caller to pass the
+EXACT claimed OutboxMessage row(s) it received from claim_outbox_batch()
+-- not a bare event_id -- and fences its write to state=IN_FLIGHT plus
+that row's exact claim_token (corrective, independent review finding
+#3). A worker whose lease already expired and was reclaimed by another
+worker therefore affects zero rows when it later reports a result,
+instead of resurrecting DELIVERED/DEAD_LETTER or clobbering the
+reclaiming worker's own transition.
 """
 
 import random
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -46,7 +56,6 @@ from .models import (
     OUTBOX_PENDING,
     OutboxMessage,
     _bulk_write_immutable_rows,
-    _write_immutable_row_fields,
 )
 
 # Task 5 owns sane self-contained defaults; Task 6/10 may later thread
@@ -56,20 +65,17 @@ _DEFAULT_BACKOFF_BASE_SECONDS = 5.0
 _DEFAULT_BACKOFF_CAP_SECONDS = 3600.0
 
 
-def _bulk_write_outbox_fields(event_ids, **fields):
-    """Thin event_id-keyed convenience wrapper over
-    linuxlab.sync.models._bulk_write_immutable_rows() -- the public
-    event_id is the natural key every caller in this module already
-    has, rather than a local pk. The mutable-field allow-list itself is
-    resolved entirely inside that shared helper, not here. Affecting
-    zero rows for an unknown/no-longer-matching event_id is a normal,
-    safe no-op (the caller's next claim cycle simply will not see that
-    row again), not an error."""
-    event_ids = list(event_ids)
-    if not event_ids:
-        return 0
+def _write_fenced(row, **changes):
+    """Update `row`'s OutboxMessage ONLY if it still owns the exact
+    claim it was issued: state=IN_FLIGHT AND this exact claim_token
+    (corrective, independent review finding #3). Returns the number of
+    rows updated -- 0 is a legitimate, safe outcome (a stale worker
+    fenced out by a reclaim), never an error."""
     return _bulk_write_immutable_rows(
-        OutboxMessage.objects.filter(event_id__in=event_ids), **fields
+        OutboxMessage.objects.filter(
+            event_id=row.event_id, state=OUTBOX_IN_FLIGHT, claim_token=row.claim_token
+        ),
+        **changes,
     )
 
 
@@ -135,49 +141,59 @@ def claim_outbox_batch(*, max_events, max_bytes, lease_seconds, now=None):
             selected.append(row)
             running_bytes += row_bytes
 
-        claimed_pks = [row.pk for row in selected]
-        if claimed_pks:
+        # A fresh claim_token per row, minted on every claim AND every
+        # reclaim, is what lets every later write prove it still owns
+        # the row's current claim (T14 corrective, review finding #3).
+        new_tokens = {}
+        for row in selected:
+            token = uuid.uuid4()
+            new_tokens[row.pk] = token
             _bulk_write_immutable_rows(
-                OutboxMessage.objects.filter(pk__in=claimed_pks),
+                OutboxMessage.objects.filter(pk=row.pk),
                 state=OUTBOX_IN_FLIGHT,
                 claimed_at=now,
                 lease_until=lease_until,
+                claim_token=token,
             )
 
     for row in selected:
         row.state = OUTBOX_IN_FLIGHT
         row.claimed_at = now
         row.lease_until = lease_until
+        row.claim_token = new_tokens[row.pk]
 
     return tuple(selected)
 
 
-def mark_delivered(event_ids, now=None):
+def mark_delivered(claimed_rows, now=None):
     """Transition confirmed accepted/duplicate events to DELIVERED
-    (T14-D08, T14-D17). Never called for an unconfirmed event_id."""
+    (T14-D08, T14-D17). Never called for an unconfirmed event. Each
+    `claimed_rows` entry must be the exact OutboxMessage claim_outbox_batch()
+    returned; a stale/reclaimed row's write is fenced to zero rows."""
     now = now or timezone.now()
-    _bulk_write_outbox_fields(event_ids, state=OUTBOX_DELIVERED, delivered_at=now)
+    for row in claimed_rows:
+        _write_fenced(row, state=OUTBOX_DELIVERED, delivered_at=now)
 
 
-def mark_dead_letter(event_id, code, reason, now=None):
+def mark_dead_letter(claimed_row, code, reason, now=None):
     """Permanently reject exactly one event (T14-D17). A poison event's
-    dead-letter never affects any other event in the same batch."""
+    dead-letter never affects any other event in the same batch. Fenced
+    the same way mark_delivered() is."""
     del now  # no timestamp field beyond rejection_code/reason is required
-    _bulk_write_outbox_fields(
-        [event_id], state=OUTBOX_DEAD_LETTER, rejection_code=code, rejection_reason=reason
-    )
+    _write_fenced(claimed_row, state=OUTBOX_DEAD_LETTER, rejection_code=code, rejection_reason=reason)
 
 
-def release_transient(event_ids, error_kind, now=None):
+def release_transient(claimed_rows, error_kind, now=None):
     """Return claimed events to PENDING after a transient delivery
     failure (timeout, 5xx, missing ACK): attempts increments, and
     next_attempt_at moves out by an exponential-backoff-with-jitter
     delay. Never dead-letters, at any attempt count (T14-D14, T14-D15).
+    Fenced the same way mark_delivered() is; the claim_token is cleared
+    since the row no longer has an active claim.
     """
     del error_kind  # reserved for future differentiated backoff policy
     now = now or timezone.now()
-    rows = OutboxMessage.objects.filter(event_id__in=list(event_ids))
-    for row in rows:
+    for row in claimed_rows:
         new_attempts = row.attempts + 1
         delay = compute_retry_delay(
             new_attempts,
@@ -185,29 +201,33 @@ def release_transient(event_ids, error_kind, now=None):
             cap=_DEFAULT_BACKOFF_CAP_SECONDS,
             random_source=random.random,
         )
-        _write_immutable_row_fields(
+        _write_fenced(
             row,
             state=OUTBOX_PENDING,
             attempts=new_attempts,
             next_attempt_at=now + timedelta(seconds=delay),
             claimed_at=None,
             lease_until=None,
+            claim_token=None,
         )
 
 
-def release_auth_failure(event_ids, now=None):
+def release_auth_failure(claimed_rows, now=None):
     """Return claimed events to PENDING after a 401/403 channel fault --
     a fault in the Node's credential/channel, not in any individual
     event's content, so attempts is left untouched and the event is
-    immediately retryable once the channel recovers (T14-D17)."""
+    immediately retryable once the channel recovers (T14-D17). Fenced
+    the same way mark_delivered() is."""
     now = now or timezone.now()
-    _bulk_write_outbox_fields(
-        event_ids,
-        state=OUTBOX_PENDING,
-        next_attempt_at=now,
-        claimed_at=None,
-        lease_until=None,
-    )
+    for row in claimed_rows:
+        _write_fenced(
+            row,
+            state=OUTBOX_PENDING,
+            next_attempt_at=now,
+            claimed_at=None,
+            lease_until=None,
+            claim_token=None,
+        )
 
 
 def compute_retry_delay(attempts, *, base, cap, random_source):
@@ -253,44 +273,43 @@ def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
     if not claimed:
         return FlushSummary()
 
-    event_ids = [row.event_id for row in claimed]
     envelopes = tuple(envelope_for(row) for row in claimed)
 
     try:
         batch_ack = transport.send_batch(envelopes)
     except AuthTransportError:
-        release_auth_failure(event_ids, now=now)
+        release_auth_failure(claimed, now=now)
         return FlushSummary(claimed=len(claimed), released_auth_failure=len(claimed), auth_fault=True)
     except (TransientTransportError, ProtocolTransportError) as exc:
-        release_transient(event_ids, type(exc).__name__, now=now)
+        release_transient(claimed, type(exc).__name__, now=now)
         return FlushSummary(claimed=len(claimed), released_transient=len(claimed))
 
     acks_by_event_id = {ack.event_id: ack for ack in batch_ack.results}
 
-    delivered_ids = []
+    delivered_rows = []
     dead_lettered = 0
-    unconfirmed_ids = []
-    for event_id in event_ids:
-        ack = acks_by_event_id.get(event_id)
+    unconfirmed_rows = []
+    for row in claimed:
+        ack = acks_by_event_id.get(row.event_id)
         if ack is None:
-            unconfirmed_ids.append(event_id)
+            unconfirmed_rows.append(row)
             continue
         if ack.status in (ACCEPTED, DUPLICATE):
-            delivered_ids.append(event_id)
+            delivered_rows.append(row)
         elif ack.status == REJECTED:
-            mark_dead_letter(event_id, ack.code, ack.reason, now=now)
+            mark_dead_letter(row, ack.code, ack.reason, now=now)
             dead_lettered += 1
         else:
-            unconfirmed_ids.append(event_id)
+            unconfirmed_rows.append(row)
 
-    if delivered_ids:
-        mark_delivered(delivered_ids, now=now)
-    if unconfirmed_ids:
-        release_transient(unconfirmed_ids, "missing_or_unconfirmed_ack", now=now)
+    if delivered_rows:
+        mark_delivered(delivered_rows, now=now)
+    if unconfirmed_rows:
+        release_transient(unconfirmed_rows, "missing_or_unconfirmed_ack", now=now)
 
     return FlushSummary(
         claimed=len(claimed),
-        delivered=len(delivered_ids),
+        delivered=len(delivered_rows),
         dead_lettered=dead_lettered,
-        released_transient=len(unconfirmed_ids),
+        released_transient=len(unconfirmed_rows),
     )

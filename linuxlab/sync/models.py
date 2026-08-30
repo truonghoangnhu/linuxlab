@@ -469,6 +469,13 @@ class OutboxMessage(ImmutableArtifact):
     next_attempt_at = models.DateTimeField(default=timezone.now)
     claimed_at = models.DateTimeField(null=True, blank=True)
     lease_until = models.DateTimeField(null=True, blank=True)
+    # Corrective (independent review finding #3): a fresh claim_token is
+    # minted every time a row is claimed/reclaimed. Every post-claim write
+    # (delivered/dead-letter/release) must match this EXACT token, not
+    # merely event_id + IN_FLIGHT, so a worker whose lease already expired
+    # and was reclaimed by another worker can never affect the row again --
+    # its write matches zero rows instead.
+    claim_token = models.UUIDField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
     rejection_code = models.CharField(max_length=100, blank=True, default="")
     rejection_reason = models.TextField(blank=True, default="")
@@ -552,6 +559,7 @@ _MUTABLE_FIELDS_BY_MODEL.update(
                 "next_attempt_at",
                 "claimed_at",
                 "lease_until",
+                "claim_token",
                 "delivered_at",
                 "rejection_code",
                 "rejection_reason",

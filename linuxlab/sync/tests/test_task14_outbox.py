@@ -25,6 +25,7 @@ from linuxlab.sync.models import (
     OUTBOX_IN_FLIGHT,
     OUTBOX_PENDING,
     OutboxMessage,
+    _bulk_write_immutable_rows,
     _insert_immutable_row,
 )
 from linuxlab.sync.outbox import (
@@ -218,6 +219,115 @@ def test_concurrent_claims_never_select_the_same_row():
     assert OutboxMessage.objects.filter(state=OUTBOX_IN_FLIGHT).count() == 2
 
 
+# --- real PostgreSQL stale-worker fencing (corrective, review finding #3) --
+# Each phase below runs on its OWN real DB connection/thread -- not a mock --
+# to prove the fencing is enforced by the actual claim_token comparison
+# round-tripped through PostgreSQL, not merely by in-process bookkeeping.
+
+
+class _RunOnOwnConnection(threading.Thread):
+    def __init__(self, action, results, key):
+        super().__init__()
+        self.action = action
+        self.results = results
+        self.key = key
+
+    def run(self):
+        close_old_connections()
+        try:
+            self.results[self.key] = self.action()
+        finally:
+            connection.close()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_worker_cannot_resurrect_a_row_reclaimed_and_delivered_by_another_worker():
+    now = timezone.now()
+    outbox = _make_outbox(next_attempt_at=now)
+    results = {}
+
+    def _worker_a_claims():
+        return claim_outbox_batch(max_events=10, max_bytes=10_000_000, lease_seconds=1, now=now)
+
+    worker_a = _RunOnOwnConnection(_worker_a_claims, results, "a_claimed")
+    worker_a.start()
+    worker_a.join()
+    stale_row = results["a_claimed"][0]
+
+    later = now + timedelta(seconds=5)
+
+    def _worker_b_reclaims_and_delivers():
+        reclaimed = claim_outbox_batch(
+            max_events=10, max_bytes=10_000_000, lease_seconds=60, now=later
+        )
+        mark_delivered(reclaimed, now=later)
+        return reclaimed
+
+    worker_b = _RunOnOwnConnection(_worker_b_reclaims_and_delivers, results, "b_claimed")
+    worker_b.start()
+    worker_b.join()
+    assert results["b_claimed"][0].event_id == outbox.event_id
+    assert results["b_claimed"][0].claim_token != stale_row.claim_token
+
+    even_later = now + timedelta(seconds=10)
+
+    def _worker_a_reports_transient_failure_too_late():
+        release_transient([stale_row], "timeout", now=even_later)
+
+    worker_a_late = _RunOnOwnConnection(
+        _worker_a_reports_transient_failure_too_late, results, "a_late"
+    )
+    worker_a_late.start()
+    worker_a_late.join()
+
+    refreshed = OutboxMessage.objects.get(pk=outbox.pk)
+    assert refreshed.state == OUTBOX_DELIVERED
+    assert refreshed.event_id == outbox.event_id
+    assert refreshed.payload == outbox.payload
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_worker_success_report_affects_zero_rows_after_reclaim_released_it():
+    now = timezone.now()
+    outbox = _make_outbox(next_attempt_at=now)
+    results = {}
+
+    def _worker_a_claims():
+        return claim_outbox_batch(max_events=10, max_bytes=10_000_000, lease_seconds=1, now=now)
+
+    worker_a = _RunOnOwnConnection(_worker_a_claims, results, "a_claimed")
+    worker_a.start()
+    worker_a.join()
+    stale_row = results["a_claimed"][0]
+
+    later = now + timedelta(seconds=5)
+
+    def _worker_b_reclaims_and_dead_letters():
+        reclaimed = claim_outbox_batch(
+            max_events=10, max_bytes=10_000_000, lease_seconds=60, now=later
+        )
+        mark_dead_letter(reclaimed[0], "IDEMPOTENCY_CONFLICT", "central rejected it", now=later)
+        return reclaimed
+
+    worker_b = _RunOnOwnConnection(_worker_b_reclaims_and_dead_letters, results, "b_claimed")
+    worker_b.start()
+    worker_b.join()
+
+    even_later = now + timedelta(seconds=10)
+
+    def _worker_a_reports_success_too_late():
+        mark_delivered([stale_row], now=even_later)
+
+    worker_a_late = _RunOnOwnConnection(_worker_a_reports_success_too_late, results, "a_late")
+    worker_a_late.start()
+    worker_a_late.join()
+
+    refreshed = OutboxMessage.objects.get(pk=outbox.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.rejection_code == "IDEMPOTENCY_CONFLICT"
+    assert refreshed.delivered_at is None
+
+
 # --- mark_delivered() --------------------------------------------------------
 
 
@@ -226,7 +336,7 @@ def test_mark_delivered_transitions_accepted_and_duplicate_rows():
     accepted = _make_outbox(state=OUTBOX_IN_FLIGHT, claimed_at=now, lease_until=now + timedelta(minutes=5))
     duplicate = _make_outbox(state=OUTBOX_IN_FLIGHT, claimed_at=now, lease_until=now + timedelta(minutes=5))
 
-    mark_delivered([accepted.event_id, duplicate.event_id], now=now)
+    mark_delivered([accepted, duplicate], now=now)
 
     for row in (accepted, duplicate):
         refreshed = OutboxMessage.objects.get(pk=row.pk)
@@ -237,7 +347,7 @@ def test_mark_delivered_transitions_accepted_and_duplicate_rows():
 def test_mark_delivered_never_touches_envelope_fields():
     row = _make_outbox(state=OUTBOX_IN_FLIGHT)
 
-    mark_delivered([row.event_id])
+    mark_delivered([row])
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.event_id == row.event_id
@@ -253,7 +363,7 @@ def test_mark_dead_letter_transitions_only_the_named_event():
     poison = _make_outbox(state=OUTBOX_IN_FLIGHT)
     healthy = _make_outbox(state=OUTBOX_IN_FLIGHT)
 
-    mark_dead_letter(poison.event_id, "IDEMPOTENCY_CONFLICT", "conflicting content", now=now)
+    mark_dead_letter(poison, "IDEMPOTENCY_CONFLICT", "conflicting content", now=now)
 
     refreshed_poison = OutboxMessage.objects.get(pk=poison.pk)
     assert refreshed_poison.state == OUTBOX_DEAD_LETTER
@@ -271,7 +381,7 @@ def test_release_transient_returns_row_to_pending_with_incremented_attempts():
     now = timezone.now()
     row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=2, claimed_at=now, lease_until=now + timedelta(minutes=5))
 
-    release_transient([row.event_id], "timeout", now=now)
+    release_transient([row], "timeout", now=now)
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.state == OUTBOX_PENDING
@@ -284,7 +394,7 @@ def test_release_transient_returns_row_to_pending_with_incremented_attempts():
 def test_release_transient_never_dead_letters_at_any_attempt_count():
     row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=10_000)
 
-    release_transient([row.event_id], "timeout")
+    release_transient([row], "timeout")
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.state == OUTBOX_PENDING
@@ -297,7 +407,7 @@ def test_release_auth_failure_returns_row_to_pending_without_incrementing_attemp
     now = timezone.now()
     row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=1, claimed_at=now, lease_until=now + timedelta(minutes=5))
 
-    release_auth_failure([row.event_id], now=now)
+    release_auth_failure([row], now=now)
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.state == OUTBOX_PENDING
@@ -309,10 +419,65 @@ def test_release_auth_failure_returns_row_to_pending_without_incrementing_attemp
 def test_release_auth_failure_never_dead_letters():
     row = _make_outbox(state=OUTBOX_IN_FLIGHT)
 
-    release_auth_failure([row.event_id])
+    release_auth_failure([row])
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.state == OUTBOX_PENDING
+
+
+# --- corrective (independent review finding #3): stale-claim fencing --------
+# claim_outbox_batch() mints a fresh claim_token per row; every writer must
+# fence its update to state=IN_FLIGHT + that exact token, so a caller still
+# holding an in-memory row object from BEFORE a reclaim can never affect the
+# row again -- its write must match zero rows, not raise, not silently
+# "succeed" against a row it no longer owns.
+
+
+def test_mark_delivered_after_reclaim_affects_zero_rows_and_keeps_new_claim_state():
+    stale = _make_outbox(state=OUTBOX_IN_FLIGHT, claim_token=uuid.uuid4())
+    new_token = uuid.uuid4()
+    _bulk_write_immutable_rows(OutboxMessage.objects.filter(pk=stale.pk), claim_token=new_token)
+    reclaimed = OutboxMessage.objects.get(pk=stale.pk)
+    # A different worker delivers under the NEW claim first.
+    mark_delivered([reclaimed])
+
+    # The stale worker's in-memory `stale` object still carries the OLD
+    # claim_token; its late write must affect nothing.
+    mark_delivered([stale])
+
+    refreshed = OutboxMessage.objects.get(pk=stale.pk)
+    assert refreshed.state == OUTBOX_DELIVERED
+    assert refreshed.claim_token == new_token
+
+
+def test_release_transient_after_reclaim_affects_zero_rows():
+    stale = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=0, claim_token=uuid.uuid4())
+    new_token = uuid.uuid4()
+    _bulk_write_immutable_rows(
+        OutboxMessage.objects.filter(pk=stale.pk), claim_token=new_token, attempts=5
+    )
+    reclaimed = OutboxMessage.objects.get(pk=stale.pk)
+    mark_delivered([reclaimed])
+
+    release_transient([stale], "timeout")
+
+    refreshed = OutboxMessage.objects.get(pk=stale.pk)
+    assert refreshed.state == OUTBOX_DELIVERED
+    assert refreshed.attempts == 5
+
+
+def test_mark_dead_letter_after_reclaim_affects_zero_rows():
+    stale = _make_outbox(state=OUTBOX_IN_FLIGHT, claim_token=uuid.uuid4())
+    new_token = uuid.uuid4()
+    _bulk_write_immutable_rows(OutboxMessage.objects.filter(pk=stale.pk), claim_token=new_token)
+    reclaimed = OutboxMessage.objects.get(pk=stale.pk)
+    mark_delivered([reclaimed])
+
+    mark_dead_letter(stale, "IDEMPOTENCY_CONFLICT", "should never apply")
+
+    refreshed = OutboxMessage.objects.get(pk=stale.pk)
+    assert refreshed.state == OUTBOX_DELIVERED
+    assert refreshed.rejection_code == ""
 
 
 # --- compute_retry_delay() ---------------------------------------------------
@@ -368,10 +533,10 @@ def test_envelope_for_reflects_stored_immutable_fields():
 # --- guard: writers reject unknown fields ------------------------------------
 
 
-def test_bulk_outbox_write_rejects_non_mutable_field():
-    row = _make_outbox()
+def test_fenced_outbox_write_rejects_non_mutable_field():
+    row = _make_outbox(state=OUTBOX_IN_FLIGHT)
 
     with pytest.raises(ValueError):
-        from linuxlab.sync.outbox import _bulk_write_outbox_fields
+        from linuxlab.sync.outbox import _write_fenced
 
-        _bulk_write_outbox_fields([row.event_id], payload={"tampered": True})
+        _write_fenced(row, payload={"tampered": True})
