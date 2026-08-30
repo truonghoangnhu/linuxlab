@@ -1,0 +1,184 @@
+"""Task 15 release-gate evidence schema, redaction, and failure model
+(T15-D07). Pure-Python, database-free.
+"""
+
+import json
+from unittest.mock import patch
+
+import pytest
+
+from scripts.release_gate.evidence import (
+    EXIT_CODE,
+    SCHEMA_VERSION,
+    ReleaseEvidence,
+    ScenarioResult,
+    SecretRegistry,
+    write_json_evidence,
+    write_markdown_evidence,
+)
+
+
+def _make_evidence(**overrides):
+    fields = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": "rabc123456789",
+        "git_sha": "a" * 40,
+        "started_at": "2026-08-31T00:00:00+00:00",
+        "finished_at": "2026-08-31T00:05:00+00:00",
+        "environment": {"python": "3.12", "postgresql": "18", "platform": "linux"},
+        "checks": {},
+        "scenarios": {},
+        "artifacts": {},
+        "overall": "PASS",
+    }
+    fields.update(overrides)
+    return ReleaseEvidence(**fields)
+
+
+# --- exit code mapping ---------------------------------------------------
+
+
+def test_exit_code_mapping_is_exact():
+    assert EXIT_CODE["PASS"] == 0
+    assert EXIT_CODE["PRECHECK_FAILURE"] == 2
+    assert EXIT_CODE["STARTUP_FAILURE"] == 3
+    assert EXIT_CODE["SCENARIO_FAILURE"] == 4
+    assert EXIT_CODE["CLEANUP_FAILURE"] == 5
+
+
+# --- schema shape --------------------------------------------------------
+
+
+def test_evidence_to_dict_has_required_schema_v1_shape():
+    evidence = _make_evidence()
+
+    doc = evidence.to_dict()
+
+    assert doc["schema_version"] == 1
+    assert doc["run_id"] == "rabc123456789"
+    assert doc["git_sha"] == "a" * 40
+    assert doc["overall"] in {"PASS", "FAIL"}
+    assert "environment" in doc
+    assert "checks" in doc
+    assert "scenarios" in doc
+    assert "artifacts" in doc
+
+
+def test_scenario_result_carries_status_assertions_and_duration():
+    result = ScenarioResult(
+        name="invalid_package_signature",
+        status="PASS",
+        assertions={"rejected": True, "active_package_unchanged": True},
+        duration_ms=42.5,
+    )
+
+    assert result.name == "invalid_package_signature"
+    assert result.status == "PASS"
+    assert result.assertions["rejected"] is True
+    assert result.duration_ms == 42.5
+
+
+# --- secret redaction -------------------------------------------------------
+
+
+def test_secret_registry_redacts_registered_value_from_text():
+    secrets = SecretRegistry()
+    secrets.register("NODE_SECRET_DO_NOT_LEAK")
+
+    redacted = secrets.redact_text("bearer token: NODE_SECRET_DO_NOT_LEAK end")
+
+    assert "NODE_SECRET_DO_NOT_LEAK" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_secret_registry_redacts_nested_dict_values():
+    secrets = SecretRegistry()
+    secrets.register("PRIVATE_KEY_DO_NOT_LEAK")
+
+    redacted = secrets.redact_value(
+        {"outer": {"inner": ["prefix PRIVATE_KEY_DO_NOT_LEAK suffix"]}}
+    )
+
+    assert "PRIVATE_KEY_DO_NOT_LEAK" not in json.dumps(redacted)
+
+
+def test_secret_registry_ignores_empty_values():
+    secrets = SecretRegistry()
+    secrets.register("")
+    secrets.register(None)
+
+    # Must not raise and must not redact everything into oblivion.
+    assert secrets.redact_text("hello world") == "hello world"
+
+
+def test_write_json_evidence_redacts_secret_sentinels(tmp_path):
+    secrets = SecretRegistry()
+    secrets.register("NODE_SECRET_DO_NOT_LEAK")
+    secrets.register("PRIVATE_KEY_DO_NOT_LEAK")
+    evidence = _make_evidence(
+        checks={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"},
+        artifacts={"signing_key_pem": "PRIVATE_KEY_DO_NOT_LEAK"},
+    )
+    path = tmp_path / "release-evidence.json"
+
+    write_json_evidence(path, evidence, secrets)
+
+    text = path.read_text()
+    assert "NODE_SECRET_DO_NOT_LEAK" not in text
+    assert "PRIVATE_KEY_DO_NOT_LEAK" not in text
+    assert json.loads(text)["schema_version"] == 1
+
+
+def test_write_markdown_evidence_redacts_secret_sentinels(tmp_path):
+    secrets = SecretRegistry()
+    secrets.register("NODE_SECRET_DO_NOT_LEAK")
+    evidence = _make_evidence(checks={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"})
+    path = tmp_path / "release-evidence.md"
+
+    write_markdown_evidence(path, evidence, secrets)
+
+    text = path.read_text()
+    assert "NODE_SECRET_DO_NOT_LEAK" not in text
+    assert "# " in text  # some heading exists -- human-readable projection
+
+
+# --- atomic writes -----------------------------------------------------
+
+
+def test_write_json_evidence_leaves_no_temp_file_behind(tmp_path):
+    path = tmp_path / "release-evidence.json"
+
+    write_json_evidence(path, _make_evidence(), SecretRegistry())
+
+    remaining = list(tmp_path.iterdir())
+    assert remaining == [path]
+
+
+def test_write_json_evidence_does_not_leave_a_partial_file_on_failure(tmp_path):
+    path = tmp_path / "release-evidence.json"
+
+    with (
+        patch("scripts.release_gate.evidence.json.dumps", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError),
+    ):
+        write_json_evidence(path, _make_evidence(), SecretRegistry())
+
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_json_evidence_creates_parent_directories(tmp_path):
+    path = tmp_path / "nested" / "dir" / "release-evidence.json"
+
+    write_json_evidence(path, _make_evidence(), SecretRegistry())
+
+    assert path.exists()
+
+
+def test_write_json_evidence_overwrites_existing_file_atomically(tmp_path):
+    path = tmp_path / "release-evidence.json"
+    path.write_text("stale content")
+
+    write_json_evidence(path, _make_evidence(overall="FAIL"), SecretRegistry())
+
+    assert json.loads(path.read_text())["overall"] == "FAIL"
