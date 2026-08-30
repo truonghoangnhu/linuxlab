@@ -125,10 +125,13 @@ def test_rollback_never_rebuilds_or_reverifies(quiz_world, keypair):
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
 def test_failed_rollback_leaves_no_partial_state(quiz_world, keypair):
     """Force a failure after the current-active row has already been
-    archived by the raw `.update()` call inside rollback_package()'s
-    transaction: the whole transaction must roll back, leaving the
-    pre-rollback state exactly as it was -- never zero-active, never
-    two-active (Task 12 §32, §69)."""
+    archived (the first _write_installed_package_lifecycle() call inside
+    rollback_package()'s transaction) but before the previous package's
+    own reactivation commits: the whole transaction must roll back,
+    leaving the pre-rollback state exactly as it was -- never zero-active,
+    never two-active (Task 12 §32, §69)."""
+    from linuxlab.sync import services as sync_services
+
     private_key, public_key = keypair
     registry = quiz_world["activity_registry"]
 
@@ -141,10 +144,19 @@ def test_failed_rollback_leaves_no_partial_state(quiz_world, keypair):
     )
     activate_package(second)
 
+    original = sync_services._write_installed_package_lifecycle
+    calls = {"n": 0}
+
+    def fail_on_second_write(pk, **fields):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated failure")
+        return original(pk, **fields)
+
     with (
         patch(
-            "linuxlab.sync.models.InstalledPackage.save",
-            side_effect=RuntimeError("simulated failure"),
+            "linuxlab.sync.services._write_installed_package_lifecycle",
+            side_effect=fail_on_second_write,
         ),
         pytest.raises(RuntimeError),
     ):
@@ -166,7 +178,12 @@ def test_failed_rollback_leaves_no_partial_state(quiz_world, keypair):
 def test_rollback_rejects_a_previous_package_from_a_foreign_source(quiz_world, keypair):
     """Defense in depth: even if InstalledPackage.previous_package somehow
     pointed at a package outside this exact source scope, rollback fails
-    closed rather than activating a foreign package."""
+    closed rather than activating a foreign package. The corrupted linkage
+    is forced via raw SQL (never a supported ORM/service write path,
+    exactly like Task 11's own _corrupt_stored_content_hash() adversarial
+    test technique) since ordinary QuerySet.update() is now blocked."""
+    from django.db import connection
+
     private_key, public_key = keypair
 
     from .conftest import build_quiz_world
@@ -177,9 +194,78 @@ def test_rollback_rejects_a_previous_package_from_a_foreign_source(quiz_world, k
     package = _stage(quiz_world, private_key, public_key)
     activate_package(package)
 
-    # Force an inconsistent linkage directly at the DB level (never a
-    # supported lifecycle-service outcome) to prove rollback fails closed.
-    InstalledPackage.objects.filter(pk=package.pk).update(previous_package=other_package.pk)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE sync_installedpackage SET previous_package_id = %s WHERE id = %s",
+            [other_package.pk, package.pk],
+        )
 
     with pytest.raises(PackageRollbackError):
         rollback_package(package.package_type, package.source_public_id)
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_archived_package_cannot_be_deleted_and_rollback_still_works(quiz_world, keypair):
+    """Task 12 corrective §29: an ARCHIVED package retains full rollback
+    capability even though it cannot be deleted through ordinary ORM."""
+    private_key, public_key = keypair
+    registry = quiz_world["activity_registry"]
+
+    first = _stage(quiz_world, private_key, public_key)
+    activate_package(first)
+
+    second_snapshot = republish(quiz_world)
+    second = import_package(
+        build_package(second_snapshot, registry, private_key), registry, public_key
+    )
+    activate_package(second)
+
+    first_reloaded = InstalledPackage.objects.get(pk=first.pk)
+    assert first_reloaded.state == ARCHIVED
+
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        first_reloaded.delete()
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        InstalledPackage.objects.filter(pk=first.pk).delete()
+
+    rollback_package(first.package_type, first.source_public_id)
+
+    assert InstalledPackage.objects.get(pk=first.pk).state == ACTIVE
+    assert InstalledPackage.objects.get(pk=second.pk).state == ARCHIVED
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_multi_version_rollback_chain(quiz_world, keypair):
+    """Sanity test for historical linkage across three versions: v1 -> v2
+    -> v3, then rollback twice, each time following its own genuine
+    predecessor rather than a manufactured reciprocal link (Task 12
+    corrective §34-35)."""
+    private_key, public_key = keypair
+    registry = quiz_world["activity_registry"]
+
+    v1 = _stage(quiz_world, private_key, public_key)
+    activate_package(v1)
+
+    v2_snapshot = republish(quiz_world)
+    v2 = import_package(build_package(v2_snapshot, registry, private_key), registry, public_key)
+    activate_package(v2)
+
+    v3_snapshot = republish(quiz_world)
+    v3 = import_package(build_package(v3_snapshot, registry, private_key), registry, public_key)
+    activate_package(v3)
+
+    assert InstalledPackage.objects.get(pk=v1.pk).state == ARCHIVED
+    v2_reloaded = InstalledPackage.objects.get(pk=v2.pk)
+    assert v2_reloaded.state == ARCHIVED
+    assert v2_reloaded.previous_package_id == v1.pk
+    v3_reloaded = InstalledPackage.objects.get(pk=v3.pk)
+    assert v3_reloaded.state == ACTIVE
+    assert v3_reloaded.previous_package_id == v2.pk
+
+    rollback_package(v1.package_type, v1.source_public_id)
+    assert InstalledPackage.objects.get(pk=v2.pk).state == ACTIVE
+    assert InstalledPackage.objects.get(pk=v3.pk).state == ARCHIVED
+
+    rollback_package(v1.package_type, v1.source_public_id)
+    assert InstalledPackage.objects.get(pk=v1.pk).state == ACTIVE
+    assert InstalledPackage.objects.get(pk=v2.pk).state == ARCHIVED

@@ -5,6 +5,16 @@ is authentic and self-contained; this module stores what a Node has locally
 staged/activated from that trust boundary. It never re-derives trust: every
 row here exists only because linuxlab.sync.services already verified the
 package bytes it was built from.
+
+Task 12 corrective (security/architecture review): ordinary supported ORM
+APIs (Model(...).save(), Manager.create(), QuerySet.bulk_create()/update()/
+bulk_update()/delete(), instance.delete()) are NOT an alternative package-
+import or package-mutation mechanism. Every model below rejects all of
+these outright; the only legitimate writers are the private trusted
+insertion/lifecycle helpers in linuxlab.sync.services, which bypass these
+guards deliberately via Django's own underlying primitives (the same
+bypass spirit as Task 09's PublicationSnapshot _insert_published_snapshot()
+calling Model.save_base() directly).
 """
 
 from typing import ClassVar
@@ -24,6 +34,47 @@ PACKAGE_STATE_CHOICES = [
 ]
 
 
+class InstalledPackageQuerySet(models.QuerySet):
+    """Blocks every bulk write path for InstalledPackage (Task 09's
+    PublicationSnapshotQuerySet pattern): ordinary application code must
+    never create, mutate, or delete package inventory rows. The private
+    trusted insertion/lifecycle helpers in linuxlab.sync.services bypass
+    this guard deliberately by calling Django's underlying QuerySet
+    methods directly, never by calling through this subclass. Read
+    methods (all(), filter(), get(), select_for_update(), ...) are
+    untouched.
+    """
+
+    def create(self, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be created through ordinary application "
+            "code; import_package() is the only writer"
+        )
+
+    def bulk_create(self, objs, *args, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be created through QuerySet.bulk_create(); "
+            "import_package() is the only writer"
+        )
+
+    def update(self, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be mutated through QuerySet.update(); "
+            "use the lifecycle services in linuxlab.sync.services"
+        )
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be mutated through QuerySet.bulk_update()"
+        )
+
+    def delete(self):
+        raise ValueError(
+            "InstalledPackage cannot be deleted through ordinary application "
+            "code; package deletion/GC is out of Task 12 scope"
+        )
+
+
 class InstalledPackage(models.Model):
     """One Node-local package lifecycle row.
 
@@ -34,13 +85,15 @@ class InstalledPackage(models.Model):
     PublicationSnapshot/ActivityVersion pattern (ADR-011) -- local primary
     keys never leave this Node.
 
-    state/activated_at/previous_package are the only fields that change
-    after creation, and only through linuxlab.sync.services -- every
-    semantic artifact this package owns (InstalledPublication,
-    InstalledActivityVersion, InstalledQuestionVersion,
-    InstalledQuestionGrading) is immutable once staged (see
-    ImmutableArtifact below), so activation/rollback are pure lifecycle
-    metadata transitions that never touch content.
+    Every field here is either PROVENANCE (authenticated at import time,
+    permanently immutable) or LIFECYCLE (state/activated_at/
+    previous_package, mutable only through linuxlab.sync.services'
+    private lifecycle helper). Ordinary save()/delete() are rejected
+    unconditionally, exactly like PublicationSnapshot -- there is no
+    supported ORM path that creates, mutates, or deletes a row here at
+    all; the trusted importer and lifecycle services bypass this guard
+    deliberately through private helpers, never through this class's own
+    public surface.
     """
 
     package_type = models.CharField(max_length=100)
@@ -65,7 +118,16 @@ class InstalledPackage(models.Model):
         related_name="+",
     )
 
+    objects = models.Manager.from_queryset(InstalledPackageQuerySet)()
+
     class Meta:
+        # Same reasoning as PublicationSnapshot (linuxlab/publication/models.py):
+        # without this, Model._base_manager defaults to a bare, unguarded
+        # models.Manager() regardless of what `objects` is, which would
+        # leave a live bulk_create()/update()/bulk_update()/delete()
+        # bypass through internal Django machinery that resolves via
+        # _base_manager (e.g. delete() collectors, relation traversal).
+        base_manager_name = "objects"
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.UniqueConstraint(
                 fields=["package_type", "source_public_id", "package_version"],
@@ -80,14 +142,47 @@ class InstalledPackage(models.Model):
                 condition=Q(package_version__gte=1),
                 name="installed_package_version_gte_1",
             ),
+            models.CheckConstraint(
+                condition=Q(state__in=[STAGED, ACTIVE, ARCHIVED]),
+                name="installed_package_state_allowed_values",
+            ),
         ]
+
+    def save(self, *args, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be created or modified through ordinary "
+            "application code; import_package() and the lifecycle services in "
+            "linuxlab.sync.services are the only writers"
+        )
+
+    def delete(self, *args, **kwargs):
+        raise ValueError(
+            "InstalledPackage cannot be deleted; package deletion/GC is out of "
+            "Task 12 scope"
+        )
 
 
 class ImmutableArtifactQuerySet(models.QuerySet):
-    """Blocks the bulk write paths that never call Model.save() (Task 09's
-    PublicationSnapshotQuerySet pattern, linuxlab/publication/models.py):
-    QuerySet.update()/bulk_update() issue raw UPDATEs that would otherwise
-    bypass save()'s rejection below. Read methods are untouched."""
+    """Blocks every bulk write path for staged package artifacts (Task 09's
+    PublicationSnapshotQuerySet pattern): create()/bulk_create() would
+    fabricate rows with no verified provenance, and update()/bulk_update()/
+    delete() would mutate or destroy authenticated content after import.
+    The private trusted insertion helper in linuxlab.sync.services bypasses
+    this guard deliberately by calling Django's underlying Model.save_base()
+    directly, never through this subclass. Read methods are untouched.
+    """
+
+    def create(self, **kwargs):
+        raise ValueError(
+            f"{self.model.__name__} cannot be created through ordinary "
+            "application code; only a trusted package import may stage one"
+        )
+
+    def bulk_create(self, objs, *args, **kwargs):
+        raise ValueError(
+            f"{self.model.__name__} cannot be created through "
+            "QuerySet.bulk_create(); only a trusted package import may stage one"
+        )
 
     def update(self, **kwargs):
         raise ValueError(f"{self.model.__name__} rows are immutable and cannot be updated")
@@ -95,15 +190,19 @@ class ImmutableArtifactQuerySet(models.QuerySet):
     def bulk_update(self, objs, fields, *args, **kwargs):
         raise ValueError(f"{self.model.__name__} rows are immutable and cannot be updated")
 
+    def delete(self):
+        raise ValueError(f"{self.model.__name__} rows are immutable and cannot be deleted")
+
 
 class ImmutableArtifact(models.Model):
-    """Shared immutable-after-creation guard for staged package artifacts
-    (ActivityVersion's pattern, linuxlab/activities/models.py): allows the
-    one genuine INSERT that stages a verified row, rejects a caller-
-    supplied local primary key on that insert, and rejects every
-    subsequent save() outright. These rows are derived from authenticated
-    package bytes (Task 11) and must never become ordinary mutable content
-    after import.
+    """Shared trust guard for staged package artifacts: ordinary save()/
+    delete() are rejected unconditionally (no supported ORM path creates,
+    modifies, or deletes a row here), and the guarded QuerySet above closes
+    every bulk write path too. These rows are derived from authenticated
+    package bytes (Task 11) and must never become ordinary mutable content,
+    fabricated content, or disappear as a side effect of ordinary
+    application code -- an ACTIVE or ARCHIVED package must keep every
+    artifact it needs to serve/roll back to.
     """
 
     objects = models.Manager.from_queryset(ImmutableArtifactQuerySet)()
@@ -113,15 +212,13 @@ class ImmutableArtifact(models.Model):
         base_manager_name = "objects"
 
     def save(self, *args, **kwargs):
-        if self._state.adding:
-            if self.pk is not None:
-                raise ValueError(
-                    f"{type(self).__name__}'s local primary key is assigned by "
-                    "the database and cannot be supplied by ordinary application code"
-                )
-            super().save(*args, **kwargs)
-            return
-        raise ValueError(f"{type(self).__name__} is immutable after creation")
+        raise ValueError(
+            f"{type(self).__name__} cannot be created or modified through "
+            "ordinary application code; only a trusted package import may stage one"
+        )
+
+    def delete(self, *args, **kwargs):
+        raise ValueError(f"{type(self).__name__} rows are immutable and cannot be deleted")
 
 
 class InstalledPublication(ImmutableArtifact):

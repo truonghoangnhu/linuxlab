@@ -108,3 +108,22 @@ def test_full_verify_stage_activate_stage_activate_rollback_lifecycle(quiz_world
     assert InstalledActivityVersion.objects.filter(package=first).count() == 1
     assert InstalledQuestionVersion.objects.filter(package=first).count() == 1
     assert InstalledQuestionGrading.objects.filter(question__package=first).count() == 1
+
+    # --- 6. provenance is untouched by the whole lifecycle ------------------
+    first_reloaded = InstalledPackage.objects.get(pk=first.pk)
+    assert first_reloaded.package_type == "learning_path"
+    assert first_reloaded.source_public_id == quiz_world["snapshot"].source_public_id
+    assert first_reloaded.package_version == quiz_world["snapshot"].version
+    assert first_reloaded.payload_sha256 == first.payload_sha256
+
+    # --- 7. no public deletion is possible at any point in the lifecycle ---
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        first_reloaded.delete()
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        InstalledPackage.objects.filter(pk=second.pk).delete()
+    with pytest.raises(ValueError, match="immutable"):
+        InstalledQuestionGrading.objects.get(question=installed_question).delete()
+
+    assert InstalledPackage.objects.filter(pk=first.pk).exists()
+    assert InstalledPackage.objects.filter(pk=second.pk).exists()
+    assert InstalledQuestionGrading.objects.filter(question=installed_question).exists()

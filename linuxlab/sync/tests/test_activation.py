@@ -156,10 +156,13 @@ def test_activation_does_not_modify_semantic_artifact_rows(quiz_world, keypair):
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
 def test_concurrent_activation_never_leaves_two_active_packages(quiz_world, keypair):
-    """DB-level invariant test: even bypassing the service's own lock by
-    racing two raw activations against the same scope, the partial unique
-    index is the final backstop -- at most one row can ever be committed
-    ACTIVE for one source."""
+    """DB-level invariant test: even bypassing activate_package()'s own
+    scope-locking by writing lifecycle state directly through the private
+    helper (simulating a hypothetical second, differently-coded writer),
+    the partial unique index is the final backstop -- at most one row can
+    ever be committed ACTIVE for one source."""
+    from linuxlab.sync.services import _write_installed_package_lifecycle
+
     private_key, public_key = keypair
     registry = quiz_world["activity_registry"]
 
@@ -172,11 +175,127 @@ def test_concurrent_activation_never_leaves_two_active_packages(quiz_world, keyp
     activate_package(first)
 
     with pytest.raises(IntegrityError), transaction.atomic():
-        InstalledPackage.objects.filter(pk=second.pk).update(state=ACTIVE)
+        _write_installed_package_lifecycle(second.pk, state=ACTIVE)
 
     assert InstalledPackage.objects.filter(
         package_type=first.package_type, source_public_id=first.source_public_id, state=ACTIVE
     ).count() == 1
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_archived_package_cannot_be_directly_reactivated(quiz_world, keypair):
+    """Task 12 corrective §33: ARCHIVED -> ACTIVE is only ever reached
+    through rollback_package(), never through activate_package() again --
+    this closes the previous_package cycle footgun a direct
+    archived->active transition would otherwise allow."""
+    private_key, public_key = keypair
+    registry = quiz_world["activity_registry"]
+
+    first = _stage(quiz_world, private_key, public_key)
+    activate_package(first)
+
+    second_snapshot = republish(quiz_world)
+    second = import_package(
+        build_package(second_snapshot, registry, private_key), registry, public_key
+    )
+    activate_package(second)
+
+    reloaded_first = InstalledPackage.objects.get(pk=first.pk)
+    assert reloaded_first.state == ARCHIVED
+
+    with pytest.raises(PackageActivationError):
+        activate_package(reloaded_first)
+
+    assert InstalledPackage.objects.get(pk=first.pk).state == ARCHIVED
+    assert InstalledPackage.objects.get(pk=second.pk).state == ACTIVE
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_incomplete_fabricated_package_fails_completeness_check_on_activation():
+    """Defense in depth (Task 12 corrective §23-25): a row introduced
+    through the low-level trusted-insertion seam but missing its
+    publication artifact (something ordinary ORM fabrication can no
+    longer produce at all, now that public creation is blocked outright)
+    must still fail closed on activation."""
+    import uuid
+    from datetime import UTC, datetime
+
+    from linuxlab.sync.services import _insert_trusted
+
+    package = _insert_trusted(
+        InstalledPackage,
+        package_type="learning_path",
+        source_public_id=uuid.uuid4(),
+        package_version=1,
+        payload_sha256="0" * 64,
+        schema_version=1,
+        minimum_linuxlab_version="0.1.0",
+        signature_algorithm="ed25519",
+        manifest_created_at=datetime.now(UTC),
+        state=STAGED,
+    )
+
+    with pytest.raises(PackageActivationError, match="publication artifact"):
+        activate_package(package)
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_activation_failure_leaves_no_partial_transition(quiz_world, keypair):
+    """Task 12 corrective §61: force a failure after the old active
+    package would already have been archived but before the candidate's
+    own activation commits. The whole transaction must roll back --
+    neither package may end up in a partially-transitioned state."""
+    from linuxlab.sync import services as sync_services
+
+    private_key, public_key = keypair
+    registry = quiz_world["activity_registry"]
+
+    first = _stage(quiz_world, private_key, public_key)
+    activate_package(first)
+
+    second_snapshot = republish(quiz_world)
+    second = import_package(
+        build_package(second_snapshot, registry, private_key), registry, public_key
+    )
+
+    original = sync_services._write_installed_package_lifecycle
+    calls = {"n": 0}
+
+    def fail_on_second_write(pk, **fields):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated failure")
+        return original(pk, **fields)
+
+    with (
+        patch(
+            "linuxlab.sync.services._write_installed_package_lifecycle",
+            side_effect=fail_on_second_write,
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        activate_package(second)
+
+    assert InstalledPackage.objects.get(pk=first.pk).state == ACTIVE
+    assert InstalledPackage.objects.get(pk=second.pk).state == STAGED
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_active_package_cannot_be_deleted(quiz_world, keypair):
+    private_key, public_key = keypair
+    package = _stage(quiz_world, private_key, public_key)
+    activate_package(package)
+
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        package.delete()
+    with pytest.raises(ValueError, match="cannot be deleted"):
+        InstalledPackage.objects.filter(pk=package.pk).delete()
+
+    reloaded = InstalledPackage.objects.get(pk=package.pk)
+    assert reloaded.state == ACTIVE
+    assert reloaded.activities.count() == 1
+    assert reloaded.questions.count() == 1
+    assert reloaded.publication is not None
 
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)

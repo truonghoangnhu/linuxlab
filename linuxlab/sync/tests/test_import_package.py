@@ -134,6 +134,27 @@ def test_malformed_bytes_create_no_rows(quiz_world, keypair):
 # --- staging is all-or-nothing ----------------------------------------------
 
 
+def _failing_insert_for(target_model_cls):
+    """A side_effect for linuxlab.sync.services._insert_trusted that
+    delegates to the REAL implementation for every model except
+    `target_model_cls`, which raises instead -- forcing a failure at a
+    specific point deep inside _stage_verified_package()'s insert
+    sequence while still exercising the real trusted insertion path for
+    everything before it. `original` is captured here, before patch()
+    replaces the module attribute, so it is genuinely the unpatched
+    implementation."""
+    from linuxlab.sync import services as sync_services
+
+    original = sync_services._insert_trusted
+
+    def _side_effect(model_cls, **fields):
+        if model_cls is target_model_cls:
+            raise RuntimeError("simulated failure")
+        return original(model_cls, **fields)
+
+    return _side_effect
+
+
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
 def test_partial_stage_failure_leaves_no_rows_and_active_package_untouched(quiz_world, keypair):
     private_key, public_key = keypair
@@ -141,8 +162,8 @@ def test_partial_stage_failure_leaves_no_rows_and_active_package_untouched(quiz_
 
     with (
         patch(
-            "linuxlab.sync.services.InstalledQuestionGrading.objects.create",
-            side_effect=RuntimeError("simulated failure"),
+            "linuxlab.sync.services._insert_trusted",
+            side_effect=_failing_insert_for(InstalledQuestionGrading),
         ),
         pytest.raises(RuntimeError),
     ):
@@ -166,8 +187,8 @@ def test_partial_stage_failure_does_not_disturb_an_existing_active_package(quiz_
 
     with (
         patch(
-            "linuxlab.sync.services.InstalledQuestionGrading.objects.create",
-            side_effect=RuntimeError("simulated failure"),
+            "linuxlab.sync.services._insert_trusted",
+            side_effect=_failing_insert_for(InstalledQuestionGrading),
         ),
         pytest.raises(RuntimeError),
     ):
@@ -322,3 +343,117 @@ def test_manually_constructed_verified_package_cannot_reach_the_database_via_imp
         import_package(counterfeit, quiz_world["activity_registry"], public_key)
 
     _assert_no_installed_rows()
+
+
+# --- archived-package restage (Task 12 corrective §37) ----------------------
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_restaging_an_archived_package_does_not_change_its_state(quiz_world, keypair):
+    from linuxlab.sync.models import ARCHIVED
+    from linuxlab.sync.services import activate_package
+
+    private_key, public_key = keypair
+    registry = quiz_world["activity_registry"]
+
+    first_bytes = _package_bytes(quiz_world, private_key)
+    first = import_package(first_bytes, registry, public_key)
+    activate_package(first)
+
+    from .conftest import republish
+
+    second_snapshot = republish(quiz_world)
+    second = import_package(
+        build_package(second_snapshot, registry, private_key), registry, public_key
+    )
+    activate_package(second)
+
+    first_reloaded = InstalledPackage.objects.get(pk=first.pk)
+    assert first_reloaded.state == ARCHIVED
+
+    restaged = import_package(first_bytes, registry, public_key)
+
+    assert restaged.pk == first.pk
+    assert InstalledPackage.objects.get(pk=first.pk).state == ARCHIVED
+    assert InstalledPublication.objects.filter(package=first).count() == 1
+    assert InstalledActivityVersion.objects.filter(package=first).count() == 1
+
+
+# --- concurrent import races (Task 12 corrective §38-40) --------------------
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_concurrent_identical_first_import_resolves_to_one_package(quiz_world, keypair):
+    """Simulate a concurrent transaction committing the exact same new
+    package identity between our own existence check and our own insert
+    attempt: patch _find_installed_package to miss on its first call only
+    (as if our SELECT ran before the other transaction's INSERT
+    committed), so our own insert hits the real unique constraint and the
+    recovery path in _stage_verified_package() must resolve to the
+    already-committed row rather than raising a raw IntegrityError."""
+    private_key, public_key = keypair
+    package_bytes = _package_bytes(quiz_world, private_key)
+    registry = quiz_world["activity_registry"]
+
+    winner = import_package(package_bytes, registry, public_key)
+
+    from linuxlab.sync import services as sync_services
+
+    real_find = sync_services._find_installed_package
+    call_count = {"n": 0}
+
+    def missing_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return real_find(*args, **kwargs)
+
+    with patch("linuxlab.sync.services._find_installed_package", side_effect=missing_once):
+        loser_result = import_package(package_bytes, registry, public_key)
+
+    assert loser_result.pk == winner.pk
+    assert InstalledPackage.objects.count() == 1
+    assert InstalledPublication.objects.count() == 1
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_concurrent_different_hash_import_resolves_to_conflict_not_integrity_error():
+    """Same race as above, but the racing package carries a different
+    payload hash for the same identity: the loser must still resolve to a
+    clean PackageIdentityConflict, never a raw IntegrityError, and must
+    never overwrite the winner."""
+    world_a = build_quiz_world()
+    world_b = build_quiz_world()
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    winner_bytes = _package_bytes(world_a, private_key)
+    winner = import_package(winner_bytes, world_a["activity_registry"], public_key)
+
+    loser_bytes = _package_bytes(world_b, private_key)
+    forged_bytes = _forge_identity(
+        loser_bytes,
+        package_uuid=winner.source_public_id,
+        package_version=winner.package_version,
+        private_key=private_key,
+    )
+
+    from linuxlab.sync import services as sync_services
+
+    real_find = sync_services._find_installed_package
+    call_count = {"n": 0}
+
+    def missing_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return real_find(*args, **kwargs)
+
+    with (
+        patch("linuxlab.sync.services._find_installed_package", side_effect=missing_once),
+        pytest.raises(PackageIdentityConflict),
+    ):
+        import_package(forged_bytes, world_b["activity_registry"], public_key)
+
+    assert InstalledPackage.objects.count() == 1
+    assert InstalledPackage.objects.get(pk=winner.pk).payload_sha256 == winner.payload_sha256
