@@ -87,10 +87,23 @@ class AuthTransportError(TransportError):
 
 
 class ProtocolTransportError(TransportError):
-    """400/413 -- the outgoing request itself was malformed/oversized;
-    a Task 14 implementation-side batching fault, not any one event's
-    fault, so it is handled the same as a transient failure by the
-    flush orchestrator rather than dead-lettering individual events."""
+    """400 -- the outgoing request itself was malformed; a Task 14
+    implementation-side fault, not any one event's fault. The flush
+    orchestrator releases the whole batch as retryable (never falsely
+    dead-lettering an event over a request-level fault) and flags the
+    result as a protocol fault so a deterministic 400 cannot silently
+    tight-loop the identical request forever (T14-D40 corrective)."""
+
+
+class RequestTooLargeError(ProtocolTransportError):
+    """413 -- the outgoing request exceeded Central's accepted batch
+    limits. A subclass of ProtocolTransportError so existing generic
+    handling still applies if a caller doesn't need the distinction,
+    but the flush orchestrator catches this specifically to implement
+    T14-D40: split a multi-event batch and retry smaller subsets; a
+    singleton event that still receives 413 is permanently unsendable
+    under the current transport contract and dead-letters with code
+    EVENT_TOO_LARGE."""
 
 
 @dataclass(frozen=True)
@@ -129,12 +142,28 @@ def canonical_event_dict(envelope):
 
 
 def canonical_event_bytes(envelope):
-    """Deterministic canonical serialization: sorted keys, no delimiter
-    ambiguity. Used both for immutable-envelope comparison (exact
-    duplicate vs idempotency conflict, T14-D27) and for batch byte-size
-    budgeting (T14-D16)."""
+    """Deterministic canonical serialization of ONE event: sorted keys,
+    no delimiter ambiguity. Used for immutable-envelope comparison
+    (exact duplicate vs idempotency conflict, T14-D27) -- NOT for batch
+    byte-size budgeting, since it omits the wrapping-object/separator
+    overhead of the actual request body (see serialize_sync_batch())."""
     return json.dumps(
         canonical_event_dict(envelope),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def serialize_sync_batch(envelopes):
+    """The ONE shared serializer for a full sync request body -- both
+    HttpSyncTransport (what actually goes out over HTTPS) and
+    claim_outbox_batch()'s byte-budget accounting use this exact
+    function, so the count enforced locally can never mismatch what
+    Central actually receives (corrective, independent review finding
+    #4). Deterministic: sorted keys, no delimiter ambiguity."""
+    return json.dumps(
+        {"events": [canonical_event_dict(envelope) for envelope in envelopes]},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,

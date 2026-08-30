@@ -46,6 +46,7 @@ from .contracts import (
     REJECTED,
     AuthTransportError,
     ProtocolTransportError,
+    RequestTooLargeError,
     TransientTransportError,
     WireEventEnvelope,
 )
@@ -106,10 +107,16 @@ def claim_outbox_batch(*, max_events, max_bytes, lease_seconds, now=None):
     PENDING and eligible for a later call, never silently marked
     delivered or dead-lettered.
 
+    Byte-budget accounting uses serialize_sync_batch() -- the SAME
+    function HttpSyncTransport uses to build the actual outgoing
+    request body -- so the locally enforced count can never mismatch
+    what Central actually receives on the wire (corrective, independent
+    review finding #4).
+
     Runs entirely inside one short transaction with
     select_for_update(skip_locked=True); performs no network I/O.
     """
-    from .contracts import canonical_event_bytes
+    from .contracts import serialize_sync_batch
 
     now = now or timezone.now()
     lease_until = now + timedelta(seconds=lease_seconds)
@@ -131,15 +138,16 @@ def claim_outbox_batch(*, max_events, max_bytes, lease_seconds, now=None):
         )
 
         selected = []
-        running_bytes = 0
+        selected_envelopes = []
         for row in candidates:
             if len(selected) >= max_events:
                 break
-            row_bytes = len(canonical_event_bytes(envelope_for(row)))
-            if selected and running_bytes + row_bytes > max_bytes:
+            row_envelope = envelope_for(row)
+            candidate_bytes = len(serialize_sync_batch([*selected_envelopes, row_envelope]))
+            if selected and candidate_bytes > max_bytes:
                 break
             selected.append(row)
-            running_bytes += row_bytes
+            selected_envelopes.append(row_envelope)
 
         # A fresh claim_token per row, minted on every claim AND every
         # reclaim, is what lets every later write prove it still owns
@@ -257,39 +265,77 @@ class FlushSummary:
     released_transient: int = 0
     released_auth_failure: int = 0
     auth_fault: bool = False
+    # T14-D40 corrective: a deterministic 400 (never 413 -- that has its
+    # own split/singleton-dead-letter handling below) is flagged here so
+    # a caller (the sync_events worker) can pause/degrade visibly instead
+    # of silently retrying an identical malformed request forever.
+    protocol_fault: bool = False
 
 
-def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
-    """Claim a bounded batch, send it through `transport` OUTSIDE any
-    open DB transaction, then update delivery metadata only for
-    confirmed event IDs (T14-D08, T14-D16, T14-D17). Never reserializes
-    from current domain state -- every envelope sent is exactly what
-    claim_outbox_batch() returned. Owns no business mutation and no
-    Central projection.
-    """
-    claimed = claim_outbox_batch(
-        max_events=max_events, max_bytes=max_bytes, lease_seconds=lease_seconds, now=now
+def _merge_flush_summaries(a, b):
+    return FlushSummary(
+        claimed=a.claimed + b.claimed,
+        delivered=a.delivered + b.delivered,
+        dead_lettered=a.dead_lettered + b.dead_lettered,
+        released_transient=a.released_transient + b.released_transient,
+        released_auth_failure=a.released_auth_failure + b.released_auth_failure,
+        auth_fault=a.auth_fault or b.auth_fault,
+        protocol_fault=a.protocol_fault or b.protocol_fault,
     )
-    if not claimed:
+
+
+def _send_claimed_rows(transport, rows, now=None):
+    """Send exactly `rows` (already-claimed OutboxMessage instances)
+    through `transport`, OUTSIDE any open DB transaction, then update
+    delivery metadata only for confirmed events. Handles T14-D40 (413)
+    recovery by splitting a multi-event batch and retrying smaller
+    subsets outside any DB transaction/claim lock; a singleton event
+    that still receives 413 is permanently unsendable under the current
+    transport contract and dead-letters with code EVENT_TOO_LARGE. The
+    recursion is bounded by repeated halving (O(log n) deep for any
+    realistic batch size), never unbounded.
+    """
+    if not rows:
         return FlushSummary()
 
-    envelopes = tuple(envelope_for(row) for row in claimed)
+    envelopes = tuple(envelope_for(row) for row in rows)
 
     try:
         batch_ack = transport.send_batch(envelopes)
+    except RequestTooLargeError:
+        if len(rows) == 1:
+            mark_dead_letter(
+                rows[0],
+                "EVENT_TOO_LARGE",
+                "singleton event still rejected as too large by Central",
+                now=now,
+            )
+            return FlushSummary(claimed=1, dead_lettered=1)
+        midpoint = len(rows) // 2
+        first_half = _send_claimed_rows(transport, rows[:midpoint], now=now)
+        second_half = _send_claimed_rows(transport, rows[midpoint:], now=now)
+        return _merge_flush_summaries(first_half, second_half)
     except AuthTransportError:
-        release_auth_failure(claimed, now=now)
-        return FlushSummary(claimed=len(claimed), released_auth_failure=len(claimed), auth_fault=True)
-    except (TransientTransportError, ProtocolTransportError) as exc:
-        release_transient(claimed, type(exc).__name__, now=now)
-        return FlushSummary(claimed=len(claimed), released_transient=len(claimed))
+        release_auth_failure(rows, now=now)
+        return FlushSummary(claimed=len(rows), released_auth_failure=len(rows), auth_fault=True)
+    except ProtocolTransportError:
+        # A deterministic 400: never falsely dead-letter every event
+        # over a request-level fault, and never silently rebuild/resend
+        # the identical malformed request in a tight loop -- release as
+        # retryable (with the usual backoff) and flag protocol_fault so
+        # the worker can additionally pause/degrade (T14-D40).
+        release_transient(rows, "protocol_400", now=now)
+        return FlushSummary(claimed=len(rows), released_transient=len(rows), protocol_fault=True)
+    except TransientTransportError:
+        release_transient(rows, "transient", now=now)
+        return FlushSummary(claimed=len(rows), released_transient=len(rows))
 
     acks_by_event_id = {ack.event_id: ack for ack in batch_ack.results}
 
     delivered_rows = []
     dead_lettered = 0
     unconfirmed_rows = []
-    for row in claimed:
+    for row in rows:
         ack = acks_by_event_id.get(row.event_id)
         if ack is None:
             unconfirmed_rows.append(row)
@@ -308,8 +354,22 @@ def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
         release_transient(unconfirmed_rows, "missing_or_unconfirmed_ack", now=now)
 
     return FlushSummary(
-        claimed=len(claimed),
+        claimed=len(rows),
         delivered=len(delivered_rows),
         dead_lettered=dead_lettered,
         released_transient=len(unconfirmed_rows),
     )
+
+
+def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
+    """Claim a bounded batch, send it through `transport` OUTSIDE any
+    open DB transaction, then update delivery metadata only for
+    confirmed events (T14-D08, T14-D16, T14-D17, T14-D40). Never
+    reserializes from current domain state -- every envelope sent is
+    exactly what claim_outbox_batch() returned. Owns no business
+    mutation and no Central projection.
+    """
+    claimed = claim_outbox_batch(
+        max_events=max_events, max_bytes=max_bytes, lease_seconds=lease_seconds, now=now
+    )
+    return _send_claimed_rows(transport, list(claimed), now=now)

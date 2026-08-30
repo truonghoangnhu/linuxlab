@@ -163,6 +163,65 @@ def test_claim_stops_before_exceeding_byte_budget_and_leaves_remainder_pending()
     assert OutboxMessage.objects.filter(state=OUTBOX_PENDING).count() == 1
 
 
+# --- corrective (independent review finding #4): byte accounting must match
+# the actual wire request body exactly, via the one shared serializer.
+
+
+def test_claim_byte_budget_uses_wrapped_batch_bytes_not_raw_per_event_sum():
+    from linuxlab.sync.contracts import canonical_event_bytes
+
+    first = _make_outbox(payload={"x": 1})
+    second = _make_outbox(
+        payload={"x": 1}, next_attempt_at=first.next_attempt_at + timedelta(seconds=1)
+    )
+    raw_per_event_bytes = len(canonical_event_bytes(envelope_for(first)))
+    # What a naive per-event-sum (the pre-corrective bug) would have
+    # allowed for two events -- the real wrapped `{"events":[...]}` body
+    # is strictly larger due to wrapper/separator overhead, so the
+    # correct accounting must NOT fit both under this budget.
+    naive_budget = raw_per_event_bytes * 2
+
+    claimed = claim_outbox_batch(
+        max_events=10, max_bytes=naive_budget, lease_seconds=60, now=second.next_attempt_at
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0].event_id == first.event_id
+
+
+def test_claim_byte_budget_exact_boundary_fits_exactly():
+    from linuxlab.sync.contracts import serialize_sync_batch
+
+    first = _make_outbox(payload={"x": 1})
+    second = _make_outbox(
+        payload={"x": 1}, next_attempt_at=first.next_attempt_at + timedelta(seconds=1)
+    )
+    exact_bytes = len(serialize_sync_batch([envelope_for(first), envelope_for(second)]))
+
+    claimed = claim_outbox_batch(
+        max_events=10, max_bytes=exact_bytes, lease_seconds=60, now=second.next_attempt_at
+    )
+
+    assert {c.event_id for c in claimed} == {first.event_id, second.event_id}
+
+
+def test_claim_byte_budget_one_byte_under_exact_boundary_excludes_last_event():
+    from linuxlab.sync.contracts import serialize_sync_batch
+
+    first = _make_outbox(payload={"x": 1})
+    second = _make_outbox(
+        payload={"x": 1}, next_attempt_at=first.next_attempt_at + timedelta(seconds=1)
+    )
+    exact_bytes = len(serialize_sync_batch([envelope_for(first), envelope_for(second)]))
+
+    claimed = claim_outbox_batch(
+        max_events=10, max_bytes=exact_bytes - 1, lease_seconds=60, now=second.next_attempt_at
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0].event_id == first.event_id
+
+
 def test_claim_always_includes_at_least_one_oversized_row_without_marking_it_delivered():
     row = _make_outbox(payload={"x": "y" * 500})
 

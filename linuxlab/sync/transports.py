@@ -29,8 +29,10 @@ from .contracts import (
     BatchAck,
     EventAck,
     ProtocolTransportError,
+    RequestTooLargeError,
     TransientTransportError,
     canonical_event_dict,
+    serialize_sync_batch,
 )
 
 _EVENTS_PATH = "/api/v1/sync/events/"
@@ -60,9 +62,10 @@ class HttpSyncTransport:
         return f"HttpSyncTransport(node_id={self._node_id!r}, url={self._events_url!r})"
 
     def send_batch(self, envelopes):
-        body = json.dumps(
-            {"events": [canonical_event_dict(envelope) for envelope in envelopes]}
-        ).encode("utf-8")
+        # The EXACT bytes claim_outbox_batch() budgeted against
+        # (corrective, independent review finding #4) -- one shared
+        # serializer, never a second differently-formatted encoding.
+        body = serialize_sync_batch(envelopes)
         request = urllib.request.Request(
             self._events_url,
             data=body,
@@ -88,7 +91,9 @@ class HttpSyncTransport:
     def _raise_for_status(status):
         if status in (401, 403):
             raise AuthTransportError(f"authentication rejected (HTTP {status})")
-        if status in (400, 413):
+        if status == 413:
+            raise RequestTooLargeError(f"request rejected (HTTP {status})")
+        if status == 400:
             raise ProtocolTransportError(f"request rejected (HTTP {status})")
         # 5xx and any other non-2xx: always safe to treat as retryable
         # rather than inventing a new terminal failure mode.

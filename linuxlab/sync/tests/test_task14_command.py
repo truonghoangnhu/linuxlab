@@ -3,6 +3,7 @@ deterministic testing/admin, a continuous supervised loop otherwise, no
 background thread inside the Django web process.
 """
 
+import io
 import signal
 import uuid
 from unittest.mock import patch
@@ -140,3 +141,30 @@ def test_auth_fault_pauses_longer_than_idle(settings):
         command.handle(once=False)
 
     sleep_mock.assert_called_with(60)
+
+
+def test_protocol_fault_pauses_longer_than_idle_and_warns_operator(settings):
+    _configure_sync_settings(settings)
+    command = Command(stderr=io.StringIO())
+
+    call_count = 0
+
+    def _fake_flush(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            command._running = False
+        return FlushSummary(claimed=1, released_transient=1, protocol_fault=True)
+
+    with (
+        patch(
+            "linuxlab.sync.management.commands.sync_events.flush_outbox",
+            side_effect=_fake_flush,
+        ),
+        patch.object(command, "_build_transport", return_value=object()),
+        patch("linuxlab.sync.management.commands.sync_events.time.sleep") as sleep_mock,
+    ):
+        command.handle(once=False)
+
+    sleep_mock.assert_called_with(60)
+    assert "malformed" in command.stderr.getvalue().lower()

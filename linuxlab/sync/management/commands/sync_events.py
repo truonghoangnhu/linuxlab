@@ -62,8 +62,21 @@ class Command(BaseCommand):
             f"dead_lettered={summary.dead_lettered} "
             f"released_transient={summary.released_transient} "
             f"released_auth_failure={summary.released_auth_failure} "
-            f"auth_fault={summary.auth_fault}"
+            f"auth_fault={summary.auth_fault} protocol_fault={summary.protocol_fault}"
         )
+        if summary.protocol_fault:
+            # T14-D40: a deterministic 400 means Central is rejecting a
+            # STRUCTURALLY malformed request that will never succeed by
+            # retrying identically -- surface it distinctly so an
+            # operator notices, rather than letting it blend into
+            # ordinary transient-failure log noise.
+            self.stderr.write(
+                self.style.WARNING(
+                    "sync_events: Central rejected the request as malformed (HTTP 400); "
+                    "this will not resolve on its own -- investigate the Node/Central "
+                    "protocol version mismatch or a local batching defect"
+                )
+            )
 
     def handle(self, *args, **options):
         del args
@@ -84,7 +97,7 @@ class Command(BaseCommand):
             if options.get("once"):
                 return
 
-            if summary.auth_fault:
+            if summary.auth_fault or summary.protocol_fault:
                 time.sleep(_AUTH_FAULT_SLEEP_SECONDS)
             elif summary.claimed == 0:
                 time.sleep(_IDLE_SLEEP_SECONDS)

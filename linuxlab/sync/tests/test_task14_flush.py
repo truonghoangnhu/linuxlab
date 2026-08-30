@@ -17,6 +17,7 @@ from linuxlab.sync.contracts import (
     BatchAck,
     EventAck,
     ProtocolTransportError,
+    RequestTooLargeError,
     TransientTransportError,
 )
 from linuxlab.sync.models import (
@@ -72,6 +73,22 @@ class _ScriptedTransport:
         if self._exception is not None:
             raise self._exception
         return self._result
+
+
+class _CallableTransport:
+    """A fake SyncTransport whose send_batch() outcome is decided by a
+    caller-supplied function of the envelope batch itself -- needed for
+    T14-D40 tests where the transport must behave differently depending
+    on how many events are in the batch it receives (e.g. 413 for a
+    multi-event batch, success for the same event sent alone)."""
+
+    def __init__(self, decide):
+        self._decide = decide
+        self.calls = []
+
+    def send_batch(self, envelopes):
+        self.calls.append(envelopes)
+        return self._decide(envelopes)
 
 
 # --- successful flush --------------------------------------------------
@@ -216,6 +233,130 @@ def test_auth_transport_error_releases_whole_batch_without_dead_lettering_or_inc
         refreshed = OutboxMessage.objects.get(pk=row.pk)
         assert refreshed.state == OUTBOX_PENDING
         assert refreshed.attempts == 3
+
+
+# --- T14-D40: deterministic HTTP 413 recovery -------------------------------
+
+
+def test_413_on_multi_event_batch_splits_and_delivers_good_events():
+    a = _make_outbox()
+    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+    c = _make_outbox(next_attempt_at=a.next_attempt_at)
+
+    def _decide(envelopes):
+        if len(envelopes) > 1:
+            raise RequestTooLargeError("413")
+        (envelope,) = envelopes
+        return BatchAck(results=(EventAck(event_id=envelope.event_id, status=ACCEPTED),))
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.claimed == 3
+    assert summary.delivered == 3
+    assert summary.dead_lettered == 0
+    for row in (a, b, c):
+        assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DELIVERED
+    # More than one send_batch() call, eventually down to single-event
+    # sends -- proving the split actually happened rather than merely
+    # retrying the identical oversized batch.
+    assert len(transport.calls) > 1
+    assert any(len(call) == 1 for call in transport.calls)
+
+
+def test_413_on_singleton_dead_letters_with_event_too_large():
+    row = _make_outbox()
+    transport = _ScriptedTransport(exception=RequestTooLargeError("413"))
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.claimed == 1
+    assert summary.dead_lettered == 1
+    assert summary.delivered == 0
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.rejection_code == "EVENT_TOO_LARGE"
+
+
+def test_413_split_isolates_the_oversized_singleton_and_delivers_its_neighbor():
+    good = _make_outbox()
+    oversized = _make_outbox(next_attempt_at=good.next_attempt_at)
+
+    def _decide(envelopes):
+        ids = {e.event_id for e in envelopes}
+        if oversized.event_id in ids and len(envelopes) == 1:
+            raise RequestTooLargeError("413 even alone")
+        if len(envelopes) > 1:
+            raise RequestTooLargeError("413")
+        (envelope,) = envelopes
+        return BatchAck(results=(EventAck(event_id=envelope.event_id, status=ACCEPTED),))
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.claimed == 2
+    assert summary.delivered == 1
+    assert summary.dead_lettered == 1
+    assert OutboxMessage.objects.get(pk=good.pk).state == OUTBOX_DELIVERED
+    refreshed_oversized = OutboxMessage.objects.get(pk=oversized.pk)
+    assert refreshed_oversized.state == OUTBOX_DEAD_LETTER
+    assert refreshed_oversized.rejection_code == "EVENT_TOO_LARGE"
+
+
+def test_413_split_never_recurses_unboundedly_for_a_realistic_batch():
+    first = _make_outbox()
+    rows = [first] + [_make_outbox(next_attempt_at=first.next_attempt_at) for _ in range(7)]
+    transport = _ScriptedTransport(exception=RequestTooLargeError("413"))
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    # Every claimed event, split all the way down to singletons, still
+    # rejected as too large -- all 8 dead-letter, none delivered, and
+    # nothing hangs or raises a recursion error.
+    assert summary.claimed == 8
+    assert summary.dead_lettered == 8
+    for row in rows:
+        assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DEAD_LETTER
+
+
+# --- T14-D40: deterministic HTTP 400 handling --------------------------------
+
+
+def test_deterministic_400_releases_retryable_without_dead_lettering():
+    a = _make_outbox()
+    b = _make_outbox(next_attempt_at=a.next_attempt_at)
+    transport = _ScriptedTransport(exception=ProtocolTransportError("malformed request"))
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.protocol_fault is True
+    assert summary.dead_lettered == 0
+    assert summary.delivered == 0
+    assert summary.released_transient == 2
+    for row in (a, b):
+        refreshed = OutboxMessage.objects.get(pk=row.pk)
+        assert refreshed.state == OUTBOX_PENDING
+        assert refreshed.attempts == 1
+
+
+def test_deterministic_400_does_not_tight_loop_the_identical_request():
+    row = _make_outbox()
+    transport = _ScriptedTransport(exception=ProtocolTransportError("malformed request"))
+    now = timezone.now()
+
+    first = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now)
+    refreshed_after_first = OutboxMessage.objects.get(pk=row.pk)
+
+    # The SAME malformed request would recur unchanged on an immediate
+    # retry -- but next_attempt_at has moved out via backoff, so an
+    # immediate second flush at the same `now` claims nothing.
+    second = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now)
+
+    assert first.protocol_fault is True
+    assert second.claimed == 0
+    assert refreshed_after_first.next_attempt_at > now
 
 
 # --- FileSyncTransport non-delivery -----------------------------------------
