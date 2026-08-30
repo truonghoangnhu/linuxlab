@@ -297,4 +297,62 @@ Any later change to these decisions must be recorded in a dated dev-log entry co
 4. migration/backward-compatibility impact;
 5. review approval.
 
+---
+
+## Implementation record (2026-08-30)
+
+Task 13 implementation, following `docs/superpowers/plans/2026-08-30-task13-offline-node-serving.md`. No semantic change to T13-D01 through T13-D15 — this section records what was built, not a new decision.
+
+**Commit range:** `8fb7bc7`..`5fe15fe` (six commits, one per plan task 1-6), on top of docs HEAD `e7b2e5d`.
+
+- `8fb7bc7` feat: add immutable runtime contracts
+- `0bbdb0d` feat: pin active runtime package context
+- `7acdb6e` feat: resolve learner content from pinned package
+- `92a056d` feat: add isolated runtime grading lookup
+- `8a93059` feat: serve active Node content over LAN
+- `5fe15fe` test: prove offline pinned runtime serving
+
+**Actual files:**
+
+```text
+linuxlab/runtime/
+├── __init__.py            (empty — exports nothing; grading is never part of the learner facade)
+├── context.py              open_runtime_context(), _rebind_runtime_context()
+├── dto.py                  RuntimePackageContext/RuntimePublication/RuntimeActivity/RuntimeQuestion/RuntimeQuestionGrading
+├── freeze.py                freeze_json_value()
+├── content.py               get_runtime_publication()/get_runtime_activity()/get_runtime_question()
+├── grading.py                get_runtime_question_grading() (own module, not imported by content.py or the sync view)
+├── exceptions.py             RuntimeContentUnavailable/RuntimeArtifactNotFound/RuntimeContextInvalid
+└── tests/                    test_dto.py, test_context.py, test_content.py, test_grading.py, test_pinning.py, conftest.py, _wagtail_bootstrap.py
+
+linuxlab/sync/
+├── views.py                LearnView (GET /learn/<uuid:source_public_id>/)
+├── urls.py                 the one route above
+├── templates/sync/          learn.html, learn_unavailable.html, learn_not_found.html
+└── tests/                    test_views.py, test_offline.py (added to the existing Task 12 sync test package)
+
+linuxlab/urls.py            one added line: `path("", include("linuxlab.sync.urls"))`, placed before the
+                             existing `path("", include(wagtail_urls))` catch-all so /learn/<uuid>/ resolves
+                             first.
+linuxlab/settings/{base,central,node,test}.py
+                             one added capability flag, following the existing LINUXLAB_CAN_* pattern:
+                             LINUXLAB_CAN_SERVE_LEARNER_CONTENT (base/central/test: False, node: True).
+```
+
+- `linuxlab/runtime/` is confirmed **not** a Django app: not in any `INSTALLED_APPS` list, no `apps.py`, no `migrations/` directory.
+
+**Route/template/profile behavior:**
+
+- `GET /learn/<uuid:source_public_id>/` opens one `RuntimePackageContext` for `package_type="learning_path"` and reuses it for the one `get_runtime_publication()` call the current template needs; it never calls `get_runtime_activity()`/`get_runtime_question()`/grading itself (the plan's "optionally activity/question functions only when the authoritative template requires them" — the current minimal template does not).
+- Exception mapping implemented exactly as designed: `RuntimeContentUnavailable` → 503 (`learn_unavailable.html`), `RuntimeArtifactNotFound` → 404 (`learn_not_found.html`), `RuntimeContextInvalid` → 500 (plain `HttpResponseServerError`, no template — this path is not expected to be reachable in normal operation since the context was just opened in the same request).
+- Central profile (and any profile with `LINUXLAB_CAN_SERVE_LEARNER_CONTENT=False`, including the shared `test` profile by default) gets `HttpResponseForbidden` (403) before `open_runtime_context()` is ever called.
+
+**Tests proving the load-bearing behaviors:**
+
+- pinning across activation, deep immutability, grading separation, no-Central/Wagtail-fallback: `linuxlab/runtime/tests/test_pinning.py`, `test_context.py`, `test_content.py`, `test_grading.py`, `test_dto.py`.
+- no-network HTTP serving: `linuxlab/sync/tests/test_offline.py` (patches `socket.create_connection`/`socket.socket.connect`; the already-open PostgreSQL connection is unaffected because psycopg's C extension talks to libpq directly, not through Python's `socket` module — confirmed empirically, this test passes).
+- Node/Central profile behavior, no-latest-fallback, one-context-per-request: `linuxlab/sync/tests/test_views.py`.
+
+**Full suite at completion:** see the Task 13 Implementation Report for exact counts (full verification run separately, after this record).
+
 Do not silently change Task 13 runtime semantics in code alone.
