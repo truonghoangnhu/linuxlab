@@ -111,6 +111,24 @@ systemd unit files, Caddy example configs, and env examples are version-controll
 
 RELEASE CI is mandatory on merges to the protected integration/release branch and again on the exact commit SHA selected for a release/tag. A PASS from a different SHA is not release evidence for the selected commit.
 
+## T15-D27 — Node learning execution references installed immutable artifacts directly
+
+The `assessment/single_choice` provider eligibility audit (see the Task 15 checkpoint) found that Node learning persistence referenced only Central live-authoring models (`Attempt.activity_version` → `activities.ActivityVersion`, `Progress.activity_definition` → `activities.ActivityDefinition`), while Node package import produces separate immutable `InstalledActivityVersion`/`InstalledQuestionVersion`/`InstalledQuestionGrading` rows. A package-only activity therefore could not produce a legitimate Node `Attempt` without either materializing authoring rows on Node or bypassing the approved trust boundaries with raw ORM/SQL — both forbidden.
+
+Full design: `docs/superpowers/specs/2026-08-31-task15-node-installed-execution-design.md`.
+
+Approved invariants:
+
+- `Attempt` supports exactly one execution source — Central `ActivityVersion` or Node `InstalledActivityVersion` — enforced by a database XOR `CheckConstraint`, never both and never neither.
+- `Progress` is keyed by a stable `activity_definition_public_id` (not the local `ActivityDefinition` PK) across both execution sources and deployments; existing Progress rows are backfilled by migration.
+- Node never materializes `ActivityDefinition`/`ActivityVersion`/`Question`/`QuestionVersion` rows from installed package artifacts; there is no live-authoring fallback in the installed grading path.
+- Node grading resolves exclusively through the pinned installed artifact/package context (`Attempt → InstalledActivityVersion → InstalledPackage/RuntimePackageContext → InstalledQuestionVersion → InstalledQuestionGrading`).
+- An Attempt, once started, stays pinned to the exact package it started against even after a newer package later activates; only a *new* Attempt may start against a non-active package, and must not.
+- `build_default_activity_registry()`/`build_default_question_registry()` are real production wiring (not pytest-fixture-only), registering `AssessmentActivityProvider`/`SingleChoiceProvider`, and are the same registries used by ordinary runtime/service code and the Release E2E.
+- A real Node HTTP learner activity GET/submit path exists, using only public/domain services.
+
+This is additive to the existing Central learning model, not a replacement of the Central authoring path. Existing Central behavior remains fully backward-compatible. T15-D27 does not alter T15-D01–D26.
+
 ---
 
-No implementation-time decision may silently contradict these approved choices. A material new architecture decision requires human approval and a new Task 15 decision entry (T15-D27+); none has been added during implementation.
+No implementation-time decision may silently contradict these approved choices. A material new architecture decision requires human approval and a new Task 15 decision entry (T15-D28+); none has been added beyond T15-D27.
