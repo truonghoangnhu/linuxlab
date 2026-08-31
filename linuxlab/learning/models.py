@@ -7,10 +7,12 @@ from django.db.models import Q
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 from linuxlab.core.models import StableIdentityModel
 from linuxlab.identity.models import Learner
+from linuxlab.sync.models import InstalledActivityVersion
 
 _ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS = (
     "learner_id",
     "activity_version_id",
+    "installed_activity_version_id",
     "started_at",
     "submission",
     "submitted_at",
@@ -18,13 +20,15 @@ _ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS = (
 
 
 class Attempt(StableIdentityModel):
-    """One learner interaction with ONE exact immutable ActivityVersion (ADR-004,
-    ADR-009). The FK below is never re-resolved through "latest" lookup: an
-    Attempt is permanently bound to the ActivityVersion row it was started
-    against, even after later versions of the same ActivityDefinition publish.
+    """One learner interaction with ONE exact immutable execution source
+    (ADR-004, ADR-009, T15-D27): either a Central-authored ActivityVersion
+    or a Node InstalledActivityVersion, never both and never neither. The
+    FK is never re-resolved through "latest" lookup: an Attempt is
+    permanently bound to the exact row it was started against, even after
+    a later version publishes or a newer package activates.
 
     Lifecycle is expressed through timestamps, not a status field:
-    submitted_at is NULL until submit_attempt() completes exactly once.
+    submitted_at is NULL until submission completes exactly once.
     """
 
     learner = models.ForeignKey(
@@ -36,10 +40,30 @@ class Attempt(StableIdentityModel):
         ActivityVersion,
         on_delete=models.PROTECT,
         related_name="attempts",
+        null=True,
+        blank=True,
+    )
+    installed_activity_version = models.ForeignKey(
+        InstalledActivityVersion,
+        on_delete=models.PROTECT,
+        related_name="attempts",
+        null=True,
+        blank=True,
     )
     started_at = models.DateTimeField(auto_now_add=True)
     submitted_at = models.DateTimeField(null=True, blank=True)
     submission = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            models.CheckConstraint(
+                condition=(
+                    Q(activity_version__isnull=False, installed_activity_version__isnull=True)
+                    | Q(activity_version__isnull=True, installed_activity_version__isnull=False)
+                ),
+                name="attempt_exactly_one_execution_source",
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         # Attempt is historical evidence (ADR-003), and finalization is
@@ -82,7 +106,7 @@ class Attempt(StableIdentityModel):
             locked = (
                 Attempt.objects.select_for_update()
                 .filter(pk=self.pk)
-                .values("learner_id", "activity_version_id", "started_at", "submission", "submitted_at")
+                .values(*_ATTEMPT_IMMUTABLE_AFTER_CREATION_FIELDS)
                 .first()
             )
             if locked is None:
@@ -131,12 +155,21 @@ class Result(models.Model):
 
 
 class Progress(models.Model):
-    """Derived projection of a learner's status for one ActivityDefinition.
+    """Derived projection of a learner's status for one stable Activity
+    definition identity (T15-D27: activity_definition_public_id), across
+    both Central-authored and Node-installed execution sources.
 
     NOT the source of truth (ADR-003): every field here must be fully
     reconstructable from Attempt/Result history alone. Rows only exist for
-    (learner, activity_definition) pairs that have at least one Result;
-    rebuild_progress()/the post-submit refresh are the only writers.
+    (learner, activity_definition_public_id) pairs that have at least one
+    Result; rebuild_progress()/the post-submit refresh are the only
+    writers.
+
+    activity_definition is populated only when a matching local
+    ActivityDefinition row exists (always true on Central for content it
+    authored; never true on Node for package-only content, T15-D27 S4.3).
+    activity_definition_public_id is always populated -- it is the stable
+    cross-deployment identity Progress is actually keyed by.
     """
 
     learner = models.ForeignKey(
@@ -148,14 +181,33 @@ class Progress(models.Model):
         ActivityDefinition,
         on_delete=models.CASCADE,
         related_name="progress_records",
+        null=True,
+        blank=True,
     )
+    activity_definition_public_id = models.UUIDField(null=True, blank=True)
     completed = models.BooleanField()
     best_score = models.IntegerField(validators=[MinValueValidator(0)])
 
     class Meta:
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.UniqueConstraint(
-                fields=["learner", "activity_definition"],
-                name="unique_progress_per_learner_activity",
+                fields=["learner", "activity_definition_public_id"],
+                name="unique_progress_per_learner_activity_public_id",
             ),
         ]
+
+    def save(self, *args, **kwargs):
+        # T15-D27 S4.3: activity_definition_public_id is the stable identity
+        # Progress is actually keyed by; it must always be present. Callers
+        # that already resolved the public_id (the projection service) pass
+        # it explicitly; older/simpler callers (tests, Central-only code)
+        # may pass only activity_definition, and it is derived here so
+        # existing call sites remain backward-compatible without an extra
+        # explicit field on every call.
+        if self.activity_definition_id is None and self.activity_definition_public_id is None:
+            raise ValueError(
+                "Progress requires activity_definition or activity_definition_public_id"
+            )
+        if self.activity_definition_id is not None and self.activity_definition_public_id is None:
+            self.activity_definition_public_id = self.activity_definition.public_id
+        super().save(*args, **kwargs)

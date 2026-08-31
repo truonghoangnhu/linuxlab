@@ -116,7 +116,21 @@ class AssessmentActivityProvider:
         refs = tuple(_parse_question_ref(item) for item in config["questions"])
         return ActivityDependencies(question_versions=refs)
 
-    def evaluate(self, config, submission):
+    def evaluate(self, config, submission, context=None):
+        """context=None (default) resolves each question from the Central
+        live-authoring QuestionVersion table -- the original Task 06/07
+        behavior, unchanged for every existing caller.
+
+        T15-D27 S8: a caller grading a Node-installed Attempt instead
+        passes context=<RuntimePackageContext>, pinned to the exact
+        InstalledPackage the Attempt started against. Resolution then
+        reads exclusively from that package's InstalledQuestionVersion/
+        InstalledQuestionGrading rows -- never the live authoring tables --
+        so a Node execution path can never fetch or reconstruct live
+        authoring question versions. The QuestionProvider.evaluate() call
+        below is unchanged either way: it is already resolver-agnostic,
+        taking plain content/answer_key/scoring/response values.
+        """
         responses_by_key = self._parse_responses(submission)
 
         results = []
@@ -125,16 +139,13 @@ class AssessmentActivityProvider:
 
         for item in config["questions"]:
             question_public_id, version = _parse_question_ref(item)
-            question_version = get_question_version(question_public_id, version)
-            provider = self.question_registry.get(question_version.type_key)
+            type_key, content, answer_key, scoring = self._resolve_question(
+                context, question_public_id, version
+            )
+            provider = self.question_registry.get(type_key)
 
             response = responses_by_key.get((question_public_id, version), {})
-            outcome = provider.evaluate(
-                question_version.content,
-                question_version.answer_key,
-                question_version.scoring,
-                response,
-            )
+            outcome = provider.evaluate(content, answer_key, scoring, response)
 
             total_score += outcome["score"]
             total_max_score += outcome["max_score"]
@@ -153,6 +164,35 @@ class AssessmentActivityProvider:
             "max_score": total_max_score,
             "results": results,
         }
+
+    @staticmethod
+    def _resolve_question(context, question_public_id, version):
+        """Returns (type_key, content, answer_key, scoring) for one exact
+        question reference, from either the Central live-authoring table
+        (context is None) or the pinned Node InstalledPackage (context is
+        a RuntimePackageContext) -- see evaluate()'s docstring."""
+        if context is None:
+            question_version = get_question_version(question_public_id, version)
+            return (
+                question_version.type_key,
+                question_version.content,
+                question_version.answer_key,
+                question_version.scoring,
+            )
+
+        # Local import: keeps linuxlab.quiz's dependency on linuxlab.runtime
+        # confined to this one Node-only code path, not module-level.
+        from linuxlab.runtime.content import get_runtime_question
+        from linuxlab.runtime.grading import get_runtime_question_grading
+
+        runtime_question = get_runtime_question(context, question_public_id, version)
+        runtime_grading = get_runtime_question_grading(context, question_public_id, version)
+        return (
+            runtime_question.type_key,
+            runtime_question.content,
+            runtime_grading.answer_key,
+            runtime_grading.scoring,
+        )
 
     @staticmethod
     def _parse_responses(submission):

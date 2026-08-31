@@ -105,6 +105,22 @@ def open_runtime_context(package_type, source_public_id):
     return _context_from_package(package)
 
 
+def open_pinned_context(package):
+    """Mint a RuntimePackageContext for an InstalledPackage the caller has
+    already legitimately resolved through its own trust boundary -- e.g.
+    linuxlab.learning grading an existing Attempt via
+    attempt.installed_activity_version.package (T15-D27 S7, S8).
+
+    Unlike open_runtime_context(), this does NOT require package.state ==
+    ACTIVE: an Attempt remains pinned to whatever package it started
+    against even after a newer package activates or this one becomes
+    ARCHIVED. Grading (or re-rendering) an EXISTING Attempt must never
+    re-resolve "the current active package" -- that lookup is exactly
+    what open_runtime_context() performs, and it is the wrong one here.
+    """
+    return _context_from_package(package)
+
+
 def _context_from_package(package):
     provenance_tag = _seal_runtime_context_identity(
         package.pk,

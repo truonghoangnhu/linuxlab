@@ -11,7 +11,9 @@ from linuxlab.identity.models import Learner
 from linuxlab.identity.services import ensure_learner
 from linuxlab.learning.models import Attempt, Result
 from linuxlab.learning.projections import refresh_progress
+from linuxlab.runtime.context import open_pinned_context
 from linuxlab.sync.enqueue import enqueue_sync_event
+from linuxlab.sync.models import ACTIVE
 
 _GUEST_CLAIM_SOURCE = "guest_claim"
 _CLAIM_ITEM_KEYS = {"activity_public_id", "activity_version"}
@@ -112,7 +114,9 @@ def claim_activity_completion(learner, activity_version):
             details=details,
         )
 
-        refresh_progress(locked_learner.pk, activity_version.definition_id)
+        refresh_progress(
+            locked_learner.pk, activity_version.definition.public_id, activity_version.definition_id
+        )
 
         domain_event = publish_event(
             "activity.completed",
@@ -212,73 +216,179 @@ def claim_guest_progress(account, claims):
         return learner, results
 
 
+def _lock_attempt_for_submission(attempt):
+    """Re-read/lock the Attempt row rather than trusting the caller's
+    in-memory object (Task 05/06 stale-object lesson): two concurrent
+    submissions of the SAME attempt serialize on this row lock, and the
+    loser observes submitted_at already set and is rejected.
+
+    Deliberately does NOT select_related() across activity_version or
+    installed_activity_version: both are nullable (T15-D27), so Django
+    would emit a LEFT OUTER JOIN, and PostgreSQL rejects `SELECT ... FOR
+    UPDATE` on the nullable side of an outer join. Whichever execution
+    source is actually set is instead read as a normal (unlocked) follow-up
+    access -- correct, since only the Attempt row itself needs locking.
+    """
+    locked_attempt = (
+        Attempt.objects.select_for_update().select_related("learner").get(pk=attempt.pk)
+    )
+    if locked_attempt.submitted_at is not None:
+        raise ValueError("Attempt has already been submitted")
+    return locked_attempt
+
+
+def _finalize_submission(
+    locked_attempt, submission, score, max_score, details, *, activity_definition_public_id, activity_definition_id
+):
+    """Shared finalization for both execution sources (T15-D27 S9):
+    transaction boundary, Result persistence, Progress update, and
+    activity.completed domain event + Outbox enqueue. Callers have already
+    locked the Attempt row and evaluated the submission through the
+    correct provider/resolver for their execution source; only the
+    finalization mechanics are identical either way.
+    """
+    # Deliberate, narrow bypass of Attempt.save()'s guard: finalization is
+    # the ONE service-owned write path, so it persists the first submission
+    # transition through a conditional QuerySet.update() rather than an
+    # ordinary save() (which now rejects this transition unconditionally,
+    # on purpose). The row is already select_for_update locked by the
+    # caller, so this update is not itself a race; the
+    # submitted_at__isnull=True filter plus the row-count check are a
+    # defensive assertion of that invariant, not the actual guard.
+    submitted_at = timezone.now()
+    updated = Attempt.objects.filter(pk=locked_attempt.pk, submitted_at__isnull=True).update(
+        submission=submission,
+        submitted_at=submitted_at,
+    )
+    if updated != 1:
+        raise ValueError("Attempt has already been submitted")
+
+    locked_attempt.submission = submission
+    locked_attempt.submitted_at = submitted_at
+
+    result = Result.objects.create(
+        attempt=locked_attempt,
+        score=score,
+        max_score=max_score,
+        details=details,
+    )
+
+    refresh_progress(locked_attempt.learner_id, activity_definition_public_id, activity_definition_id)
+
+    if locked_attempt.activity_version_id is not None:
+        execution_source_version = locked_attempt.activity_version.version
+    else:
+        execution_source_version = locked_attempt.installed_activity_version.version
+
+    domain_event = publish_event(
+        "activity.completed",
+        {
+            "attempt_public_id": str(locked_attempt.public_id),
+            "learner_public_id": str(locked_attempt.learner.public_id),
+            "activity_definition_public_id": str(activity_definition_public_id),
+            "activity_version": execution_source_version,
+            "score": score,
+            "max_score": max_score,
+        },
+        aggregate_id=locked_attempt.public_id,
+    )
+    enqueue_sync_event(
+        domain_event,
+        node_id=settings.LINUXLAB_NODE_ID,
+        sync_enabled=settings.LINUXLAB_SYNC_ENABLED,
+    )
+
+    return result
+
+
 def submit_attempt(attempt, submission, registry):
     """Evaluate a submission through the provider registry and record the
-    single authoritative Result for this Attempt.
-
-    Attempt is re-read/locked from the database rather than trusting the
-    caller's in-memory object (Task 05/06 stale-object lesson): two
-    concurrent submissions of the SAME attempt serialize on this row lock,
-    and the loser observes submitted_at already set and is rejected.
+    single authoritative Result for this Attempt (Central execution
+    source: Attempt.activity_version).
     """
     with transaction.atomic():
-        locked_attempt = (
-            Attempt.objects.select_for_update()
-            .select_related("activity_version__definition", "learner")
-            .get(pk=attempt.pk)
-        )
-        if locked_attempt.submitted_at is not None:
-            raise ValueError("Attempt has already been submitted")
+        locked_attempt = _lock_attempt_for_submission(attempt)
+        if locked_attempt.activity_version_id is None:
+            raise ValueError("Attempt has no Central activity_version execution source")
 
         activity_version = locked_attempt.activity_version
         provider = registry.get(activity_version.definition.type_key)
         outcome = provider.evaluate(activity_version.config, submission)
         score, max_score = _validate_provider_outcome(outcome)
 
-        # Deliberate, narrow bypass of Attempt.save()'s guard: finalization
-        # is the ONE service-owned write path, so it persists the first
-        # submission transition through a conditional QuerySet.update()
-        # rather than an ordinary save() (which now rejects this transition
-        # unconditionally, on purpose). The row is already select_for_update
-        # locked above, so this update is not itself a race; the
-        # submitted_at__isnull=True filter plus the row-count check are a
-        # defensive assertion of that invariant, not the actual guard.
-        submitted_at = timezone.now()
-        updated = Attempt.objects.filter(pk=locked_attempt.pk, submitted_at__isnull=True).update(
-            submission=submission,
-            submitted_at=submitted_at,
-        )
-        if updated != 1:
-            raise ValueError("Attempt has already been submitted")
-
-        locked_attempt.submission = submission
-        locked_attempt.submitted_at = submitted_at
-
-        result = Result.objects.create(
-            attempt=locked_attempt,
-            score=score,
-            max_score=max_score,
-            details=outcome,
+        return _finalize_submission(
+            locked_attempt,
+            submission,
+            score,
+            max_score,
+            outcome,
+            activity_definition_public_id=activity_version.definition.public_id,
+            activity_definition_id=activity_version.definition_id,
         )
 
-        refresh_progress(locked_attempt.learner_id, activity_version.definition_id)
 
-        domain_event = publish_event(
-            "activity.completed",
-            {
-                "attempt_public_id": str(locked_attempt.public_id),
-                "learner_public_id": str(locked_attempt.learner.public_id),
-                "activity_definition_public_id": str(activity_version.definition.public_id),
-                "activity_version": activity_version.version,
-                "score": score,
-                "max_score": max_score,
-            },
-            aggregate_id=locked_attempt.public_id,
-        )
-        enqueue_sync_event(
-            domain_event,
-            node_id=settings.LINUXLAB_NODE_ID,
-            sync_enabled=settings.LINUXLAB_SYNC_ENABLED,
+def start_installed_attempt(learner, context, activity_public_id, version):
+    """Start a new Attempt against an exact installed activity pinned by
+    `context` (T15-D27 S6): the Node execution source counterpart to
+    start_attempt().
+
+    Requires the package underlying `context` to be currently ACTIVE: new
+    executions may only begin against the active package (T15-D27 S7) --
+    an existing Attempt, once started, stays pinned to its package even
+    after a newer package activates or this one is archived, but nothing
+    NEW may start against a non-active package. context provenance/
+    identity is re-verified by resolving the pinned InstalledActivityVersion
+    through the runtime boundary, exactly like every other runtime lookup.
+    """
+    from linuxlab.runtime.execution import get_installed_activity_for_attempt
+
+    installed_activity = get_installed_activity_for_attempt(context, activity_public_id, version)
+    if installed_activity.package.state != ACTIVE:
+        raise ValueError("cannot start a new Attempt against a non-active package")
+
+    return Attempt.objects.create(learner=learner, installed_activity_version=installed_activity)
+
+
+def submit_installed_attempt(attempt, submission, activity_registry):
+    """Evaluate a submission through the provider registry and record the
+    single authoritative Result for this Attempt (Node execution source:
+    Attempt.installed_activity_version, T15-D27 S6/S8).
+
+    Grading is pinned to whichever InstalledPackage this Attempt actually
+    started against (open_pinned_context()), never re-resolved to "the
+    current active package" -- an Attempt started against package A stays
+    pinned to A even after package B later activates (T15-D27 S7).
+    """
+    with transaction.atomic():
+        locked_attempt = _lock_attempt_for_submission(attempt)
+        if locked_attempt.installed_activity_version_id is None:
+            raise ValueError("Attempt has no installed_activity_version execution source")
+
+        installed_activity = locked_attempt.installed_activity_version
+        context = open_pinned_context(installed_activity.package)
+
+        provider = activity_registry.get(installed_activity.type_key)
+        outcome = provider.evaluate(installed_activity.config, submission, context=context)
+        score, max_score = _validate_provider_outcome(outcome)
+
+        return _finalize_submission(
+            locked_attempt,
+            submission,
+            score,
+            max_score,
+            outcome,
+            activity_definition_public_id=installed_activity.activity_public_id,
+            activity_definition_id=None,
         )
 
-        return result
+
+def submit(attempt, submission, activity_registry):
+    """Source-dispatch entry point (T15-D27 S9): inspect the Attempt's own
+    execution source and route to the matching handler. Never
+    profile-based -- the decision is made from the Attempt row itself, so
+    it is correct regardless of which deployment profile happens to be
+    running the request.
+    """
+    if attempt.installed_activity_version_id is not None:
+        return submit_installed_attempt(attempt, submission, activity_registry)
+    return submit_attempt(attempt, submission, activity_registry)
