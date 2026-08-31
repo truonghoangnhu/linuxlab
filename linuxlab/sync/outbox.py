@@ -31,6 +31,7 @@ instead of resurrecting DELIVERED/DEAD_LETTER or clobbering the
 reclaiming worker's own transition.
 """
 
+import math
 import random
 import uuid
 from dataclasses import dataclass
@@ -61,18 +62,75 @@ from .models import (
 )
 
 
+class BackoffConfigurationError(Exception):
+    """Raised when LINUXLAB_SYNC_BACKOFF_BASE_SECONDS/CAP_SECONDS are not
+    both finite positive numbers with BASE strictly less than CAP.
+    Checkpoint corrective (finding #5): base.py only parses these into
+    floats -- it never validated the values themselves, so a
+    pathological configuration (e.g. BASE=999 > CAP=5, BASE == CAP, a
+    non-positive value, or NaN/Infinity) would otherwise be silently
+    accepted and could produce an immediate/past retry schedule or break
+    the T14-D41 strict-ordering guarantee below. Fails closed: raising
+    here leaves the caller's row(s) untouched rather than ever compute a
+    bogus delay."""
+
+
+def _validated_backoff_bounds():
+    """The single point every backoff computation in this module reads
+    LINUXLAB_SYNC_BACKOFF_BASE_SECONDS/CAP_SECONDS through. Read (and
+    re-validated) at call time so a test/operator settings change takes
+    effect immediately, same as before this corrective -- the only
+    change is that the values are now actually checked, not just
+    parsed."""
+    base = settings.LINUXLAB_SYNC_BACKOFF_BASE_SECONDS
+    cap = settings.LINUXLAB_SYNC_BACKOFF_CAP_SECONDS
+    for setting_name, value in (
+        ("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", base),
+        ("LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", cap),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise BackoffConfigurationError(
+                f"{setting_name} must be a finite positive number, got {value!r}"
+            )
+    if not base < cap:
+        raise BackoffConfigurationError(
+            f"LINUXLAB_SYNC_BACKOFF_BASE_SECONDS ({base}) must be strictly less "
+            f"than LINUXLAB_SYNC_BACKOFF_CAP_SECONDS ({cap})"
+        )
+    return base, cap
+
+
 def _configured_backoff_base_seconds():
     """Task 15: LINUXLAB_SYNC_BACKOFF_BASE_SECONDS actually drives
     ordinary transient retry timing (closing the accepted Task 14
     Minor -- this used to be a hardcoded module constant the setting
-    never reached). Read at call time so a test/operator settings
-    change takes effect immediately, with no separate validation
-    boundary to duplicate: base.py already parses/defaults it."""
-    return settings.LINUXLAB_SYNC_BACKOFF_BASE_SECONDS
+    never reached)."""
+    base, _cap = _validated_backoff_bounds()
+    return base
 
 
 def _configured_backoff_cap_seconds():
-    return settings.LINUXLAB_SYNC_BACKOFF_CAP_SECONDS
+    _base, cap = _validated_backoff_bounds()
+    return cap
+
+
+def _configured_protocol_fault_backoff_seconds():
+    """T14-D41 singleton-400 backoff. Checkpoint corrective (finding
+    #5): the ordinary transient path's full-jitter delay is
+    `ceiling * random_source()` with `ceiling = min(cap, base * 2**n)`,
+    so its worst-case ceiling can itself reach exactly `cap` -- a
+    bare-cap singleton delay could then tie with that worst-case ceiling
+    instead of staying strictly longer. Doubling the cap here is a
+    fixed, non-configurable multiplier (not a new operator-facing
+    setting) that keeps this always strictly greater than the ordinary
+    path's maximum possible ceiling, for any validated base/cap."""
+    _base, cap = _validated_backoff_bounds()
+    return cap * 2
 
 
 def _write_fenced(row, **changes):
@@ -313,9 +371,11 @@ def _release_singleton_protocol_fault(row, now):
     # PENDING rather than DEAD_LETTER. Deliberately tracks the
     # configured cap (Task 15) rather than a fixed number, but is read
     # independently of `base` -- it must never collapse to the ordinary
-    # transient schedule regardless of how `base` is configured.
+    # transient schedule regardless of how `base` is configured. See
+    # _configured_protocol_fault_backoff_seconds() for why this is 2x
+    # the cap, not the bare cap value (checkpoint corrective finding #5).
     now = now or timezone.now()
-    long_backoff_seconds = _configured_backoff_cap_seconds()
+    long_backoff_seconds = _configured_protocol_fault_backoff_seconds()
     _write_fenced(
         row,
         state=OUTBOX_PENDING,
