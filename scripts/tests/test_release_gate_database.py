@@ -502,7 +502,15 @@ def test_two_near_boundary_run_ids_never_collide_on_real_postgresql():
     (<=33-byte) run IDs that differ only in their very last character
     must produce genuinely distinct, non-colliding databases -- proving
     the byte bound is tight enough that PostgreSQL's own server-side
-    truncation can never merge two different runs' databases."""
+    truncation can never merge two different runs' databases.
+
+    Uses the `restore_central` role rather than `central`: its longer
+    prefix (`linuxlab_gate_restore_central_`) is what makes
+    MAX_GATE_RUN_ID_BYTES exactly 63 bytes once a run ID is appended --
+    the actual PostgreSQL NAMEDATALEN-1 identifier-truncation boundary.
+    The shorter `central` role never reaches that exact boundary, so it
+    could pass even if the truncation defense were subtly broken right
+    at the edge."""
     db_admin = _admin_connection()
     common_prefix = "r" + "a" * (MAX_GATE_RUN_ID_BYTES - 2)
     run_id_a = common_prefix + "x"
@@ -512,30 +520,32 @@ def test_two_near_boundary_run_ids_never_collide_on_real_postgresql():
 
     names_a = GateDatabaseNames.for_run(run_id_a)
     names_b = GateDatabaseNames.for_run(run_id_b)
-    assert names_a.central != names_b.central
+    assert len(names_a.restore_central.encode("ascii")) == 63
+    assert len(names_b.restore_central.encode("ascii")) == 63
+    assert names_a.restore_central != names_b.restore_central
 
-    create_database(db_admin, names_a, "central")
-    create_database(db_admin, names_b, "central")
+    create_database(db_admin, names_a, "restore_central")
+    create_database(db_admin, names_b, "restore_central")
     try:
-        with _connect(db_admin, names_a.central) as conn:
+        with _connect(db_admin, names_a.restore_central) as conn:
             conn.execute("SELECT 1")
-        with _connect(db_admin, names_b.central) as conn:
+        with _connect(db_admin, names_b.restore_central) as conn:
             conn.execute("SELECT 1")
 
-        drop_database(db_admin, names_b, "central")
+        drop_database(db_admin, names_b, "restore_central")
 
         with _connect(db_admin, "postgres") as conn:
             exists_a = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (names_a.central,)
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names_a.restore_central,)
             ).fetchone()
             exists_b = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (names_b.central,)
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names_b.restore_central,)
             ).fetchone()
         assert exists_a is not None, "run A must survive run B's drop -- no collision"
         assert exists_b is None
     finally:
-        drop_database(db_admin, names_a, "central")
-        drop_database(db_admin, names_b, "central")
+        drop_database(db_admin, names_a, "restore_central")
+        drop_database(db_admin, names_b, "restore_central")
 
 
 def test_generated_run_id_satisfies_grammar_and_byte_limit():
