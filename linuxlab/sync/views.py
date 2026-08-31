@@ -30,7 +30,12 @@ from django.urls import reverse
 from django.views import View
 
 from linuxlab.activities.default_registry import build_default_activity_registry
-from linuxlab.identity.services import ensure_learner, resolve_or_create_guest_learner
+from linuxlab.identity.services import (
+    ensure_learner,
+    resolve_existing_guest_learner,
+    resolve_existing_learner_for_account,
+    resolve_or_create_guest_learner,
+)
 from linuxlab.learning.services import get_attempt_by_public_id, start_installed_attempt, submit
 from linuxlab.quiz.provider import serialize_installed_assessment_for_learner
 from linuxlab.runtime.content import get_runtime_activity, get_runtime_publication
@@ -80,6 +85,14 @@ def _resolve_node_learner(request):
     """Resolve (or mint) the Learner identity for a Node HTTP
     request (T15-D27 S11, corrective identity-boundary finding).
 
+    CREATE-CAPABLE: reserved for ActivityStartView (POST /start/) only,
+    which is the one action that legitimately begins a new local
+    identity. Every other view authorizing access to an ALREADY-EXISTING
+    Attempt (AttemptView, AttemptSubmitView) must use the fully
+    read-only _resolve_existing_node_learner() below instead -- a denied
+    request must never create a Learner or a session as a side effect
+    (T15-D27 final corrective, read-only-authorization finding).
+
     This view owns only session binding and request orchestration; actual
     Learner resolution/creation is entirely delegated to the public
     linuxlab.identity services -- never a direct Learner.objects.create()/
@@ -104,6 +117,25 @@ def _resolve_node_learner(request):
     learner = resolve_or_create_guest_learner(public_id=request.session.get(_LEARNER_SESSION_KEY))
     request.session[_LEARNER_SESSION_KEY] = str(learner.public_id)
     return learner
+
+
+def _resolve_existing_node_learner(request):
+    """Fully READ-ONLY learner resolution for authorizing access to an
+    ALREADY-EXISTING Attempt (T15-D27 final corrective, read-only-
+    authorization finding): never creates a Learner, never writes to
+    `request.session`. Returns None if this request presents no
+    already-established identity at all -- callers must then deny (an
+    absent identity can never be treated as "no restriction").
+
+    Used by AttemptView (GET) and AttemptSubmitView (POST) only; POST
+    /start/ keeps using the create-capable _resolve_node_learner() above,
+    since starting a new Attempt is the one action that legitimately
+    begins a new local identity.
+    """
+    if request.user.is_authenticated:
+        return resolve_existing_learner_for_account(request.user)
+
+    return resolve_existing_guest_learner(public_id=request.session.get(_LEARNER_SESSION_KEY))
 
 
 def _resolve_activity_registry_provider(activity):
@@ -221,6 +253,10 @@ class AttemptView(View):
         if attempt is None or attempt.installed_activity_version_id is None:
             return render(request, "sync/learn_not_found.html", status=404)
 
+        learner = _resolve_existing_node_learner(request)
+        if learner is None or learner.pk != attempt.learner_id:
+            return HttpResponseForbidden("this Attempt does not belong to the current session")
+
         installed_activity = attempt.installed_activity_version
         context = open_pinned_context(installed_activity.package)
 
@@ -278,8 +314,8 @@ class AttemptSubmitView(View):
         if attempt is None or attempt.installed_activity_version_id is None:
             return JsonResponse({"error": "not found"}, status=404)
 
-        learner = _resolve_node_learner(request)
-        if learner.pk != attempt.learner_id:
+        learner = _resolve_existing_node_learner(request)
+        if learner is None or learner.pk != attempt.learner_id:
             return JsonResponse({"error": "forbidden"}, status=403)
 
         activity_registry = build_default_activity_registry()

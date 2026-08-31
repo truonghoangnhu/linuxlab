@@ -11,12 +11,18 @@ import uuid
 from unittest.mock import patch
 
 import pytest
+from django.contrib.sessions.models import Session
 from django.test import Client, override_settings
 
 from linuxlab.core.models import DomainEvent
-from linuxlab.identity.services import resolve_or_create_guest_learner
-from linuxlab.learning.models import Attempt, Progress
+from linuxlab.identity.models import Learner
+from linuxlab.identity.services import (
+    resolve_existing_guest_learner,
+    resolve_or_create_guest_learner,
+)
+from linuxlab.learning.models import Attempt, Progress, Result
 from linuxlab.publication.package import build_package
+from linuxlab.sync.models import OutboxMessage
 from linuxlab.sync.services import activate_package, import_package
 
 from .conftest import republish
@@ -430,3 +436,105 @@ def test_same_session_can_start_then_submit_its_own_attempt(quiz_world, keypair)
     )
 
     assert response.status_code == 200
+
+
+# --- T15-D27 final corrective: read-only authorization, zero mutation on deny
+
+
+def _mutation_snapshot():
+    return {
+        "Learner": Learner.objects.count(),
+        "Session": Session.objects.count(),
+        "Attempt": Attempt.objects.count(),
+        "Result": Result.objects.count(),
+        "Progress": Progress.objects.count(),
+        "DomainEvent": DomainEvent.objects.count(),
+        "OutboxMessage": OutboxMessage.objects.count(),
+    }
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_wrong_session_get_denies_and_mutates_nothing(quiz_world, keypair):
+    """GET on an existing Attempt must enforce ownership (it previously
+    did not) and a denied GET must leave zero trace: no Learner created,
+    no session row created, no business/event/outbox state touched."""
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    owner_client = Client()
+    attempt = _start_attempt(owner_client, quiz_world)
+
+    other_client = Client()
+    before = _mutation_snapshot()
+
+    response = other_client.get(_attempt_url(attempt))
+
+    after = _mutation_snapshot()
+    assert response.status_code in (403, 404)
+    assert after == before
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_wrong_session_submit_denies_and_mutates_nothing(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    owner_client = Client()
+    attempt = _start_attempt(owner_client, quiz_world)
+
+    other_client = Client()
+    before = _mutation_snapshot()
+
+    response = other_client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    )
+
+    after = _mutation_snapshot()
+    assert response.status_code == 403
+    assert after == before
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_owner_can_still_get_their_own_attempt(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
+
+    response = client.get(_attempt_url(attempt))
+
+    assert response.status_code == 200
+    rendered = response.content.decode()
+    assert "answer_key" not in rendered
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_attempt_get_and_submit_delegate_to_the_read_only_identity_service(quiz_world, keypair):
+    """The existing-Attempt authorization path must resolve identity
+    through resolve_existing_guest_learner() -- never
+    resolve_or_create_guest_learner() (the create-capable service, which
+    remains reserved for POST /start/ only)."""
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
+
+    with patch(
+        "linuxlab.sync.views.resolve_existing_guest_learner", wraps=resolve_existing_guest_learner
+    ) as spy:
+        get_response = client.get(_attempt_url(attempt))
+    assert get_response.status_code == 200
+    spy.assert_called_once()
+
+    with patch(
+        "linuxlab.sync.views.resolve_existing_guest_learner", wraps=resolve_existing_guest_learner
+    ) as spy:
+        submit_response = client.post(
+            _attempt_submit_url(attempt),
+            data=json.dumps(_correct_submission(quiz_world)),
+            content_type="application/json",
+        )
+    assert submit_response.status_code == 200
+    spy.assert_called_once()

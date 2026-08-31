@@ -29,3 +29,32 @@ def resolve_or_create_guest_learner(*, public_id=None):
             return learner
 
     return Learner.objects.create(account=None)
+
+
+def resolve_existing_guest_learner(*, public_id=None):
+    """Fully read-only counterpart to resolve_or_create_guest_learner()
+    (T15-D27 final corrective, read-only-authorization finding): resolves
+    an EXISTING guest Learner (account=None) by its stable public_id, or
+    None -- never creates a Learner. For authorizing access to an
+    already-existing resource (e.g. an existing Attempt), where a denied
+    request must leave zero trace: no new Learner row and no new session
+    state.
+
+    Never returns an Account-backed Learner even if `public_id` happens
+    to match one -- an arbitrary/forged public_id can never authorize as
+    someone else's registered identity.
+    """
+    if public_id is None:
+        return None
+    return Learner.objects.filter(public_id=public_id, account__isnull=True).first()
+
+
+def resolve_existing_learner_for_account(account):
+    """Fully read-only counterpart to ensure_learner() (T15-D27 final
+    corrective, read-only-authorization finding): resolves the EXISTING
+    Learner linked to `account`, or None if none exists yet -- never
+    creates one. For authorizing access to an already-existing resource
+    without side-effecting a first-time Learner creation."""
+    if account is None:
+        return None
+    return Learner.objects.filter(account=account).first()

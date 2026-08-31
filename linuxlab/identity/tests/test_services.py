@@ -8,7 +8,12 @@ import uuid
 import pytest
 
 from linuxlab.identity.models import Account, Learner
-from linuxlab.identity.services import ensure_learner, resolve_or_create_guest_learner
+from linuxlab.identity.services import (
+    ensure_learner,
+    resolve_existing_guest_learner,
+    resolve_existing_learner_for_account,
+    resolve_or_create_guest_learner,
+)
 
 
 @pytest.mark.django_db
@@ -58,3 +63,69 @@ def test_resolve_or_create_guest_learner_is_idempotent_for_repeated_calls_with_t
 
     assert Learner.objects.filter(public_id=first.public_id).count() == 1
     assert third.pk == first.pk
+
+
+# --- read-only resolution for authorizing an EXISTING Attempt -------------
+# (T15-D27 final corrective, read-only-authorization finding: must never
+# create a Learner as a side effect of a denied request)
+
+
+@pytest.mark.django_db
+def test_resolve_existing_guest_learner_returns_none_for_unknown_public_id():
+    learner = resolve_existing_guest_learner(public_id=uuid.uuid4())
+
+    assert learner is None
+    assert Learner.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_resolve_existing_guest_learner_returns_none_for_missing_public_id():
+    learner = resolve_existing_guest_learner(public_id=None)
+
+    assert learner is None
+    assert Learner.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_resolve_existing_guest_learner_returns_the_existing_row():
+    existing = resolve_or_create_guest_learner(public_id=None)
+    before_count = Learner.objects.count()
+
+    learner = resolve_existing_guest_learner(public_id=existing.public_id)
+
+    assert learner is not None
+    assert learner.pk == existing.pk
+    assert Learner.objects.count() == before_count
+
+
+@pytest.mark.django_db
+def test_resolve_existing_guest_learner_never_returns_an_account_backed_learner():
+    account = Account.objects.create_user(username="bob")
+    account_learner = ensure_learner(account)
+
+    learner = resolve_existing_guest_learner(public_id=account_learner.public_id)
+
+    assert learner is None
+
+
+@pytest.mark.django_db
+def test_resolve_existing_learner_for_account_returns_none_when_none_exists():
+    account = Account.objects.create_user(username="carol")
+
+    learner = resolve_existing_learner_for_account(account)
+
+    assert learner is None
+    assert Learner.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_resolve_existing_learner_for_account_returns_the_existing_row():
+    account = Account.objects.create_user(username="dave")
+    existing = ensure_learner(account)
+    before_count = Learner.objects.count()
+
+    learner = resolve_existing_learner_for_account(account)
+
+    assert learner is not None
+    assert learner.pk == existing.pk
+    assert Learner.objects.count() == before_count
