@@ -1,81 +1,128 @@
-"""T15-D27 corrective (Task 5, "fresh migration tests"): the `learning`
-app's migration graph -- including 0002_t15d27_installed_execution_source
-and its transitive activities/identity/sync dependencies -- applies
-cleanly to a genuinely empty PostgreSQL database (no legacy data, never
-touching the shared "default" test database), and the resulting schema
-physically has the XOR CheckConstraint PostgreSQL itself will enforce.
+"""T15-D27 final corrective (fresh-migration finding): the FULL migration
+graph -- every INSTALLED_APPS app, including wagtailcore and every other
+app the leaf-only proof deliberately skipped -- applies cleanly, under
+BOTH the real Central and the real Node deployment profile, exactly as an
+operator running `manage.py migrate --noinput` on a brand-new deployment
+would apply it.
 
-Central and Node share one codebase and one migration graph (ADR-002,
-ADR-008): INSTALLED_APPS is not profile-conditional, so there is exactly
-one schema to prove here, not two -- a Central-profile and a Node-profile
-deployment migrating from zero apply the identical set of migrations to
-an identical resulting schema; only runtime settings values (e.g.
-LINUXLAB_CAN_AUTHOR) differ between profiles, never the schema itself.
+Deliberately invokes `manage.py migrate` as a genuine separate
+subprocess (never Django's in-process MigrationExecutor/call_command
+against an alias registered on this already-running pytest process): an
+in-process multi-database migrate was found to trip a Wagtail
+post_migrate signal-routing quirk unrelated to any real migration defect
+-- confirmed by running the identical `manage.py migrate --noinput`
+command as a real subprocess against the same scratch database, which
+succeeds cleanly. Using a real subprocess is both the fix for that false
+signal and a more faithful proof of the actual operator workflow.
 
-Deliberately targets only `learning`'s own leaf node (via MigrationExecutor,
-not `manage.py migrate`'s full-INSTALLED_APPS sweep): learning's migrations
-transitively depend on activities/identity/sync only, never on
-content/wagtailcore, so this never needs to run Wagtail's own migrations
-or post_migrate signal handlers at all.
+Each test creates and drops its own uniquely-named scratch PostgreSQL
+database via direct psycopg admin connections -- never
+MigrationExecutor, never call_command -- so the shared pytest test
+database's schema is never at any risk of being touched, let alone
+rolled backward. Central and Node share one INSTALLED_APPS (ADR-002,
+ADR-008), so this is the same full graph proven twice, once per real
+settings module, not two different graphs.
 """
 
+import os
+import subprocess
 import uuid
 
 import psycopg
-import pytest
 from django.conf import settings
-from django.db import connections
-from django.db.migrations.executor import MigrationExecutor
+
+_REPO_ROOT = str(settings.BASE_DIR)
+_PYTHON = os.path.join(_REPO_ROOT, ".venv", "bin", "python")
+
+
+def _connection_params(db_name):
+    db = settings.DATABASES["default"]
+    return {
+        "user": db["USER"],
+        "password": db["PASSWORD"],
+        "host": db["HOST"],
+        "port": db["PORT"],
+        "dbname": db_name,
+    }
 
 
 def _admin_connect():
-    db = settings.DATABASES["default"]
-    return psycopg.connect(
-        dbname="postgres",
-        user=db["USER"],
-        password=db["PASSWORD"],
-        host=db["HOST"],
-        port=db["PORT"],
-        autocommit=True,
+    return psycopg.connect(**_connection_params("postgres"), autocommit=True)
+
+
+def _create_scratch_database(name):
+    with _admin_connect() as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE DATABASE "{name}"')
+
+
+def _drop_scratch_database(name):
+    with _admin_connect() as conn, conn.cursor() as cur:
+        cur.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def _run_full_migrate(settings_module, db_name):
+    """A real, separate `manage.py migrate --noinput` process -- exactly
+    the command an operator deploying a brand-new Central or Node
+    instance would run, never an in-process shortcut."""
+    env = {**os.environ, "DJANGO_SETTINGS_MODULE": settings_module, "POSTGRES_DB": db_name}
+    return subprocess.run(
+        [_PYTHON, "manage.py", "migrate", "--noinput"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
     )
 
 
-def _constraint_exists(alias, table_name, constraint_name):
-    with connections[alias].cursor() as cursor:
-        cursor.execute(
-            "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
-            [constraint_name, table_name],
+def _column_exists(cursor, table_name, column_name):
+    cursor.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
+        [table_name, column_name],
+    )
+    return cursor.fetchone() is not None
+
+
+def _constraint_exists(cursor, table_name, constraint_name):
+    cursor.execute(
+        "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
+        [constraint_name, table_name],
+    )
+    return cursor.fetchone() is not None
+
+
+def _assert_t15d27_schema(db_name):
+    with psycopg.connect(**_connection_params(db_name)) as conn, conn.cursor() as cursor:
+        assert _column_exists(cursor, "learning_attempt", "activity_version_id")
+        assert _column_exists(cursor, "learning_attempt", "installed_activity_version_id")
+        assert _column_exists(cursor, "learning_progress", "activity_definition_public_id")
+
+        assert _constraint_exists(
+            cursor, "learning_attempt", "attempt_exactly_one_execution_source"
         )
-        return cursor.fetchone() is not None
+        assert _constraint_exists(
+            cursor, "learning_progress", "unique_progress_per_learner_activity_public_id"
+        )
 
 
-@pytest.mark.django_db(transaction=True)
-def test_fresh_database_migrates_cleanly_with_the_t15d27_constraint_present(django_db_blocker):
-    name = f"test_fresh_migration_{uuid.uuid4().hex[:8]}"
-    alias = f"fresh_migration_{uuid.uuid4().hex[:8]}"
-
-    with _admin_connect() as admin_conn, admin_conn.cursor() as cursor:
-        cursor.execute(f'CREATE DATABASE "{name}"')
-
-    settings.DATABASES[alias] = {**settings.DATABASES["default"], "NAME": name}
-
+def _run_fresh_full_migration_proof(settings_module, db_prefix):
+    db_name = f"test_fresh_{db_prefix}_{uuid.uuid4().hex[:8]}"
+    _create_scratch_database(db_name)
     try:
-        with django_db_blocker.unblock():
-            executor = MigrationExecutor(connections[alias])
-            # The real "learning" migration graph, from zero, exactly as
-            # an operator deploying a brand-new Central or Node instance
-            # would apply it -- never a hand-picked migration subset.
-            executor.migrate(executor.loader.graph.leaf_nodes("learning"))
-
-            assert _constraint_exists(
-                alias, "learning_attempt", "attempt_exactly_one_execution_source"
-            )
-            assert _constraint_exists(
-                alias, "learning_progress", "unique_progress_per_learner_activity_public_id"
-            )
+        result = _run_full_migrate(settings_module, db_name)
+        assert result.returncode == 0, (
+            f"manage.py migrate --noinput failed (exit {result.returncode}):\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+        _assert_t15d27_schema(db_name)
     finally:
-        connections[alias].close()
-        del connections[alias]
-        del connections.databases[alias]
-        with _admin_connect() as admin_conn, admin_conn.cursor() as cursor:
-            cursor.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        _drop_scratch_database(db_name)
+
+
+def test_fresh_central_migration_reaches_leaf_with_t15d27_constraints():
+    _run_fresh_full_migration_proof("linuxlab.settings.central", "central")
+
+
+def test_fresh_node_migration_reaches_leaf_with_t15d27_constraints():
+    _run_fresh_full_migration_proof("linuxlab.settings.node", "node")
