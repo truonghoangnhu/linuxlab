@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Activity</title>
+</head>
+<body>
+  <h1>Activity {{ payload.activity_public_id }} v{{ payload.activity_version }}</h1>
+  <p>Installed package version {{ runtime_context.package_version }}</p>
+
+  <form id="linuxlab-activity-submit">
+    {% csrf_token %}
+    {% for question in payload.questions %}
+      <fieldset>
+        <legend>{{ question.prompt }}</legend>
+        {% for option in question.options %}
+          <label>
+            <input
+              type="radio"
+              name="response-{{ forloop.parentloop.counter0 }}"
+              value="{{ option.id }}"
+              data-question-public-id="{{ question.question_public_id }}"
+              data-question-version="{{ question.question_version }}"
+            >
+            {{ option.text }}
+          </label>
+        {% endfor %}
+      </fieldset>
+    {% endfor %}
+    <button type="submit">Submit</button>
+  </form>
+  <p id="linuxlab-activity-result"></p>
+
+  <script>
+    document.getElementById("linuxlab-activity-submit").addEventListener("submit", function (event) {
+      event.preventDefault();
+      var form = event.target;
+      var csrfToken = form.querySelector("[name=csrfmiddlewaretoken]").value;
+      var responses = [];
+      var seen = {};
+      Array.prototype.forEach.call(form.querySelectorAll("input[type=radio]:checked"), function (input) {
+        var key = input.dataset.questionPublicId + ":" + input.dataset.questionVersion;
+        if (seen[key]) {
+          return;
+        }
+        seen[key] = true;
+        responses.push({
+          question_public_id: input.dataset.questionPublicId,
+          question_version: parseInt(input.dataset.questionVersion, 10),
+          selected_option_id: input.value
+        });
+      });
+
+      fetch("{{ submit_url }}", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken
+        },
+        body: JSON.stringify({ responses: responses })
+      })
+        .then(function (response) { return response.json(); })
+        .then(function (data) {
+          document.getElementById("linuxlab-activity-result").textContent = JSON.stringify(data);
+        });
+    });
+  </script>
+</body>
+</html>

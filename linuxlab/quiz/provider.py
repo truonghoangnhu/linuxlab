@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Mapping
 
 from linuxlab.activities.contracts import ActivityDependencies
 from linuxlab.assessment.models import QuestionVersion
@@ -27,7 +28,13 @@ def _validate_completion_threshold(value):
 
 
 def _parse_question_ref(item):
-    if not isinstance(item, dict):
+    # Mapping, not dict: config may arrive either as an ordinary dict
+    # (Central authoring/validation) or as a frozen MappingProxyType (Node
+    # RuntimeActivity.config, via linuxlab.runtime.freeze.freeze_json_value
+    # -- T15-D27). Both satisfy Mapping; dict does not satisfy
+    # MappingProxyType's own isinstance check, so this must not be
+    # narrowed back to dict.
+    if not isinstance(item, Mapping):
         # ValueError, not TypeError: untrusted config shape validation, same
         # domain-error contract as the rest of this module.
         raise ValueError("each question reference must be an object")  # noqa: TRY004
@@ -241,5 +248,46 @@ def serialize_assessment_for_learner(activity_version, question_registry):
     return {
         "activity_public_id": str(activity_version.definition.public_id),
         "activity_version": activity_version.version,
+        "questions": questions,
+    }
+
+
+def serialize_installed_assessment_for_learner(context, activity, question_registry):
+    """Node counterpart to serialize_assessment_for_learner() (T15-D27
+    S8, S11): renders a learner-safe payload for an installed
+    (RuntimeActivity) assessment activity, resolving each question from
+    the pinned InstalledPackage via linuxlab.runtime.content -- never the
+    live authoring QuestionVersion table.
+    """
+    if activity.type_key != AssessmentActivityProvider.type_key:
+        raise ValueError("InstalledActivityVersion is not an assessment activity")
+
+    # Local import: same Node-only-path reasoning as evaluate()/
+    # _resolve_question() above.
+    from linuxlab.runtime.content import get_runtime_question
+
+    questions = []
+    for item in activity.config["questions"]:
+        question_public_id, version = _parse_question_ref(item)
+        runtime_question = get_runtime_question(context, question_public_id, version)
+        provider = question_registry.get(runtime_question.type_key)
+        payload = provider.learner_payload(runtime_question.content)
+
+        if "question_public_id" in payload or "question_version" in payload:
+            raise ValueError(
+                "provider learner_payload must not define question_public_id/question_version"
+            )
+
+        questions.append(
+            {
+                **payload,
+                "question_public_id": str(runtime_question.question_public_id),
+                "question_version": runtime_question.version,
+            }
+        )
+
+    return {
+        "activity_public_id": str(activity.activity_public_id),
+        "activity_version": activity.version,
         "questions": questions,
     }
