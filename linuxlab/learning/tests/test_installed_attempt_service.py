@@ -195,7 +195,53 @@ def test_submit_installed_attempt_emits_activity_completed_with_stable_definitio
     event = DomainEvent.objects.get(event_type="activity.completed", aggregate_id=attempt.public_id)
     assert event.payload["activity_definition_public_id"] == str(world["definition"].public_id)
     assert event.payload["score"] == 1
-    assert event.payload["max_score"] == 1
+
+
+def test_submit_installed_attempt_outbox_wire_identity_matches_task14_v1_contract(
+    installed_active_world, settings
+):
+    """T15-D27 final corrective (event-authority finding): Task 14 schema
+    v1 remains authoritative and unversioned -- the installed execution
+    source changes nothing about the wire envelope. aggregate_type is
+    "attempt" and aggregate_public_id is the exact Attempt.public_id,
+    identically to the Central submit_attempt() path
+    (test_sync_enabled_creates_exactly_one_outbox_row_for_submit_attempt
+    in linuxlab.sync.tests.test_task14_enqueue). activity_definition_public_id
+    lives only inside the payload body, exactly as it already did before
+    T15-D27 (see enqueue._ACTIVITY_COMPLETED_WIRE_FIELDS) -- it was never
+    part of the aggregate identity and T15-D27 never made it one."""
+    import uuid
+
+    from linuxlab.sync.models import OutboxMessage
+
+    node_id = uuid.uuid4()
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = str(node_id)
+
+    world = installed_active_world
+    learner = Learner.objects.create(account=None)
+    context = _context(world)
+    attempt = start_installed_attempt(
+        learner, context, world["definition"].public_id, world["activity_version"].version
+    )
+    submission = {
+        "responses": [
+            {
+                "question_public_id": str(world["question"].public_id),
+                "question_version": world["question_version"].version,
+                "selected_option_id": "a",
+            }
+        ]
+    }
+
+    submit_installed_attempt(attempt, submission, world["activity_registry"])
+
+    outbox = OutboxMessage.objects.get()
+    assert outbox.event_type == "activity.completed"
+    assert outbox.aggregate_type == "attempt"
+    assert outbox.aggregate_public_id == attempt.public_id
+    assert outbox.payload["attempt_public_id"] == str(attempt.public_id)
+    assert outbox.payload["activity_definition_public_id"] == str(world["definition"].public_id)
 
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)

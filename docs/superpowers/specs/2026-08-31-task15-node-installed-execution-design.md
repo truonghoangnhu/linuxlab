@@ -286,12 +286,29 @@ activity.completed
 
 It is enqueued in the same transaction as Result/Progress persistence.
 
-Use stable UUIDs only:
+T15-D27 final corrective: Task 14 schema v1 remains the sole authority for
+this event's wire identity and is unchanged by installed execution. There
+is no event schema v2 and no separate aggregate identity for the
+installed source. The already-shipped Task 14 v1 contract is:
 
 ```
-aggregate_type = "activity"
-aggregate_public_id = activity_definition_public_id
+event_type = "activity.completed"
+aggregate_type = "attempt"
+aggregate_public_id = attempt_public_id
 ```
+
+identically for both the Central and the Node installed execution source
+-- an installed Attempt is still an Attempt, and Task 14's Outbox/Inbox
+idempotency and ingestion validation already key on exactly this
+`(event_type, aggregate_type, aggregate_public_id)` triple. Widening the
+aggregate identity to the activity definition would require an
+incompatible Central Inbox/ingestion change this amendment does not make.
+
+`activity_definition_public_id` is not part of the aggregate identity. It
+is, and always was (pre-dating T15-D27), one payload field inside the
+existing wire envelope (`enqueue._ACTIVITY_COMPLETED_WIRE_FIELDS`), used
+by Progress's stable-UUID keying (S4.3) -- carried at the payload level
+exactly as before, never promoted to the aggregate.
 
 Do not include local Installed* PKs, answer keys, grading secrets, signing material, or auth secrets.
 
