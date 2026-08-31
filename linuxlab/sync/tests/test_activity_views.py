@@ -5,11 +5,13 @@ mid-request, and never exposing grading material."""
 
 import json
 import uuid
+from unittest.mock import patch
 
 import pytest
 from django.test import Client, override_settings
 
 from linuxlab.core.models import DomainEvent
+from linuxlab.identity.services import resolve_or_create_guest_learner
 from linuxlab.learning.models import Attempt, Progress
 from linuxlab.publication.package import build_package
 from linuxlab.sync.services import activate_package, import_package
@@ -95,6 +97,39 @@ def test_get_activity_route_rejected_under_central_profile(quiz_world, keypair):
     response = Client().get(_activity_url(quiz_world))
 
     assert response.status_code == 403
+
+
+# --- identity boundary (T15-D27 corrective) ---------------------------------
+
+
+def test_sync_views_module_never_references_the_learner_model_directly():
+    """sync.views owns only session binding/request orchestration; Learner
+    resolution/creation must be entirely delegated to the public
+    linuxlab.identity services (ensure_learner()/
+    resolve_or_create_guest_learner()) -- this module must not import or
+    reference the Learner model itself at all."""
+    import linuxlab.sync.views as sync_views
+
+    assert not hasattr(sync_views, "Learner")
+    assert "Learner" not in sync_views.__dict__
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_anonymous_submit_delegates_learner_resolution_to_identity_service(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    with patch(
+        "linuxlab.sync.views.resolve_or_create_guest_learner", wraps=resolve_or_create_guest_learner
+    ) as spy:
+        response = Client().post(
+            _submit_url(quiz_world),
+            data=json.dumps(_correct_submission(quiz_world)),
+            content_type="application/json",
+        )
+
+    assert response.status_code == 200
+    spy.assert_called_once()
 
 
 # --- POST submit route -------------------------------------------------------

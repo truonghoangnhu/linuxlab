@@ -21,8 +21,7 @@ from django.shortcuts import render
 from django.views import View
 
 from linuxlab.activities.default_registry import build_default_activity_registry
-from linuxlab.identity.models import Learner
-from linuxlab.identity.services import ensure_learner
+from linuxlab.identity.services import ensure_learner, resolve_or_create_guest_learner
 from linuxlab.learning.services import start_installed_attempt, submit_installed_attempt
 from linuxlab.quiz.provider import serialize_installed_assessment_for_learner
 from linuxlab.runtime.content import get_runtime_activity, get_runtime_publication
@@ -70,32 +69,30 @@ class LearnView(View):
 
 def _resolve_node_learner(request):
     """Resolve (or mint) the Learner identity for a Node HTTP
-    request (T15-D27 S11).
+    request (T15-D27 S11, corrective identity-boundary finding).
+
+    This view owns only session binding and request orchestration; actual
+    Learner resolution/creation is entirely delegated to the public
+    linuxlab.identity services -- never a direct Learner.objects.create()/
+    filter() call here.
 
     An authenticated request resolves through the existing public
     ensure_learner() service (ADR-006/ADR-012), unchanged from the Task 08
-    Central claim flow. An anonymous request gets a fresh guest Learner
-    (account=None -- the same shape Learner already supports, ADR-012),
-    remembered in the session so a GET-then-POST from the same browser
-    reuses one identity rather than minting a new Learner per request.
-    Node classroom practice is local-first learning (architecture spec
-    S5.2/S11.1): unlike Central's client-side-only guest quiz flow
-    (Task 08), a Node installed Attempt is always a real server-side
-    record -- that IS what "Node execution source" means -- so an
-    anonymous learner still needs a real local Learner row to attach it
-    to.
+    Central claim flow. An anonymous request resolves through
+    resolve_or_create_guest_learner(), keyed by whatever public_id this
+    same session previously stored (never a caller-posted value) so a
+    GET-then-POST from the same browser reuses one identity rather than
+    minting a new Learner per request. Node classroom practice is
+    local-first learning (architecture spec S5.2/S11.1): unlike Central's
+    client-side-only guest quiz flow (Task 08), a Node installed Attempt
+    is always a real server-side record -- that IS what "Node execution
+    source" means -- so an anonymous learner still needs a real local
+    Learner row to attach it to.
     """
-    learner_public_id = request.session.get(_LEARNER_SESSION_KEY)
-    if learner_public_id:
-        learner = Learner.objects.filter(public_id=learner_public_id).first()
-        if learner is not None:
-            return learner
-
     if request.user.is_authenticated:
-        learner = ensure_learner(request.user)
-    else:
-        learner = Learner.objects.create(account=None)
+        return ensure_learner(request.user)
 
+    learner = resolve_or_create_guest_learner(public_id=request.session.get(_LEARNER_SESSION_KEY))
     request.session[_LEARNER_SESSION_KEY] = str(learner.public_id)
     return learner
 
