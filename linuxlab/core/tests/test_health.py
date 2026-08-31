@@ -120,6 +120,149 @@ def test_readyz_response_never_contains_exception_or_config_detail(client):
     assert "Traceback" not in body_text
 
 
+# --- /readyz: Node sync configuration (checkpoint corrective finding #4) ---
+
+
+def test_readyz_success_when_sync_disabled_even_with_no_node_config(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = False
+    settings.LINUXLAB_NODE_ID = None
+    settings.LINUXLAB_SYNC_SECRET = None
+    settings.LINUXLAB_CENTRAL_URL = None
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+
+
+def test_readyz_success_when_sync_enabled_with_full_valid_node_config(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+
+
+def test_readyz_503_when_sync_enabled_and_node_id_missing(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = None
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
+def test_readyz_503_when_sync_enabled_and_node_id_is_not_a_valid_uuid(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "not-a-uuid"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_503_when_sync_enabled_and_secret_missing(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = None
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_503_when_sync_enabled_and_secret_is_whitespace_only(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "   "
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_503_when_sync_enabled_and_central_url_missing(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = None
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_503_when_sync_enabled_and_central_url_has_no_scheme(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_503_when_sync_enabled_and_central_url_has_wrong_scheme(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "ftp://central.example.org"
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+
+
+def test_readyz_never_requires_node_sync_config_on_a_profile_that_cannot_run_the_worker(
+    client, settings
+):
+    """Central must never require Node-only sync configuration, even if
+    LINUXLAB_SYNC_ENABLED is somehow set -- gated on
+    LINUXLAB_CAN_RUN_SYNC_WORKER (a fixed profile capability), not a
+    LINUXLAB_PROFILE string comparison."""
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = False
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = None
+    settings.LINUXLAB_SYNC_SECRET = None
+    settings.LINUXLAB_CENTRAL_URL = None
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+
+
+def test_readyz_sync_configuration_check_makes_no_external_http_request(client, settings):
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = "b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10"
+    settings.LINUXLAB_SYNC_SECRET = "a-real-bearer-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+    with patch("socket.create_connection", side_effect=AssertionError("no network access")):
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+
+
 def test_readyz_never_mutates_migration_state(client):
     """evaluate_readiness() must be read-only: it must never call
     Django's migrate executor's apply_migrations()/unapply_migrations(),
