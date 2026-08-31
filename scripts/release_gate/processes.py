@@ -7,11 +7,19 @@ identity. The parent reserves a real bound+listening loopback socket
 inherits that EXACT file descriptor (`--bind fd://<fd>`, `pass_fds`)
 rather than being told a bare port number to rebind by itself, so
 there is no window in which an unrelated process could occupy that
-port between reservation and Gunicorn's own bind. wait_ready()
-additionally takes the ManagedProcess handle and fails immediately if
-that exact child has already exited, so a healthy-looking response
-from an unrelated service can never satisfy readiness for a child that
-never became (or stopped being) that listener's owner.
+port between reservation and Gunicorn's own bind.
+
+Checkpoint corrective 2 (finding #2): FD inheritance alone was not
+enough -- wait_ready() still took an INDEPENDENT `base_url` argument
+alongside `managed_process`, so a fake service could be probed while an
+unrelated live child satisfied the liveness check, producing a false
+PASS. wait_ready() now takes ONLY a ManagedProcess: the readiness URL
+is derived exclusively from that handle's own inherited listener
+(`managed_process.base_url`), and the handle itself must be authentic
+-- produced by start_gunicorn(), the only supported producer, never
+hand-built by a caller. Liveness is re-checked immediately before every
+probe AND immediately after a successful one, closing the child-exit
+race on both sides of the HTTP round trip.
 """
 
 import json
@@ -22,13 +30,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 class StartupError(Exception):
     """Raised when a managed process fails to become ready within its
-    timeout, or has already exited. Maps to STARTUP_FAILURE (exit 3)."""
+    timeout, has already exited, or is not an authentic
+    start_gunicorn()-produced handle. Maps to STARTUP_FAILURE (exit 3)."""
 
 
 def reserve_local_port() -> int:
@@ -61,11 +70,42 @@ def reserve_listener(host: str = "127.0.0.1") -> ReservedListener:
     return ReservedListener(sock=sock, host=host, port=port)
 
 
-@dataclass
+# Identifies a ManagedProcess as genuinely produced by start_gunicorn()
+# in THIS process. Defense in depth only -- the real safety property is
+# that wait_ready() derives its probe URL exclusively from the handle's
+# own listener_host/listener_port, never from independent caller input,
+# so there is no longer any way to point the probe at one service while
+# checking liveness against an unrelated process.
+_MANAGED_PROCESS_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
 class ManagedProcess:
+    """An authentic handle to a Gunicorn child bound to a specific
+    inherited listener. The ONLY supported producer is start_gunicorn()
+    -- there is no public keyword constructor -- so a caller can never
+    hand wait_ready() a plausible-looking handle that does not actually
+    correspond to a process this module started."""
+
     popen: subprocess.Popen
-    port: int
+    listener_host: str
+    listener_port: int
     log_path: Path | None
+    _launcher_token: object = field(repr=False, compare=False)
+
+    @classmethod
+    def _produced_by_start_gunicorn(cls, *, popen, listener_host, listener_port, log_path):
+        obj = object.__new__(cls)
+        object.__setattr__(obj, "popen", popen)
+        object.__setattr__(obj, "listener_host", listener_host)
+        object.__setattr__(obj, "listener_port", listener_port)
+        object.__setattr__(obj, "log_path", log_path)
+        object.__setattr__(obj, "_launcher_token", _MANAGED_PROCESS_TOKEN)
+        return obj
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.listener_host}:{self.listener_port}"
 
 
 def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, repo_root=None, workers=1):
@@ -94,41 +134,65 @@ def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, r
     ]
     child_env = {**os.environ, **profile_env}
     popen = subprocess.Popen(argv, cwd=str(repo_root), env=child_env, pass_fds=(fd,))
+    host, port = listener.host, listener.port
     listener.sock.close()
-    return ManagedProcess(popen=popen, port=listener.port, log_path=log_path)
+    return ManagedProcess._produced_by_start_gunicorn(
+        popen=popen, listener_host=host, listener_port=port, log_path=log_path
+    )
+
+
+def _require_authentic_managed_process(managed_process) -> None:
+    if (
+        not isinstance(managed_process, ManagedProcess)
+        or getattr(managed_process, "_launcher_token", None) is not _MANAGED_PROCESS_TOKEN
+    ):
+        raise StartupError(
+            "wait_ready() requires an authentic ManagedProcess produced by "
+            "start_gunicorn() -- a hand-built or forged handle is never accepted"
+        )
 
 
 def wait_ready(
-    base_url: str,
+    managed_process: ManagedProcess,
     timeout_seconds: float,
     *,
     poll_interval_seconds: float = 0.2,
-    managed_process: ManagedProcess | None = None,
 ) -> None:
-    """Poll `<base_url>/readyz` until it returns 200 with
-    {"status": "ok"}, or raise StartupError once `timeout_seconds` has
-    elapsed. If `managed_process` is given, fail immediately (never
-    wait out the timeout) the moment that EXACT child has exited --
-    a healthy-looking response from an unrelated service on the same
-    port can never be mistaken for that child's own readiness."""
+    """Poll `managed_process.base_url + "/readyz"` until it returns 200
+    with {"status": "ok"}, or raise StartupError once `timeout_seconds`
+    has elapsed. There is deliberately no independent `base_url`
+    parameter: the probe target is derived exclusively from the
+    authentic handle's own inherited listener, so a caller can never
+    probe one endpoint while `managed_process` liveness-checks an
+    unrelated process. Liveness is checked immediately before every
+    probe AND immediately after a successful one -- a child that exits
+    in either window never yields a false readiness PASS."""
+    _require_authentic_managed_process(managed_process)
     deadline = time.monotonic() + timeout_seconds
     last_error = "no attempt made"
-    url = base_url.rstrip("/") + "/readyz"
+    url = managed_process.base_url.rstrip("/") + "/readyz"
 
     while time.monotonic() < deadline:
-        if managed_process is not None:
-            exit_code = managed_process.popen.poll()
-            if exit_code is not None:
-                raise StartupError(
-                    f"managed process for {url} exited (code {exit_code}) before "
-                    "becoming ready -- refusing to trust any response from this "
-                    "port, since it can no longer be this process's own listener"
-                )
+        _require_authentic_managed_process(managed_process)
+        exit_code = managed_process.popen.poll()
+        if exit_code is not None:
+            raise StartupError(
+                f"managed process for {url} exited (code {exit_code}) before "
+                "becoming ready -- refusing to trust any response from this "
+                "port, since it can no longer be this process's own listener"
+            )
         try:
             with urllib.request.urlopen(url, timeout=poll_interval_seconds) as response:
                 if response.status == 200:
                     body = json.loads(response.read())
                     if body.get("status") == "ok":
+                        exit_code = managed_process.popen.poll()
+                        if exit_code is not None:
+                            raise StartupError(
+                                f"managed process for {url} exited (code {exit_code}) "
+                                "immediately after answering ready -- refusing to "
+                                "grant readiness for a child no longer confirmed alive"
+                            )
                         return
                     last_error = f"not ready: {body}"
                 else:
