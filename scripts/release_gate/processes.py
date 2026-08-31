@@ -34,6 +34,24 @@ redirect. `start_gunicorn()` reads that same live `getsockname()`
 result immediately before launch and mints `ManagedProcess` from those
 actual values -- the inherited socket is the sole source of truth for
 both what Gunicorn binds to and what wait_ready() probes.
+
+Checkpoint corrective 4 (finding #2): reading `getsockname()`/`fileno()`
+straight off `listener.sock` was still not enough, because a caller can
+hand in a `socket.socket` SUBCLASS whose real underlying OS descriptor
+refers to genuine listener A while its overridden `getsockname()` (or
+`fileno()`) reports a completely different, genuinely live endpoint B --
+Gunicorn would inherit A while the ManagedProcess identity (and every
+`wait_ready()` probe) pointed at B. `start_gunicorn()` no longer calls
+any method on the caller-supplied socket object at all. It reads the
+true descriptor via the UNBOUND base-class implementation
+(`socket.socket.fileno(listener.sock)`, bypassing any subclass
+override), duplicates that descriptor into a plain base `socket.socket`
+the caller never had a chance to subclass, and from that point on reads
+identity (`socket.socket.getsockname`) and hands off the descriptor
+(`socket.socket.fileno`) exclusively from that trusted duplicate. The
+same trusted descriptor that is validated is the exact descriptor
+Gunicorn inherits -- there is no longer any pair of independently
+overridable calls whose answers could ever diverge.
 """
 
 import json
@@ -134,23 +152,65 @@ class ManagedProcess:
         return f"http://{self.listener_host}:{self.listener_port}"
 
 
-def _validate_listener_socket(sock: socket.socket) -> tuple:
-    """The last check before this process's identity is committed to a
-    Gunicorn child: the socket must still be open, bound, and loopback.
-    Returns the actual (host, port) read directly from the kernel via
-    `getsockname()` -- never from caller-suppliable metadata."""
-    if sock.fileno() == -1:
+def _obtain_trusted_duplicate(sock: socket.socket) -> socket.socket:
+    """Bypass any `fileno()` override a caller-supplied socket SUBCLASS
+    might define: read the true underlying OS descriptor via the
+    UNBOUND base-class implementation, then duplicate it into a plain
+    base `socket.socket` the caller never had a chance to subclass.
+    Every later identity read and the Gunicorn handoff itself both come
+    from this trusted duplicate, never from the original object."""
+    source_fd = socket.socket.fileno(sock)
+    if source_fd < 0:
         raise StartupError(
             "listener socket is closed -- refusing to start Gunicorn against it"
         )
-    host, port = sock.getsockname()[:2]
+    try:
+        dup_fd = os.dup(source_fd)
+    except OSError as exc:
+        raise StartupError(
+            "listener socket descriptor is no longer valid -- refusing to "
+            f"start Gunicorn against it ({exc})"
+        ) from exc
+    try:
+        return socket.socket(fileno=dup_fd)
+    except OSError:
+        os.close(dup_fd)
+        raise
+
+
+def _validate_trusted_socket(trusted_sock: socket.socket) -> tuple:
+    """The last check before this process's identity is committed to a
+    Gunicorn child. `trusted_sock` is always a plain base
+    `socket.socket` produced by `_obtain_trusted_duplicate()` -- never
+    the caller's original object -- so these base-class reads cannot be
+    lied to by an overridden method. Returns the actual (host, port,
+    fd) read directly from the kernel."""
+    trusted_fd = socket.socket.fileno(trusted_sock)
+    if trusted_fd < 0:
+        raise StartupError(
+            "listener socket is closed -- refusing to start Gunicorn against it"
+        )
+    sock_type = trusted_sock.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+    if sock_type != socket.SOCK_STREAM:
+        raise StartupError(
+            f"listener socket is not a stream socket (SO_TYPE={sock_type!r})"
+        )
+    host, port = socket.socket.getsockname(trusted_sock)[:2]
     host = str(host)
     port = int(port)
     if host not in ("127.0.0.1", "::1"):
         raise StartupError(f"listener socket is not bound to loopback (got {host!r})")
     if port <= 0:
         raise StartupError(f"listener socket has no valid bound port (got {port!r})")
-    return host, port
+    so_acceptconn = getattr(socket, "SO_ACCEPTCONN", None)
+    if so_acceptconn is not None:
+        try:
+            listening = trusted_sock.getsockopt(socket.SOL_SOCKET, so_acceptconn)
+        except OSError:
+            listening = None
+        if listening is not None and listening != 1:
+            raise StartupError("listener socket is not in a listening state")
+    return host, port, trusted_fd
 
 
 def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, repo_root=None, workers=1):
@@ -163,30 +223,38 @@ def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, r
     `pass_fds`; from that point the child (and only the child) owns
     the open listening socket.
 
-    The actual (host, port) is read from the live socket via
-    `getsockname()` immediately before launch and used to mint
-    ManagedProcess -- this is the sole source of truth for the endpoint
-    wait_ready() will later probe (checkpoint corrective 3, finding
-    #2)."""
+    The actual (host, port) is read from a TRUSTED duplicate of the
+    live socket's descriptor -- never from the caller-supplied object's
+    own (possibly overridden) `getsockname()`/`fileno()` -- immediately
+    before launch, and used to mint ManagedProcess. That same trusted
+    descriptor is the exact one Gunicorn inherits, so there is no pair
+    of independently overridable calls whose answers could ever diverge
+    (checkpoint corrective 4, finding #2)."""
     repo_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    actual_host, actual_port = _validate_listener_socket(listener.sock)
+    trusted_sock = _obtain_trusted_duplicate(listener.sock)
+    try:
+        actual_host, actual_port, trusted_fd = _validate_trusted_socket(trusted_sock)
 
-    fd = listener.sock.fileno()
-    gunicorn_bin = str(Path(sys.executable).parent / "gunicorn")
-    argv = [
-        gunicorn_bin,
-        "--bind", f"fd://{fd}",
-        "--workers", str(workers),
-        "--log-file", str(log_path),
-        "--access-logfile", str(log_path),
-        "--capture-output",
-        "linuxlab.wsgi:application",
-    ]
-    child_env = {**os.environ, **profile_env}
-    popen = subprocess.Popen(argv, cwd=str(repo_root), env=child_env, pass_fds=(fd,))
+        gunicorn_bin = str(Path(sys.executable).parent / "gunicorn")
+        argv = [
+            gunicorn_bin,
+            "--bind", f"fd://{trusted_fd}",
+            "--workers", str(workers),
+            "--log-file", str(log_path),
+            "--access-logfile", str(log_path),
+            "--capture-output",
+            "linuxlab.wsgi:application",
+        ]
+        child_env = {**os.environ, **profile_env}
+        popen = subprocess.Popen(
+            argv, cwd=str(repo_root), env=child_env, pass_fds=(trusted_fd,)
+        )
+    finally:
+        trusted_sock.close()
+
     listener.sock.close()
     return ManagedProcess._produced_by_start_gunicorn(
         popen=popen, listener_host=actual_host, listener_port=actual_port, log_path=log_path

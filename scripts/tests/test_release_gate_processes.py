@@ -30,10 +30,12 @@ is rejected before any HTTP probe.
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
+import typing
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -430,6 +432,289 @@ def test_start_gunicorn_endpoint_always_matches_the_actual_inherited_socket(tmp_
             stop_process(managed, graceful_seconds=5)
     finally:
         fake_ready.shutdown()
+
+
+# --- checkpoint corrective 4 (finding #2): one trusted base-socket descriptor
+#
+# A socket SUBCLASS can retain the real underlying OS descriptor for
+# listener A while overriding getsockname() (and/or fileno()) to report a
+# completely different, genuinely live endpoint B. Before this
+# corrective, start_gunicorn() called `listener.sock.fileno()` and
+# `listener.sock.getsockname()` directly -- both overridable -- so
+# Gunicorn could inherit A while the ManagedProcess identity (and every
+# wait_ready() probe) pointed at B. The fix bypasses any caller-defined
+# override entirely: it reads the true descriptor via the unbound
+# `socket.socket.fileno`/`socket.socket.getsockname` base implementations,
+# duplicates that descriptor into a plain base `socket.socket` the caller
+# never had a chance to subclass, and uses ONLY that trusted duplicate for
+# both the Gunicorn handoff and the ManagedProcess identity.
+
+
+class _LyingGetsocknameSocket(socket.socket):
+    """Real OS descriptor is a duplicate of listener A; getsockname()
+    is overridden to report a fake endpoint B."""
+
+    def __init__(self, dup_fd, fake_host, fake_port):
+        super().__init__(fileno=dup_fd)
+        self._fake_host = fake_host
+        self._fake_port = fake_port
+
+    def getsockname(self):
+        return (self._fake_host, self._fake_port)
+
+
+class _LyingFilenoSocket(socket.socket):
+    """Real OS descriptor is a duplicate of listener A; fileno() is
+    overridden to report an unrelated decoy descriptor."""
+
+    def __init__(self, dup_fd, fake_fd):
+        super().__init__(fileno=dup_fd)
+        self._fake_fd = fake_fd
+
+    def fileno(self):
+        return self._fake_fd
+
+
+class _LyingBothSocket(socket.socket):
+    """Both fileno() and getsockname() are overridden inconsistently
+    with the real underlying descriptor."""
+
+    def __init__(self, dup_fd, fake_fd, fake_host, fake_port):
+        super().__init__(fileno=dup_fd)
+        self._fake_fd = fake_fd
+        self._fake_host = fake_host
+        self._fake_port = fake_port
+
+    def fileno(self):
+        return self._fake_fd
+
+    def getsockname(self):
+        return (self._fake_host, self._fake_port)
+
+
+class _RecordingFakePopen:
+    """Stands in for subprocess.Popen so overridden-fileno tests can
+    assert exactly which descriptor was about to be handed to Gunicorn
+    without actually spawning a real process bound to a decoy fd."""
+
+    _instances: typing.ClassVar[list] = []
+
+    def __init__(self, argv, **kwargs):
+        self.argv = argv
+        self.pass_fds = kwargs.get("pass_fds")
+        _RecordingFakePopen._instances.append(self)
+
+    def poll(self):
+        return None
+
+
+def test_start_gunicorn_endpoint_survives_a_lying_getsockname_subclass_and_real_gunicorn(
+    tmp_path,
+):
+    """The exact remaining checkpoint-4 attack, proven against a REAL
+    Gunicorn child: the caller-supplied socket subclass retains the
+    genuine descriptor for listener A but overrides getsockname() to
+    report a completely different, genuinely live, always-ready fake
+    service B. The managed endpoint and the socket Gunicorn actually
+    binds must both remain A; B must never be able to satisfy
+    wait_ready()."""
+    real_listener = reserve_listener()
+    expected_port = real_listener.port
+    fake_ready = _start_flaky_server(initial_failures=0)  # B: always answers 200/ok
+    try:
+        dup_fd = os.dup(socket.socket.fileno(real_listener.sock))
+        lying_sock = _LyingGetsocknameSocket(
+            dup_fd, "127.0.0.1", fake_ready.server_address[1]
+        )
+        wrapped = ReservedListener(sock=lying_sock)
+
+        log_path = tmp_path / "lying-getsockname.log"
+        profile_env = {
+            "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
+            "POSTGRES_DB": os.environ.get("POSTGRES_DB", "linuxlab_central_dev"),
+        }
+
+        managed = start_gunicorn(profile_env, wrapped, log_path)
+        try:
+            assert managed.listener_port == expected_port
+            assert managed.base_url == f"http://127.0.0.1:{expected_port}"
+            assert managed.base_url != f"http://127.0.0.1:{fake_ready.server_address[1]}"
+
+            wait_ready(managed, timeout_seconds=15)  # succeeds against the REAL child at A
+
+            import urllib.request
+
+            with urllib.request.urlopen(f"{managed.base_url}/healthz", timeout=5) as response:
+                assert response.status == 200
+        finally:
+            stop_process(managed, graceful_seconds=5)
+    finally:
+        real_listener.sock.close()
+        fake_ready.shutdown()
+
+
+def test_start_gunicorn_bypasses_overridden_fileno_and_uses_true_descriptor(
+    tmp_path, monkeypatch
+):
+    """A subclass whose fileno() lies about a decoy descriptor must
+    never get that decoy passed to Gunicorn -- the true underlying
+    descriptor (obtained via the base-class implementation) is what
+    gets inherited, always."""
+    real_listener = reserve_listener()
+    expected_port = real_listener.port
+    decoy_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        dup_fd = os.dup(socket.socket.fileno(real_listener.sock))
+        lying_sock = _LyingFilenoSocket(dup_fd, decoy_fd)
+        wrapped = ReservedListener(sock=lying_sock)
+
+        _RecordingFakePopen._instances.clear()
+        monkeypatch.setattr(
+            "scripts.release_gate.processes.subprocess.Popen", _RecordingFakePopen
+        )
+        profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+
+        managed = start_gunicorn(profile_env, wrapped, tmp_path / "fileno-lie.log")
+
+        assert len(_RecordingFakePopen._instances) == 1
+        captured = _RecordingFakePopen._instances[0]
+        assert decoy_fd not in captured.pass_fds
+        assert f"fd://{decoy_fd}" not in captured.argv
+        assert managed.listener_port == expected_port
+    finally:
+        os.close(decoy_fd)
+        real_listener.sock.close()
+
+
+def test_start_gunicorn_bypasses_both_overridden_fileno_and_getsockname(tmp_path, monkeypatch):
+    """Both overrides at once, inconsistently: fileno() points at a
+    decoy descriptor, getsockname() points at a fake live ready
+    service. Neither lie may reach Gunicorn or ManagedProcess."""
+    real_listener = reserve_listener()
+    expected_port = real_listener.port
+    fake_ready = _start_flaky_server(initial_failures=0)
+    decoy_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        dup_fd = os.dup(socket.socket.fileno(real_listener.sock))
+        lying_sock = _LyingBothSocket(
+            dup_fd, decoy_fd, "127.0.0.1", fake_ready.server_address[1]
+        )
+        wrapped = ReservedListener(sock=lying_sock)
+
+        _RecordingFakePopen._instances.clear()
+        monkeypatch.setattr(
+            "scripts.release_gate.processes.subprocess.Popen", _RecordingFakePopen
+        )
+        profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+
+        managed = start_gunicorn(profile_env, wrapped, tmp_path / "both-lie.log")
+
+        assert len(_RecordingFakePopen._instances) == 1
+        captured = _RecordingFakePopen._instances[0]
+        assert decoy_fd not in captured.pass_fds
+        assert f"fd://{decoy_fd}" not in captured.argv
+        assert managed.listener_port == expected_port
+        assert managed.listener_port != fake_ready.server_address[1]
+        assert managed.base_url != f"http://127.0.0.1:{fake_ready.server_address[1]}"
+    finally:
+        os.close(decoy_fd)
+        real_listener.sock.close()
+        fake_ready.shutdown()
+
+
+def test_start_gunicorn_refuses_a_lying_subclass_whose_true_descriptor_is_closed(
+    tmp_path, monkeypatch
+):
+    """The overridden getsockname() still reports a plausible-looking
+    live endpoint, but the TRUE underlying descriptor is closed -- this
+    must be rejected before Gunicorn is ever spawned."""
+    real_listener = reserve_listener()
+    try:
+        dup_fd = os.dup(socket.socket.fileno(real_listener.sock))
+        lying_sock = _LyingGetsocknameSocket(dup_fd, "127.0.0.1", 1)
+        os.close(dup_fd)  # true descriptor now closed; override keeps lying
+
+        wrapped = ReservedListener(sock=lying_sock)
+
+        def _fail_if_spawned(*args, **kwargs):
+            raise AssertionError(
+                "must not spawn Gunicorn against a closed true descriptor"
+            )
+
+        monkeypatch.setattr(
+            "scripts.release_gate.processes.subprocess.Popen", _fail_if_spawned
+        )
+        profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+
+        with pytest.raises(StartupError):
+            start_gunicorn(profile_env, wrapped, tmp_path / "closed-lying.log")
+    finally:
+        real_listener.sock.close()
+
+
+def test_start_gunicorn_closes_parent_duplicate_after_successful_inheritance(
+    tmp_path, monkeypatch
+):
+    """The parent's OWN duplicated descriptor must be closed once
+    Gunicorn has inherited its copy -- no descriptor leak in the
+    release-gate process itself."""
+    listener = reserve_listener()
+    recorded_dups = []
+    real_dup = os.dup
+
+    def _spy_dup(fd):
+        new_fd = real_dup(fd)
+        recorded_dups.append(new_fd)
+        return new_fd
+
+    monkeypatch.setattr("scripts.release_gate.processes.os.dup", _spy_dup)
+    profile_env = {
+        "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
+        "POSTGRES_DB": os.environ.get("POSTGRES_DB", "linuxlab_central_dev"),
+    }
+
+    managed = start_gunicorn(profile_env, listener, tmp_path / "fd-leak-success.log")
+    try:
+        assert len(recorded_dups) == 1
+        with pytest.raises(OSError):
+            os.fstat(recorded_dups[0])
+    finally:
+        stop_process(managed, graceful_seconds=5)
+
+
+def test_start_gunicorn_closes_parent_duplicate_after_validation_failure(
+    tmp_path, monkeypatch
+):
+    """A duplicate created for a listener that then fails validation
+    (here: not bound to loopback) must still be closed -- no leak on
+    the failure path either."""
+    listener = reserve_listener(host="0.0.0.0")
+    recorded_dups = []
+    real_dup = os.dup
+
+    def _spy_dup(fd):
+        new_fd = real_dup(fd)
+        recorded_dups.append(new_fd)
+        return new_fd
+
+    monkeypatch.setattr("scripts.release_gate.processes.os.dup", _spy_dup)
+
+    def _fail_if_spawned(*args, **kwargs):
+        raise AssertionError("must not spawn Gunicorn for a non-loopback listener")
+
+    monkeypatch.setattr(
+        "scripts.release_gate.processes.subprocess.Popen", _fail_if_spawned
+    )
+    profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+
+    try:
+        with pytest.raises(StartupError):
+            start_gunicorn(profile_env, listener, tmp_path / "fd-leak-failure.log")
+        assert len(recorded_dups) == 1
+        with pytest.raises(OSError):
+            os.fstat(recorded_dups[0])
+    finally:
+        listener.sock.close()
 
 
 def test_start_gunicorn_refuses_a_closed_listener_socket(tmp_path, monkeypatch):
