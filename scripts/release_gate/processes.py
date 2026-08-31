@@ -20,6 +20,20 @@ is derived exclusively from that handle's own inherited listener
 hand-built by a caller. Liveness is re-checked immediately before every
 probe AND immediately after a successful one, closing the child-exit
 race on both sides of the HTTP round trip.
+
+Checkpoint corrective 3 (finding #2): ManagedProcess deriving its
+identity from `managed_process.base_url` was not enough either, because
+that value was still built from `ReservedListener.host`/`.port` --
+plain MUTABLE dataclass fields a caller could reassign after
+reserve_listener() returned, redirecting the endpoint Gunicorn's own
+handle reports without changing which socket Gunicorn actually
+inherited. `ReservedListener` now has no stored host/port fields at
+all: `.host`/`.port` are properties computed fresh from the live
+socket's own `getsockname()`, so there is no attribute left to
+redirect. `start_gunicorn()` reads that same live `getsockname()`
+result immediately before launch and mints `ManagedProcess` from those
+actual values -- the inherited socket is the sole source of truth for
+both what Gunicorn binds to and what wait_ready() probes.
 """
 
 import json
@@ -49,16 +63,29 @@ def reserve_local_port() -> int:
         return sock.getsockname()[1]
 
 
-@dataclass
+@dataclass(frozen=True)
 class ReservedListener:
     """A real bound+listening socket the caller keeps open until a
     child process inherits its exact file descriptor. Unlike a bare
     port number, this cannot be silently reused by an unrelated
-    process while release-gate orchestration is still setting up."""
+    process while release-gate orchestration is still setting up.
+
+    `host`/`port` are deliberately NOT stored fields -- they are
+    properties read fresh from the live socket's own `getsockname()`
+    every time, so there is no attribute a caller could reassign to
+    redirect where a downstream consumer thinks this listener lives."""
 
     sock: socket.socket
-    host: str
-    port: int
+
+    @property
+    def host(self) -> str:
+        host, _port = self.sock.getsockname()[:2]
+        return str(host)
+
+    @property
+    def port(self) -> int:
+        _host, port = self.sock.getsockname()[:2]
+        return int(port)
 
 
 def reserve_listener(host: str = "127.0.0.1") -> ReservedListener:
@@ -66,8 +93,7 @@ def reserve_listener(host: str = "127.0.0.1") -> ReservedListener:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, 0))
     sock.listen(128)
-    port = sock.getsockname()[1]
-    return ReservedListener(sock=sock, host=host, port=port)
+    return ReservedListener(sock=sock)
 
 
 # Identifies a ManagedProcess as genuinely produced by start_gunicorn()
@@ -108,6 +134,25 @@ class ManagedProcess:
         return f"http://{self.listener_host}:{self.listener_port}"
 
 
+def _validate_listener_socket(sock: socket.socket) -> tuple:
+    """The last check before this process's identity is committed to a
+    Gunicorn child: the socket must still be open, bound, and loopback.
+    Returns the actual (host, port) read directly from the kernel via
+    `getsockname()` -- never from caller-suppliable metadata."""
+    if sock.fileno() == -1:
+        raise StartupError(
+            "listener socket is closed -- refusing to start Gunicorn against it"
+        )
+    host, port = sock.getsockname()[:2]
+    host = str(host)
+    port = int(port)
+    if host not in ("127.0.0.1", "::1"):
+        raise StartupError(f"listener socket is not bound to loopback (got {host!r})")
+    if port <= 0:
+        raise StartupError(f"listener socket has no valid bound port (got {port!r})")
+    return host, port
+
+
 def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, repo_root=None, workers=1):
     """Start Gunicorn bound to the EXACT reserved listener via
     inherited file descriptor (`fd://<fd>`), serving
@@ -116,10 +161,18 @@ def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, r
     through the child process environment only. The parent's own copy
     of the socket is closed once the child has inherited it via
     `pass_fds`; from that point the child (and only the child) owns
-    the open listening socket."""
+    the open listening socket.
+
+    The actual (host, port) is read from the live socket via
+    `getsockname()` immediately before launch and used to mint
+    ManagedProcess -- this is the sole source of truth for the endpoint
+    wait_ready() will later probe (checkpoint corrective 3, finding
+    #2)."""
     repo_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    actual_host, actual_port = _validate_listener_socket(listener.sock)
 
     fd = listener.sock.fileno()
     gunicorn_bin = str(Path(sys.executable).parent / "gunicorn")
@@ -134,10 +187,9 @@ def start_gunicorn(profile_env: dict, listener: ReservedListener, log_path, *, r
     ]
     child_env = {**os.environ, **profile_env}
     popen = subprocess.Popen(argv, cwd=str(repo_root), env=child_env, pass_fds=(fd,))
-    host, port = listener.host, listener.port
     listener.sock.close()
     return ManagedProcess._produced_by_start_gunicorn(
-        popen=popen, listener_host=host, listener_port=port, log_path=log_path
+        popen=popen, listener_host=actual_host, listener_port=actual_port, log_path=log_path
     )
 
 

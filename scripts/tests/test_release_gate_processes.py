@@ -97,6 +97,31 @@ def test_reserve_listener_returns_different_ports_across_calls():
         b.sock.close()
 
 
+# --- checkpoint corrective 3 (finding #2): socket is the sole source of truth
+
+
+def test_reserved_listener_host_and_port_have_no_settable_fields():
+    """host/port are properties computed from the live socket, not
+    stored fields -- there is no attribute to redirect at all."""
+    listener = reserve_listener()
+    try:
+        with pytest.raises(AttributeError):
+            listener.port = 9999
+        with pytest.raises(AttributeError):
+            listener.host = "10.0.0.1"
+    finally:
+        listener.sock.close()
+
+
+def test_reserved_listener_port_always_reflects_the_actual_socket():
+    listener = reserve_listener()
+    try:
+        assert listener.port == listener.sock.getsockname()[1]
+        assert listener.host == listener.sock.getsockname()[0]
+    finally:
+        listener.sock.close()
+
+
 # --- test fixture helper: forging a ManagedProcess-shaped object -----------
 
 
@@ -342,6 +367,7 @@ def test_start_gunicorn_binds_the_exact_reserved_listener(tmp_path):
     proves the managed child actually owns the exact listener the
     parent reserved, not merely 'a' Gunicorn on 'some' port."""
     listener = reserve_listener()
+    expected_port = listener.port  # read BEFORE start_gunicorn() closes the socket
     log_path = tmp_path / "central.log"
     profile_env = {
         "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
@@ -350,7 +376,7 @@ def test_start_gunicorn_binds_the_exact_reserved_listener(tmp_path):
 
     managed = start_gunicorn(profile_env, listener, log_path)
     try:
-        assert managed.base_url == f"http://127.0.0.1:{listener.port}"
+        assert managed.base_url == f"http://127.0.0.1:{expected_port}"
         wait_ready(managed, timeout_seconds=15)
 
         import urllib.request
@@ -367,6 +393,57 @@ def test_start_gunicorn_never_binds_0_0_0_0():
         assert listener.host == "127.0.0.1"
     finally:
         listener.sock.close()
+
+
+def test_start_gunicorn_endpoint_always_matches_the_actual_inherited_socket(tmp_path):
+    """The checkpoint review's exact scenario: real socket A, a fake
+    ready service B, and an attempt to redirect the listener metadata
+    to B. Since host/port are now computed from the live socket
+    (`getsockname()`), read fresh immediately before launch, there is
+    no field left to redirect at all -- the managed endpoint can only
+    ever be A, and the fake B can never satisfy wait_ready()."""
+    listener = reserve_listener()
+    real_port = listener.port  # captured from the actual socket (A)
+
+    fake_ready = _start_flaky_server(initial_failures=0)  # B: always answers ready
+    try:
+        # The redirect attempt itself is refused -- there is no
+        # settable field to point at B in the first place.
+        with pytest.raises(AttributeError):
+            listener.port = fake_ready.server_address[1]
+
+        log_path = tmp_path / "redirect-probe.log"
+        profile_env = {
+            "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
+            "POSTGRES_DB": os.environ.get("POSTGRES_DB", "linuxlab_central_dev"),
+        }
+        managed = start_gunicorn(profile_env, listener, log_path)
+        try:
+            assert managed.listener_port == real_port
+            assert managed.base_url == f"http://127.0.0.1:{real_port}"
+            assert managed.base_url != f"http://127.0.0.1:{fake_ready.server_address[1]}"
+
+            # Readiness against the REAL Gunicorn child at A succeeds --
+            # it was never possible to point it at B.
+            wait_ready(managed, timeout_seconds=15)
+        finally:
+            stop_process(managed, graceful_seconds=5)
+    finally:
+        fake_ready.shutdown()
+
+
+def test_start_gunicorn_refuses_a_closed_listener_socket(tmp_path, monkeypatch):
+    listener = reserve_listener()
+    listener.sock.close()
+
+    def _fail_if_spawned(*args, **kwargs):
+        raise AssertionError("must not spawn Gunicorn against a closed listener socket")
+
+    monkeypatch.setattr("scripts.release_gate.processes.subprocess.Popen", _fail_if_spawned)
+    profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+
+    with pytest.raises(StartupError):
+        start_gunicorn(profile_env, listener, tmp_path / "closed.log")
 
 
 def test_start_gunicorn_produces_an_authentic_handle_wait_ready_accepts():
