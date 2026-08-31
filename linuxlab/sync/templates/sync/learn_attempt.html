@@ -2,13 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Activity</title>
+  <title>Attempt</title>
 </head>
 <body>
-  <h1>Activity {{ payload.activity_public_id }} v{{ payload.activity_version }}</h1>
-  <p>Installed package version {{ runtime_context.package_version }}</p>
+  <h1>Attempt {{ attempt.public_id }}</h1>
+  <p>Activity {{ payload.activity_public_id }} v{{ payload.activity_version }}</p>
 
-  <form id="linuxlab-activity-submit">
+  {% if already_submitted %}
+    <p>This attempt has already been submitted.</p>
+  {% endif %}
+
+  <form id="linuxlab-attempt-submit">
     {% csrf_token %}
     {% for question in payload.questions %}
       <fieldset>
@@ -29,10 +33,10 @@
     {% endfor %}
     <button type="submit">Submit</button>
   </form>
-  <p id="linuxlab-activity-result"></p>
+  <p id="linuxlab-attempt-result"></p>
 
   <script>
-    document.getElementById("linuxlab-activity-submit").addEventListener("submit", function (event) {
+    document.getElementById("linuxlab-attempt-submit").addEventListener("submit", function (event) {
       event.preventDefault();
       var form = event.target;
       var csrfToken = form.querySelector("[name=csrfmiddlewaretoken]").value;
@@ -61,7 +65,7 @@
       })
         .then(function (response) { return response.json(); })
         .then(function (data) {
-          document.getElementById("linuxlab-activity-result").textContent = JSON.stringify(data);
+          document.getElementById("linuxlab-attempt-result").textContent = JSON.stringify(data);
         });
     });
   </script>

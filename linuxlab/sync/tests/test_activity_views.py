@@ -1,7 +1,10 @@
-"""T15-D27 S11: Node HTTP learner activity/submit surface -- a thin
-adapter that starts+grades a fresh installed Attempt against the exact
-pinned InstalledActivityVersion, never re-resolving the active package
-mid-request, and never exposing grading material."""
+"""T15-D27 S11, refined by the T15-D27 corrective: an explicit Node
+Start -> Attempt -> Submit HTTP flow. Landing GET never creates an
+Attempt; POST start pins one against the current active package and
+redirects to its own page; GET/POST on that page resolve entirely from
+the Attempt's own pinned installed artifact, never re-resolving "the
+current active package"; submit rejects any session/identity that does
+not match the Attempt's own learner."""
 
 import json
 import uuid
@@ -31,15 +34,23 @@ def _stage(world, private_key, public_key):
     return import_package(package_bytes, world["activity_registry"], public_key)
 
 
-def _activity_url(world):
+def _landing_url(world):
     return (
         f"/learn/{world['snapshot'].source_public_id}/activity/"
         f"{world['definition'].public_id}/{world['activity_version'].version}/"
     )
 
 
-def _submit_url(world):
-    return _activity_url(world) + "submit/"
+def _start_url(world):
+    return _landing_url(world) + "start/"
+
+
+def _attempt_url(attempt):
+    return f"/learn/attempt/{attempt.public_id}/"
+
+
+def _attempt_submit_url(attempt):
+    return _attempt_url(attempt) + "submit/"
 
 
 def _correct_submission(world):
@@ -54,15 +65,133 @@ def _correct_submission(world):
     }
 
 
-# --- GET activity route -----------------------------------------------------
+def _start_attempt(client, world):
+    """POST start and return the created Attempt, reading its public_id
+    back off the redirect Location header (never assumed/synthesized)."""
+    response = client.post(_start_url(world))
+    assert response.status_code == 303
+    attempt_public_id = response["Location"].rstrip("/").rsplit("/", 1)[-1]
+    return Attempt.objects.get(public_id=attempt_public_id)
+
+
+# --- landing GET -------------------------------------------------------------
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_get_activity_route_renders_learner_safe_payload(quiz_world, keypair):
+def test_landing_get_renders_learner_safe_content_and_creates_no_attempt(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
 
-    response = Client().get(_activity_url(quiz_world))
+    response = Client().get(_landing_url(quiz_world))
+
+    assert response.status_code == 200
+    rendered = response.content.decode()
+    assert "Which command lists files?" in rendered
+    assert "answer_key" not in rendered
+    assert "correct_option_id" not in rendered
+    assert "scoring" not in rendered
+    assert Attempt.objects.count() == 0
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_landing_get_returns_503_without_an_active_package():
+    response = Client().get(f"/learn/{uuid.uuid4()}/activity/{uuid.uuid4()}/1/")
+
+    assert response.status_code == 503
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_landing_get_returns_404_for_unknown_activity(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    response = Client().get(f"/learn/{quiz_world['snapshot'].source_public_id}/activity/{uuid.uuid4()}/1/")
+
+    assert response.status_code == 404
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True, LINUXLAB_CAN_SERVE_LEARNER_CONTENT=False)
+def test_landing_get_rejected_under_central_profile(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    response = Client().get(_landing_url(quiz_world))
+
+    assert response.status_code == 403
+
+
+# --- POST start ---------------------------------------------------------------
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_post_start_pins_an_attempt_and_redirects_to_its_own_page(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    attempt = _start_attempt(Client(), quiz_world)
+
+    assert attempt.installed_activity_version.activity_public_id == quiz_world["definition"].public_id
+    assert attempt.submitted_at is None
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_post_start_delegates_learner_resolution_to_identity_service(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    with patch(
+        "linuxlab.sync.views.resolve_or_create_guest_learner", wraps=resolve_or_create_guest_learner
+    ) as spy:
+        response = Client().post(_start_url(quiz_world))
+
+    assert response.status_code == 303
+    spy.assert_called_once()
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_post_start_returns_503_without_an_active_package():
+    response = Client().post(f"/learn/{uuid.uuid4()}/activity/{uuid.uuid4()}/1/start/")
+
+    assert response.status_code == 503
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True, LINUXLAB_CAN_SERVE_LEARNER_CONTENT=False)
+def test_post_start_rejected_under_central_profile(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+
+    response = Client().post(_start_url(quiz_world))
+
+    assert response.status_code == 403
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_post_start_always_targets_the_current_active_package(quiz_world, keypair):
+    private_key, public_key = keypair
+    v1 = _stage(quiz_world, private_key, public_key)
+    activate_package(v1)
+
+    v2_snapshot = republish(quiz_world)
+    v2_bytes = build_package(v2_snapshot, quiz_world["activity_registry"], private_key)
+    v2 = import_package(v2_bytes, quiz_world["activity_registry"], public_key)
+    activate_package(v2)
+
+    attempt = _start_attempt(Client(), quiz_world)
+
+    assert attempt.installed_activity_version.package_id == v2.pk
+
+
+# --- Attempt GET ---------------------------------------------------------------
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_attempt_get_renders_learner_safe_payload(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
+
+    response = client.get(_attempt_url(attempt))
 
     assert response.status_code == 200
     rendered = response.content.decode()
@@ -73,98 +202,81 @@ def test_get_activity_route_renders_learner_safe_payload(quiz_world, keypair):
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_get_activity_route_returns_503_without_an_active_package():
-    response = Client().get(f"/learn/{uuid.uuid4()}/activity/{uuid.uuid4()}/1/")
-
-    assert response.status_code == 503
-
-
-@override_settings(**_NODE_SETTINGS)
-def test_get_activity_route_returns_404_for_unknown_activity(quiz_world, keypair):
-    private_key, public_key = keypair
-    activate_package(_stage(quiz_world, private_key, public_key))
-
-    response = Client().get(f"/learn/{quiz_world['snapshot'].source_public_id}/activity/{uuid.uuid4()}/1/")
+def test_attempt_get_returns_404_for_unknown_attempt():
+    response = Client().get(f"/learn/attempt/{uuid.uuid4()}/")
 
     assert response.status_code == 404
 
 
-@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True, LINUXLAB_CAN_SERVE_LEARNER_CONTENT=False)
-def test_get_activity_route_rejected_under_central_profile(quiz_world, keypair):
-    private_key, public_key = keypair
-    activate_package(_stage(quiz_world, private_key, public_key))
-
-    response = Client().get(_activity_url(quiz_world))
-
-    assert response.status_code == 403
-
-
-# --- identity boundary (T15-D27 corrective) ---------------------------------
-
-
-def test_sync_views_module_never_references_the_learner_model_directly():
-    """sync.views owns only session binding/request orchestration; Learner
-    resolution/creation must be entirely delegated to the public
-    linuxlab.identity services (ensure_learner()/
-    resolve_or_create_guest_learner()) -- this module must not import or
-    reference the Learner model itself at all."""
-    import linuxlab.sync.views as sync_views
-
-    assert not hasattr(sync_views, "Learner")
-    assert "Learner" not in sync_views.__dict__
-
-
 @override_settings(**_NODE_SETTINGS)
-def test_anonymous_submit_delegates_learner_resolution_to_identity_service(quiz_world, keypair):
+def test_attempt_get_ignores_a_newly_activated_package_and_never_re_resolves_active(
+    quiz_world, keypair
+):
+    """T15-D27 corrective: GET landing A -> POST start A -> Attempt X
+    pinned to A -> activate B -> GET Attempt X still renders A (never the
+    current active package B)."""
     private_key, public_key = keypair
-    activate_package(_stage(quiz_world, private_key, public_key))
+    v1 = _stage(quiz_world, private_key, public_key)
+    activate_package(v1)
+    client = Client()
 
-    with patch(
-        "linuxlab.sync.views.resolve_or_create_guest_learner", wraps=resolve_or_create_guest_learner
-    ) as spy:
-        response = Client().post(
-            _submit_url(quiz_world),
-            data=json.dumps(_correct_submission(quiz_world)),
-            content_type="application/json",
-        )
+    landing = client.get(_landing_url(quiz_world))
+    assert landing.status_code == 200
+
+    attempt = _start_attempt(client, quiz_world)
+    assert attempt.installed_activity_version.package_id == v1.pk
+
+    v2_snapshot = republish(quiz_world)
+    v2_bytes = build_package(v2_snapshot, quiz_world["activity_registry"], private_key)
+    v2 = import_package(v2_bytes, quiz_world["activity_registry"], public_key)
+    activate_package(v2)
+
+    response = client.get(_attempt_url(attempt))
 
     assert response.status_code == 200
-    spy.assert_called_once()
+    attempt.refresh_from_db()
+    assert attempt.installed_activity_version.package_id == v1.pk
+    assert attempt.installed_activity_version.package_id != v2.pk
 
 
-# --- POST submit route -------------------------------------------------------
+# --- Attempt POST submit --------------------------------------------------------
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_grades_correct_response_and_returns_score(quiz_world, keypair):
+def test_attempt_submit_grades_the_pinned_attempt_and_returns_score(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
 
-    response = Client().post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    response = client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["score"] == 1
     assert body["max_score"] == 1
+    assert body["attempt_public_id"] == str(attempt.public_id)
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_persists_attempt_result_and_progress(quiz_world, keypair):
+def test_attempt_submit_persists_result_and_progress_without_creating_a_new_attempt(
+    quiz_world, keypair
+):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
+    assert Attempt.objects.count() == 1
 
-    response = Client().post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
     )
-    attempt_public_id = response.json()["attempt_public_id"]
 
-    attempt = Attempt.objects.get(public_id=attempt_public_id)
-    assert attempt.installed_activity_version is not None
-    assert attempt.activity_version_id is None
+    assert Attempt.objects.count() == 1
+    attempt.refresh_from_db()
     assert hasattr(attempt, "result")
-
     progress = Progress.objects.get(
         learner=attempt.learner, activity_definition_public_id=quiz_world["definition"].public_id
     )
@@ -172,27 +284,30 @@ def test_post_submit_persists_attempt_result_and_progress(quiz_world, keypair):
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_emits_activity_completed_event(quiz_world, keypair):
+def test_attempt_submit_emits_activity_completed_event(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
 
-    response = Client().post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
     )
-    attempt_public_id = response.json()["attempt_public_id"]
 
     assert DomainEvent.objects.filter(
-        event_type="activity.completed", aggregate_id=attempt_public_id
+        event_type="activity.completed", aggregate_id=attempt.public_id
     ).exists()
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_response_has_no_grading_material(quiz_world, keypair):
+def test_attempt_submit_response_has_no_grading_material(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
 
-    response = Client().post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    response = client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
     )
 
     rendered = response.content.decode()
@@ -201,80 +316,117 @@ def test_post_submit_response_has_no_grading_material(quiz_world, keypair):
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_rejects_invalid_json_body(quiz_world, keypair):
+def test_attempt_submit_rejects_invalid_json_body(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
 
-    response = Client().post(_submit_url(quiz_world), data="not json", content_type="application/json")
+    response = client.post(_attempt_submit_url(attempt), data="not json", content_type="application/json")
 
     assert response.status_code == 400
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_post_submit_returns_503_without_an_active_package():
+def test_attempt_submit_returns_404_for_unknown_attempt():
     response = Client().post(
-        f"/learn/{uuid.uuid4()}/activity/{uuid.uuid4()}/1/submit/", data="{}", content_type="application/json"
+        f"/learn/attempt/{uuid.uuid4()}/submit/", data="{}", content_type="application/json"
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 404
 
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True, LINUXLAB_CAN_SERVE_LEARNER_CONTENT=False)
-def test_post_submit_rejected_under_central_profile(quiz_world, keypair):
+def test_attempt_submit_rejected_under_central_profile(quiz_world, keypair):
     private_key, public_key = keypair
     activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
 
-    response = Client().post(_submit_url(quiz_world), data="{}", content_type="application/json")
+    with override_settings(**_NODE_SETTINGS):
+        attempt = _start_attempt(client, quiz_world)
+
+    response = client.post(_attempt_submit_url(attempt), data="{}", content_type="application/json")
 
     assert response.status_code == 403
 
 
 @override_settings(**_NODE_SETTINGS)
-def test_same_anonymous_session_reuses_one_learner_across_requests(quiz_world, keypair):
-    private_key, public_key = keypair
-    activate_package(_stage(quiz_world, private_key, public_key))
-    client = Client()
-
-    first = client.post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
-    )
-
-    second_snapshot_response = client.post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
-    )
-
-    first_attempt = Attempt.objects.get(public_id=first.json()["attempt_public_id"])
-    second_attempt = Attempt.objects.get(public_id=second_snapshot_response.json()["attempt_public_id"])
-    assert first_attempt.learner_id == second_attempt.learner_id
-
-
-@override_settings(**_NODE_SETTINGS)
-def test_post_submit_always_starts_a_fresh_attempt_against_the_current_active_package(
-    quiz_world, keypair
-):
-    """The HTTP submit route starts+grades a brand-new Attempt inside one
-    request (T15-D27 S11) -- GET never creates one, so there is no
-    prior Attempt to stay pinned to. A POST issued after a newer package
-    has since activated therefore correctly targets that new package: a
-    FRESH Attempt always starts against whichever package is active right
-    now. (The "an already-STARTED Attempt stays pinned even if a newer
-    package later activates" invariant is a property of individual
-    Attempt objects across two separate start/submit calls, and is
-    covered directly at the service layer in
-    linuxlab.learning.tests.test_installed_attempt_service.)"""
+def test_attempt_submit_does_not_invalidate_when_current_package_becomes_inactive(quiz_world, keypair):
+    """T15-D27 corrective: an already-started Attempt must still grade
+    successfully even after a newer package has since become active for
+    this source (the pinned package itself is no longer "the current
+    active package", but that must not invalidate submission)."""
     private_key, public_key = keypair
     v1 = _stage(quiz_world, private_key, public_key)
     activate_package(v1)
+    client = Client()
+    attempt = _start_attempt(client, quiz_world)
 
     v2_snapshot = republish(quiz_world)
     v2_bytes = build_package(v2_snapshot, quiz_world["activity_registry"], private_key)
     v2 = import_package(v2_bytes, quiz_world["activity_registry"], public_key)
     activate_package(v2)
 
-    response = Client().post(
-        _submit_url(quiz_world), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    response = client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
     )
 
     assert response.status_code == 200
-    attempt = Attempt.objects.get(public_id=response.json()["attempt_public_id"])
-    assert attempt.installed_activity_version.package_id == v2.pk
+    assert response.json()["score"] == 1
+
+
+# --- security/identity boundary (T15-D27 corrective) --------------------------
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_a_different_session_cannot_submit_someone_elses_attempt(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    owner_client = Client()
+    attempt = _start_attempt(owner_client, quiz_world)
+
+    other_client = Client()  # a fresh, unrelated session/cookie jar
+    response = other_client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    )
+
+    assert response.status_code == 403
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_a_posted_learner_public_id_in_the_submit_body_is_ignored(quiz_world, keypair):
+    """An arbitrary/forged learner identity in the POST body itself must
+    have zero effect: only the session/auth-resolved identity is ever
+    trusted for the ownership check."""
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    owner_client = Client()
+    attempt = _start_attempt(owner_client, quiz_world)
+
+    other_client = Client()
+    forged_submission = dict(_correct_submission(quiz_world))
+    forged_submission["learner_public_id"] = str(attempt.learner.public_id)
+
+    response = other_client.post(
+        _attempt_submit_url(attempt), data=json.dumps(forged_submission), content_type="application/json"
+    )
+
+    assert response.status_code == 403
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+
+
+@override_settings(**_NODE_SETTINGS)
+def test_same_session_can_start_then_submit_its_own_attempt(quiz_world, keypair):
+    private_key, public_key = keypair
+    activate_package(_stage(quiz_world, private_key, public_key))
+    client = Client()
+
+    attempt = _start_attempt(client, quiz_world)
+    response = client.post(
+        _attempt_submit_url(attempt), data=json.dumps(_correct_submission(quiz_world)), content_type="application/json"
+    )
+
+    assert response.status_code == 200

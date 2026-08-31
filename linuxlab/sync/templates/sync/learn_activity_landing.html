@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Activity</title>
+</head>
+<body>
+  <h1>Activity {{ payload.activity_public_id }} v{{ payload.activity_version }}</h1>
+  <p>Installed package version {{ runtime_context.package_version }}</p>
+
+  {% for question in payload.questions %}
+    <section>
+      <h2>{{ question.prompt }}</h2>
+      <ul>
+        {% for option in question.options %}
+          <li>{{ option.text }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endfor %}
+
+  <form method="post" action="{{ start_url }}">
+    {% csrf_token %}
+    <button type="submit">Start</button>
+  </form>
+</body>
+</html>

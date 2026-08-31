@@ -61,6 +61,23 @@ def start_attempt(learner, activity_version):
     return Attempt.objects.create(learner=learner, activity_version=activity_version)
 
 
+def get_attempt_by_public_id(public_id):
+    """Resolve an Attempt by its stable public_id, or None (T15-D27
+    corrective HTTP flow): a plain read-only lookup with no ownership/
+    authorization decision baked in -- callers (e.g. the Node HTTP
+    adapter) decide what to do with the result, including whether the
+    requesting identity may act on it. Returning None rather than
+    raising Attempt.DoesNotExist keeps callers like linuxlab.sync.views
+    from needing to import the Attempt model just to catch its
+    auto-generated exception class.
+    """
+    return (
+        Attempt.objects.select_related("learner", "installed_activity_version")
+        .filter(public_id=public_id)
+        .first()
+    )
+
+
 def claim_activity_completion(learner, activity_version):
     """Record an explicit, self-attested completion claim for one exact
     published ActivityVersion (Task 08, ADR-006/ADR-012 guest-first flow).

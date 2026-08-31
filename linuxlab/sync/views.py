@@ -1,31 +1,40 @@
 """Task 13 Node LAN HTTP adapter (T13-D15), extended by T15-D27 S11 with
-the Node learner activity/submit surface.
+the Node learner activity/start/attempt/submit surface, and refined by the
+T15-D27 corrective into an explicit Start -> Attempt -> Submit flow.
 
 A thin adapter over linuxlab.runtime and linuxlab.learning: it opens
 exactly ONE RuntimePackageContext per request and reuses it for every
 runtime lookup needed to render/grade the response, calls only the
 learner-safe runtime facade for rendering (never linuxlab.runtime.grading
 directly -- grading is reached only through
-linuxlab.learning.services.submit_installed_attempt(), which itself owns
-that boundary), and never queries Installed*/Attempt models directly for
-business/runtime resolution. Domain exceptions from the runtime/learning
-core are mapped to a response here -- neither core has any HTTP awareness
-at all.
+linuxlab.learning.services.submit()/submit_installed_attempt(), which
+themselves own that boundary), and never queries Installed*/Attempt
+models directly for business/runtime resolution -- Attempt lookup goes
+through linuxlab.learning.services.get_attempt_by_public_id(), Learner
+resolution through linuxlab.identity.services. Domain exceptions from the
+runtime/learning core are mapped to a response here -- neither core has
+any HTTP awareness at all.
 """
 
 import json
 
 from django.conf import settings
-from django.http import HttpResponseForbidden, HttpResponseServerError, JsonResponse
+from django.http import (
+    HttpResponseForbidden,
+    HttpResponseRedirect,
+    HttpResponseServerError,
+    JsonResponse,
+)
 from django.shortcuts import render
+from django.urls import reverse
 from django.views import View
 
 from linuxlab.activities.default_registry import build_default_activity_registry
 from linuxlab.identity.services import ensure_learner, resolve_or_create_guest_learner
-from linuxlab.learning.services import start_installed_attempt, submit_installed_attempt
+from linuxlab.learning.services import get_attempt_by_public_id, start_installed_attempt, submit
 from linuxlab.quiz.provider import serialize_installed_assessment_for_learner
 from linuxlab.runtime.content import get_runtime_activity, get_runtime_publication
-from linuxlab.runtime.context import open_runtime_context
+from linuxlab.runtime.context import open_pinned_context, open_runtime_context
 from linuxlab.runtime.exceptions import (
     RuntimeArtifactNotFound,
     RuntimeContentUnavailable,
@@ -97,12 +106,25 @@ def _resolve_node_learner(request):
     return learner
 
 
-class ActivityView(View):
+def _resolve_activity_registry_provider(activity):
+    """Shared by every view below that needs a learner-safe serializer:
+    resolve the registered ActivityProvider for `activity.type_key` from
+    the one production registry (T15-D27 S10), or None if none is
+    registered."""
+    activity_registry = build_default_activity_registry()
+    try:
+        return activity_registry.get(activity.type_key)
+    except LookupError:
+        return None
+
+
+class ActivityLandingView(View):
     """GET /learn/<uuid:source_public_id>/activity/<uuid:activity_public_id>/<int:version>/
-    -- serves the learner-safe payload for one exact installed Activity
-    (T15-D27 S11): ACTIVE InstalledPackage -> RuntimePackageContext ->
-    InstalledActivityVersion -> learner-safe provider payload. Never
-    exposes grading material.
+    -- landing page for one exact installed Activity (T15-D27 corrective):
+    renders learner-safe content plus a Start action. Never creates an
+    Attempt here and never accepts a caller-posted learner identity --
+    that is entirely ActivityStartView's job, resolved from session/auth
+    state only.
     """
 
     def get(self, request, source_public_id, activity_public_id, version):
@@ -123,35 +145,35 @@ class ActivityView(View):
         except RuntimeContextInvalid:
             return HttpResponseServerError("runtime context is no longer valid")
 
-        activity_registry = build_default_activity_registry()
-        try:
-            provider = activity_registry.get(activity.type_key)
-        except LookupError:
+        provider = _resolve_activity_registry_provider(activity)
+        if provider is None:
             return HttpResponseServerError("no provider registered for this activity type")
 
         payload = serialize_installed_assessment_for_learner(context, activity, provider.question_registry)
 
         return render(
             request,
-            "sync/learn_activity.html",
+            "sync/learn_activity_landing.html",
             {
                 "runtime_context": context,
                 "activity": activity,
                 "payload": payload,
-                "submit_url": request.path.rstrip("/") + "/submit/",
+                "start_url": reverse(
+                    "learn-activity-start", args=[source_public_id, activity_public_id, version]
+                ),
             },
             status=200,
         )
 
 
-class ActivitySubmitView(View):
-    """POST /learn/<uuid:source_public_id>/activity/<uuid:activity_public_id>/<int:version>/submit/
-    -- starts a fresh installed Attempt against the exact pinned activity
-    and immediately grades it (T15-D27 S6, S8, S11): Attempt -> pinned
-    InstalledActivityVersion -> pinned package context -> installed
-    grading -> Result -> Progress -> activity.completed. Never
-    re-resolves "the active package" between start and grade -- both
-    happen inside this one request against the SAME RuntimePackageContext.
+class ActivityStartView(View):
+    """POST .../start/ -- starts (and pins) a fresh installed Attempt
+    against the CURRENT active package for this activity (T15-D27
+    corrective), then redirects (303 See Other) to that Attempt's own
+    page. Accepts no meaningful request body: starting an attempt carries
+    no answers/grading, and the learner is resolved entirely from
+    session/auth state via the identity service -- never from anything
+    posted in the request.
     """
 
     def post(self, request, source_public_id, activity_public_id, version):
@@ -161,17 +183,11 @@ class ActivitySubmitView(View):
             )
 
         try:
-            submission = json.loads(request.body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return JsonResponse({"error": "invalid JSON body"}, status=400)
-
-        try:
             context = open_runtime_context(_PACKAGE_TYPE, source_public_id)
         except RuntimeContentUnavailable:
             return JsonResponse({"error": "not available"}, status=503)
 
         learner = _resolve_node_learner(request)
-        activity_registry = build_default_activity_registry()
 
         try:
             attempt = start_installed_attempt(learner, context, activity_public_id, version)
@@ -182,8 +198,93 @@ class ActivitySubmitView(View):
         except ValueError:
             return JsonResponse({"error": "package is not active"}, status=409)
 
+        return HttpResponseRedirect(reverse("learn-attempt", args=[attempt.public_id]), status=303)
+
+
+class AttemptView(View):
+    """GET /learn/attempt/<uuid:attempt_public_id>/ -- renders the
+    learner-safe payload for an ALREADY-STARTED installed Attempt,
+    resolved entirely from the Attempt's own pinned
+    InstalledActivityVersion/package (T15-D27 corrective) via
+    open_pinned_context() -- never open_runtime_context(), so this page
+    keeps rendering correctly even after a different package has since
+    become ACTIVE for this same source.
+    """
+
+    def get(self, request, attempt_public_id):
+        if not getattr(settings, "LINUXLAB_CAN_SERVE_LEARNER_CONTENT", False):
+            return HttpResponseForbidden(
+                "Node learner content serving is not enabled on this deployment profile"
+            )
+
+        attempt = get_attempt_by_public_id(attempt_public_id)
+        if attempt is None or attempt.installed_activity_version_id is None:
+            return render(request, "sync/learn_not_found.html", status=404)
+
+        installed_activity = attempt.installed_activity_version
+        context = open_pinned_context(installed_activity.package)
+
         try:
-            result = submit_installed_attempt(attempt, submission, activity_registry)
+            activity = get_runtime_activity(
+                context, installed_activity.activity_public_id, installed_activity.version
+            )
+        except RuntimeArtifactNotFound:
+            return HttpResponseServerError("pinned installed activity is missing its own package data")
+
+        provider = _resolve_activity_registry_provider(activity)
+        if provider is None:
+            return HttpResponseServerError("no provider registered for this activity type")
+
+        payload = serialize_installed_assessment_for_learner(context, activity, provider.question_registry)
+
+        return render(
+            request,
+            "sync/learn_attempt.html",
+            {
+                "attempt": attempt,
+                "runtime_context": context,
+                "activity": activity,
+                "payload": payload,
+                "submit_url": reverse("learn-attempt-submit", args=[attempt.public_id]),
+                "already_submitted": attempt.submitted_at is not None,
+            },
+            status=200,
+        )
+
+
+class AttemptSubmitView(View):
+    """POST /learn/attempt/<uuid:attempt_public_id>/submit/ -- grades an
+    ALREADY-STARTED Attempt (T15-D27 corrective): never creates a new
+    Attempt and never re-resolves "the current active package" (that is
+    submit()/submit_installed_attempt()'s own pinned-context guarantee).
+    Rejects a submitting session/identity that does not match the
+    Attempt's own learner; any learner-identifying field in the POST body
+    itself is never read at all -- only the session/auth-resolved
+    identity is ever trusted.
+    """
+
+    def post(self, request, attempt_public_id):
+        if not getattr(settings, "LINUXLAB_CAN_SERVE_LEARNER_CONTENT", False):
+            return HttpResponseForbidden(
+                "Node learner content serving is not enabled on this deployment profile"
+            )
+
+        try:
+            submission = json.loads(request.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JsonResponse({"error": "invalid JSON body"}, status=400)
+
+        attempt = get_attempt_by_public_id(attempt_public_id)
+        if attempt is None or attempt.installed_activity_version_id is None:
+            return JsonResponse({"error": "not found"}, status=404)
+
+        learner = _resolve_node_learner(request)
+        if learner.pk != attempt.learner_id:
+            return JsonResponse({"error": "forbidden"}, status=403)
+
+        activity_registry = build_default_activity_registry()
+        try:
+            result = submit(attempt, submission, activity_registry)
         except ValueError as exc:
             return JsonResponse({"error": str(exc)}, status=400)
 
