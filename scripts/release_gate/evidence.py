@@ -63,7 +63,13 @@ class SecretRegistry:
             self._secrets.add(str(value))
 
     def redact_text(self, text: str) -> str:
-        for secret in self._secrets:
+        # Longest-first: if one registered secret is a substring of
+        # another (e.g. "ABC" and "ABCDEF"), redacting the shorter one
+        # first would consume part of the longer one and leave its
+        # remainder ("DEF") exposed. Sorting by descending length makes
+        # redaction order deterministic and immune to that case, instead
+        # of depending on set iteration order.
+        for secret in sorted(self._secrets, key=len, reverse=True):
             text = text.replace(secret, _REDACTED)
         return text
 
