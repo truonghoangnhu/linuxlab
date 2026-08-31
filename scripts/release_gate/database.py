@@ -11,12 +11,27 @@ names to operate on; it can never supply an arbitrary name value, so a
 foreign-run name, a production-like name, an embedded-dev-DB name, or
 a bare prefix can never be authorized, even if it happens to match the
 gate's naming pattern.
+
+Checkpoint corrective 2 (finding #1): a bare `GateDatabaseNames`
+instance is itself forgeable -- its stored member strings used to be
+trusted as-is. `_resolve_owned_name()` now RECOMPUTES the canonical
+name from the object's own `run_id` + role and rejects any object whose
+stored field does not exactly match that recomputation, so a forged
+`central`/`node`/`restore_central`/`restore_node` value (even a
+production-like or embedded-dev-name one, even one that looks like a
+perfectly valid gate name for some OTHER run) can never reach a
+connection or subprocess. `GateDatabaseNames.for_run()` is the only
+supported producer (`init=False` blocks the plain keyword
+constructor); an `_owner_token` sentinel is checked as defense in
+depth, but the canonical recomputation is the actual safety boundary
+-- it holds even against an object built by bypassing the constructor
+entirely via `object.__new__()`/`object.__setattr__()`.
 """
 
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import psycopg
@@ -32,6 +47,11 @@ _GATE_NAME_PATTERN_BY_PREFIX = (
 )
 
 _MEMBERS = ("central", "node", "restore_central", "restore_node")
+
+# Identifies an object as genuinely produced by GateDatabaseNames.for_run()
+# in THIS process. Defense in depth only, per the module docstring above --
+# never a substitute for the canonical-recomputation check.
+_OWNER_TOKEN = object()
 
 
 class DatabaseSafetyError(Exception):
@@ -52,47 +72,79 @@ def assert_ephemeral_database_name(name: str) -> None:
     )
 
 
-@dataclass(frozen=True)
+def _canonical_database_name(run_id: str, role: str) -> str:
+    """The single formula every gate database name is derived from.
+    Re-run on every resolution (never trusted from a stored field) so a
+    forged object can never substitute an arbitrary name for a given
+    run_id/role pair."""
+    assert_valid_run_id(run_id)
+    if role not in _MEMBERS:
+        raise DatabaseSafetyError(f"unknown database role {role!r}; must be one of {_MEMBERS}")
+    return f"linuxlab_gate_{role}_{run_id}"
+
+
+@dataclass(frozen=True, init=False)
 class GateDatabaseNames:
     run_id: str
     central: str
     node: str
     restore_central: str
     restore_node: str
+    _owner_token: object = field(repr=False, compare=False)
 
     @classmethod
     def for_run(cls, run_id: str) -> "GateDatabaseNames":
         assert_valid_run_id(run_id)
-        return cls(
-            run_id=run_id,
-            central=f"linuxlab_gate_central_{run_id}",
-            node=f"linuxlab_gate_node_{run_id}",
-            restore_central=f"linuxlab_gate_restore_central_{run_id}",
-            restore_node=f"linuxlab_gate_restore_node_{run_id}",
-        )
+        obj = object.__new__(cls)
+        object.__setattr__(obj, "run_id", run_id)
+        for role in _MEMBERS:
+            object.__setattr__(obj, role, _canonical_database_name(run_id, role))
+        object.__setattr__(obj, "_owner_token", _OWNER_TOKEN)
+        return obj
 
     def all_names(self):
         return (self.central, self.node, self.restore_central, self.restore_node)
 
 
-def _resolve_owned_name(gate_names, member: str) -> str:
-    """The ONLY way any function below learns which database name to
-    operate on. `gate_names` must be a real GateDatabaseNames (never a
-    bare string -- a caller cannot pass an arbitrary name at all), and
-    `member` must be one of the four known roles. The resolved name is
-    re-validated for shape as defense in depth before it ever reaches
-    a subprocess/connection."""
+def _require_authentic_owner(gate_names) -> None:
     if not isinstance(gate_names, GateDatabaseNames):
         raise DatabaseSafetyError(
             "database operations require a real GateDatabaseNames for the "
             "current run, produced by GateDatabaseNames.for_run(run_id) -- "
             "a bare database name string is never accepted"
         )
+    # Defense in depth: catches accidental misuse cheaply. NOT the
+    # primary safety check -- a forged object built via
+    # object.__new__()/object.__setattr__() could carry this exact
+    # sentinel too, which is exactly why _resolve_owned_name() below
+    # always recomputes the canonical name independently as well.
+    if getattr(gate_names, "_owner_token", None) is not _OWNER_TOKEN:
+        raise DatabaseSafetyError(
+            "GateDatabaseNames must be produced by GateDatabaseNames.for_run(); "
+            "an object lacking the authentic owner token is never accepted"
+        )
+
+
+def _resolve_owned_name(gate_names, member: str) -> str:
+    """The ONLY way any function below learns which database name to
+    operate on. Returns the name RECOMPUTED from `gate_names.run_id` +
+    `member` -- never the caller-provided stored field unchecked -- and
+    raises if that stored field disagrees with the recomputation, so a
+    forged/mismatched owner can never reach a connection or
+    subprocess."""
+    _require_authentic_owner(gate_names)
     if member not in _MEMBERS:
         raise DatabaseSafetyError(f"unknown database role {member!r}; must be one of {_MEMBERS}")
-    name = getattr(gate_names, member)
-    assert_ephemeral_database_name(name)
-    return name
+    canonical = _canonical_database_name(gate_names.run_id, member)
+    stored = getattr(gate_names, member)
+    if stored != canonical:
+        raise DatabaseSafetyError(
+            f"GateDatabaseNames.{member} ({stored!r}) does not match the name "
+            f"canonically derived from its own run_id ({canonical!r}) -- refusing "
+            "to trust a forged/mismatched owner"
+        )
+    assert_ephemeral_database_name(canonical)
+    return canonical
 
 
 def _connect_admin(db_admin, dbname="postgres"):

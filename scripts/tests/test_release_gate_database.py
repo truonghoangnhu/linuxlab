@@ -243,6 +243,196 @@ def test_drop_database_is_idempotent_for_a_name_that_never_existed():
     drop_database(db_admin, names, "central")  # does not raise even though it never existed
 
 
+# --- corrective 2: canonical recomputation defeats forged owner objects ----
+
+
+def _forge_gate_names(run_id="rabc123def456", **field_overrides):
+    """Build a GateDatabaseNames-shaped object the way the checkpoint
+    review did: bypass for_run() entirely via object.__new__() +
+    object.__setattr__(), so even a caller who reaches directly into
+    the dataclass's storage (not just its public constructor) is
+    covered by the same rejection. Defaults are the CORRECT canonical
+    names for `run_id` -- callers override exactly the field(s) they
+    want to forge."""
+    obj = object.__new__(GateDatabaseNames)
+    canonical = {
+        "run_id": run_id,
+        "central": f"linuxlab_gate_central_{run_id}",
+        "node": f"linuxlab_gate_node_{run_id}",
+        "restore_central": f"linuxlab_gate_restore_central_{run_id}",
+        "restore_node": f"linuxlab_gate_restore_node_{run_id}",
+    }
+    canonical.update(field_overrides)
+    for key, value in canonical.items():
+        object.__setattr__(obj, key, value)
+    # Deliberately no _owner_token set at all -- this alone must be
+    # sufficient for database_module._require_authentic_owner to reject
+    # it, independent of whether the field values happen to be
+    # canonical.
+    return obj
+
+
+def test_create_database_refuses_forged_object_with_production_like_central(monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    forged = _forge_gate_names(central="linuxlab_gate_central_production")
+
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), forged, "central")
+
+
+def test_create_database_refuses_forged_object_with_embedded_dev_restore_node(monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    forged = _forge_gate_names(restore_node="linuxlab_gate_restore_node_linuxlab_node_dev")
+
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), forged, "restore_node")
+
+
+def test_create_database_refuses_forged_object_with_foreign_run_looking_central(monkeypatch):
+    """The `central` field looks like a perfectly valid gate name -- for
+    a DIFFERENT run than the object's own run_id. Canonical
+    recomputation from run_id must catch the mismatch."""
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    forged = _forge_gate_names(
+        run_id="rmyownrun000", central="linuxlab_gate_central_rsomeotherrun999"
+    )
+
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), forged, "central")
+
+
+@pytest.mark.parametrize(
+    "op,field,value,member,extra_args",
+    [
+        ("create_database", "central", "linuxlab_gate_central_production", "central", ()),
+        ("drop_database", "central", "linuxlab_gate_central_production", "central", ()),
+    ],
+)
+def test_forged_owner_is_rejected_before_any_connection_across_all_writers(
+    op, field, value, member, extra_args, monkeypatch
+):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError(f"{op} must not connect")),
+    )
+    func = getattr(database_module, op)
+    forged = _forge_gate_names(**{field: value})
+
+    with pytest.raises(DatabaseSafetyError):
+        func(_admin_connection(), forged, member, *extra_args)
+
+
+def test_dump_database_refuses_forged_owner_and_opens_no_subprocess(tmp_path, monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module.subprocess,
+        "run",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not invoke pg_dump")),
+    )
+    forged = _forge_gate_names(central="linuxlab_gate_central_production")
+
+    with pytest.raises(DatabaseSafetyError):
+        dump_database(_admin_connection(), forged, "central", tmp_path / "d.bin")
+
+
+def test_restore_database_refuses_forged_owner_and_opens_no_subprocess(tmp_path, monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module.subprocess,
+        "run",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not invoke pg_restore")),
+    )
+    dump_path = tmp_path / "dump.bin"
+    dump_path.write_bytes(b"not-a-real-dump")
+    forged = _forge_gate_names(restore_node="linuxlab_gate_restore_node_linuxlab_node_dev")
+
+    with pytest.raises(DatabaseSafetyError):
+        restore_database(_admin_connection(), forged, "restore_node", dump_path)
+
+
+def test_run_migrations_refuses_forged_owner_and_opens_no_subprocess(monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module.subprocess,
+        "run",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not invoke migrate")),
+    )
+    forged = _forge_gate_names(central="linuxlab_gate_central_production")
+
+    with pytest.raises(DatabaseSafetyError):
+        database_module.run_migrations(
+            forged, "central", {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+        )
+
+
+def test_create_database_refuses_a_perfectly_consistent_but_unauthenticated_forged_object(
+    monkeypatch,
+):
+    """Even a forged object whose fields ARE canonically self-consistent
+    (correctly derived from its own run_id) must still be rejected --
+    it was never produced by GateDatabaseNames.for_run(), so it carries
+    no authentic owner token."""
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    forged = _forge_gate_names()  # all fields canonical for their own run_id
+
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), forged, "central")
+
+
+def test_gate_database_names_public_constructor_is_not_available():
+    """for_run() is the only supported producer -- direct keyword
+    construction must not silently create a trusted-looking object."""
+    with pytest.raises(TypeError):
+        GateDatabaseNames(
+            run_id="rabc123def456",
+            central="linuxlab_gate_central_rabc123def456",
+            node="linuxlab_gate_node_rabc123def456",
+            restore_central="linuxlab_gate_restore_central_rabc123def456",
+            restore_node="linuxlab_gate_restore_node_rabc123def456",
+        )
+
+
+def test_for_run_produced_names_are_internally_canonical():
+    """The happy path -- an object legitimately produced by for_run()
+    always has fields that already match their own canonical
+    derivation, so _resolve_owned_name's consistency check never
+    rejects genuine output."""
+    names = GateDatabaseNames.for_run("ravalidrun001")
+
+    assert names.central == "linuxlab_gate_central_ravalidrun001"
+    assert names.restore_node == "linuxlab_gate_restore_node_ravalidrun001"
+
+
 def test_create_database_for_one_run_never_touches_another_runs_names():
     db_admin = _admin_connection()
     mine = GateDatabaseNames.for_run(_run_id())
