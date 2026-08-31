@@ -10,8 +10,10 @@ import pytest
 from scripts.release_gate.evidence import (
     EXIT_CODE,
     SCHEMA_VERSION,
+    RedactionKeyCollisionError,
     ReleaseEvidence,
     ScenarioResult,
+    SecretLeakError,
     SecretRegistry,
     write_json_evidence,
     write_markdown_evidence,
@@ -127,6 +129,115 @@ def test_write_json_evidence_redacts_secret_sentinels(tmp_path):
     assert "NODE_SECRET_DO_NOT_LEAK" not in text
     assert "PRIVATE_KEY_DO_NOT_LEAK" not in text
     assert json.loads(text)["schema_version"] == 1
+
+
+# --- checkpoint corrective: secrets embedded in dict KEYS (finding #3) -----
+
+
+def test_secret_registry_redacts_a_secret_embedded_in_a_dict_key():
+    secrets = SecretRegistry()
+    secrets.register("SUPER_SECRET_VALUE")
+
+    redacted = secrets.redact_value({"node-SUPER_SECRET_VALUE-credential": {"inner": "ok"}})
+
+    assert "SUPER_SECRET_VALUE" not in json.dumps(redacted)
+
+
+def test_secret_registry_redacts_a_secret_that_is_exactly_the_whole_key():
+    secrets = SecretRegistry()
+    secrets.register("WHOLE_KEY_SECRET")
+
+    redacted = secrets.redact_value({"WHOLE_KEY_SECRET": "value"})
+
+    assert "WHOLE_KEY_SECRET" not in json.dumps(redacted)
+
+
+def test_secret_registry_redacts_a_secret_in_a_nested_key_several_levels_deep():
+    secrets = SecretRegistry()
+    secrets.register("DEEP_KEY_SECRET")
+
+    redacted = secrets.redact_value(
+        {"outer": {"mid-DEEP_KEY_SECRET-mid": {"inner": [{"leaf-DEEP_KEY_SECRET": 1}]}}}
+    )
+
+    assert "DEEP_KEY_SECRET" not in json.dumps(redacted)
+
+
+def test_secret_registry_redacts_overlapping_secrets_in_the_same_key():
+    secrets = SecretRegistry()
+    secrets.register("ABC")
+    secrets.register("ABCDEF")
+
+    redacted = secrets.redact_value({"key-ABCDEF-tail": "value"})
+
+    assert "ABC" not in json.dumps(redacted)
+    assert "DEF" not in json.dumps(redacted)
+
+
+def test_secret_registry_fails_closed_on_redacted_key_collision():
+    secrets = SecretRegistry()
+    secrets.register("X")
+
+    # "aXb" redacts to "a[REDACTED]b", which collides with a second key
+    # that is already literally "a[REDACTED]b" -- two distinct original
+    # keys must never silently collapse into one entry.
+    with pytest.raises(RedactionKeyCollisionError):
+        secrets.redact_value({"aXb": 1, "a[REDACTED]b": 2})
+
+
+def test_secret_registry_does_not_raise_when_redaction_removes_a_would_be_duplicate_key_but_only_one_exists():
+    secrets = SecretRegistry()
+    secrets.register("X")
+
+    redacted = secrets.redact_value({"aXb": 1, "unrelated": 2})
+
+    assert "X" not in json.dumps(redacted)
+    assert len(redacted) == 2
+
+
+def test_write_json_evidence_redacts_a_secret_embedded_in_a_dict_key(tmp_path):
+    secrets = SecretRegistry()
+    secrets.register("KEY_EMBEDDED_SECRET")
+    evidence = _make_evidence(checks={"node-KEY_EMBEDDED_SECRET-credential": "issued"})
+    path = tmp_path / "release-evidence.json"
+
+    write_json_evidence(path, evidence, secrets)
+
+    assert "KEY_EMBEDDED_SECRET" not in path.read_text()
+
+
+def test_secret_registry_assert_no_secrets_present_raises_when_a_secret_remains():
+    secrets = SecretRegistry()
+    secrets.register("LEAKED_SECRET")
+
+    with pytest.raises(SecretLeakError):
+        secrets.assert_no_secrets_present("this text still has LEAKED_SECRET in it")
+
+
+def test_secret_registry_assert_no_secrets_present_passes_clean_text():
+    secrets = SecretRegistry()
+    secrets.register("LEAKED_SECRET")
+
+    secrets.assert_no_secrets_present("this text is clean")  # does not raise
+
+
+def test_write_json_evidence_aborts_and_leaves_no_artifact_if_a_secret_would_leak(
+    tmp_path, monkeypatch
+):
+    import scripts.release_gate.evidence as evidence_module
+
+    secrets = SecretRegistry()
+    secrets.register("UNREDACTABLE_SECRET")
+    evidence = _make_evidence(checks={"leak": "UNREDACTABLE_SECRET"})
+    path = tmp_path / "release-evidence.json"
+
+    # Simulate a redaction bug: value passes through untouched.
+    monkeypatch.setattr(evidence_module.SecretRegistry, "redact_value", lambda self, value: value)
+
+    with pytest.raises(SecretLeakError):
+        write_json_evidence(path, evidence, secrets)
+
+    assert not path.exists()
 
 
 def test_write_markdown_evidence_redacts_secret_sentinels(tmp_path):

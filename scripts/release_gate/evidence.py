@@ -30,12 +30,30 @@ EXIT_CODE = {
 _REDACTED = "[REDACTED]"
 
 
+class RedactionKeyCollisionError(Exception):
+    """Raised when redacting two distinct dict keys would produce the
+    same sanitized key. Checkpoint corrective (finding #3): silently
+    letting one redacted entry overwrite another could both hide data
+    and make evidence internally inconsistent, so this fails closed
+    instead of picking a winner."""
+
+
+class SecretLeakError(Exception):
+    """Raised when a final full-text scan of serialized evidence output
+    still contains a registered secret. Checkpoint corrective (finding
+    #3): redact_value()/redact_text() are defense in depth, not proof;
+    this is the last-resort check that aborts the write entirely rather
+    than ever publish a partially-redacted artifact."""
+
+
 class SecretRegistry:
     """Accumulates known secret VALUES seen during a gate run so
     redact_text()/redact_value() can scrub every occurrence of each
-    exact value from evidence/log output, wherever it appears. This is
-    defense in depth, never a substitute for not putting secrets in
-    evidence in the first place."""
+    exact value from evidence/log output, wherever it appears -- in
+    string values AND in dict keys, since a secret can end up embedded
+    in a key (e.g. an identifier built from a token). This is defense
+    in depth, never a substitute for not putting secrets in evidence in
+    the first place."""
 
     def __init__(self):
         self._secrets: set[str] = set()
@@ -53,10 +71,28 @@ class SecretRegistry:
         if isinstance(value, str):
             return self.redact_text(value)
         if isinstance(value, dict):
-            return {key: self.redact_value(item) for key, item in value.items()}
+            result: dict = {}
+            for key, item in value.items():
+                new_key = self.redact_text(key) if isinstance(key, str) else key
+                if new_key in result:
+                    raise RedactionKeyCollisionError(
+                        f"redacting dict key {key!r} produced {new_key!r}, which "
+                        "collides with another key already redacted in this same "
+                        "mapping -- refusing to silently overwrite one entry"
+                    )
+                result[new_key] = self.redact_value(item)
+            return result
         if isinstance(value, (list, tuple)):
             return [self.redact_value(item) for item in value]
         return value
+
+    def assert_no_secrets_present(self, text: str) -> None:
+        for secret in self._secrets:
+            if secret in text:
+                raise SecretLeakError(
+                    "a registered secret is still present in serialized evidence "
+                    "output after redaction -- refusing to write this artifact"
+                )
 
 
 @dataclass(frozen=True)
@@ -115,6 +151,7 @@ def _atomic_write_text(path, text: str) -> None:
 def write_json_evidence(path, evidence: ReleaseEvidence, secrets: SecretRegistry) -> None:
     doc = secrets.redact_value(evidence.to_dict())
     text = json.dumps(doc, indent=2, sort_keys=True)
+    secrets.assert_no_secrets_present(text)
     _atomic_write_text(path, text)
 
 
@@ -155,4 +192,5 @@ def write_markdown_evidence(path, evidence: ReleaseEvidence, secrets: SecretRegi
         lines += ["## Cleanup failure", "", str(evidence.cleanup_failure), ""]
 
     text = secrets.redact_text("\n".join(lines))
+    secrets.assert_no_secrets_present(text)
     _atomic_write_text(path, text)
