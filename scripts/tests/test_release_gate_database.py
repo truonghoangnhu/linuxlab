@@ -1,6 +1,15 @@
 """Task 15 fail-closed ephemeral PostgreSQL lifecycle (T15-D06, T15-D19,
 T15-D23).
 
+Checkpoint corrective (finding #1): prefix matching alone is not
+authorization. Every destructive/data-moving operation now requires a
+real `GateDatabaseNames` for the current run plus a role selector
+("central"/"node"/"restore_central"/"restore_node") -- there is no API
+surface that accepts a bare database-name string at all, so a
+foreign-run name, a production-like name, an embedded-dev-DB name, or
+a bare prefix can never be authorized, even if it happens to match the
+gate's naming pattern.
+
 These tests use the real local PostgreSQL 18 service (CLAUDE.md: "Use
 the existing local PostgreSQL installation") -- no mocked database
 layer. Every test that creates a real ephemeral database cleans it up
@@ -22,7 +31,7 @@ from scripts.release_gate.database import (
     dump_database,
     restore_database,
 )
-from scripts.release_gate.environment import DatabaseAdminConnection
+from scripts.release_gate.environment import DatabaseAdminConnection, PreflightError
 
 
 def _admin_connection():
@@ -45,7 +54,11 @@ def _connect(db_admin, dbname):
     )
 
 
-# --- naming / safety ------------------------------------------------------
+def _run_id():
+    return "r" + uuid.uuid4().hex[:10]
+
+
+# --- naming shape / GateDatabaseNames ---------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -89,14 +102,117 @@ def test_gate_database_names_for_run_produces_all_four_prefixes():
         assert_ephemeral_database_name(name)  # every produced name is self-consistent
 
 
-def test_create_database_refuses_unsafe_name():
-    with pytest.raises(DatabaseSafetyError):
-        create_database(_admin_connection(), "linuxlab_central_dev")
+def test_gate_database_names_for_run_rejects_malformed_run_id():
+    for bad_run_id in ("Has-Dash", "has space", "UPPER", "semi;colon", ""):
+        with pytest.raises(PreflightError):
+            GateDatabaseNames.for_run(bad_run_id)
 
 
-def test_drop_database_refuses_unsafe_name():
+def test_gate_database_names_for_different_runs_never_collide():
+    a = GateDatabaseNames.for_run(_run_id())
+    b = GateDatabaseNames.for_run(_run_id())
+
+    assert set(a.all_names()).isdisjoint(set(b.all_names()))
+
+
+# --- ownership: no bare-string API surface exists ---------------------------
+
+
+def test_create_database_refuses_a_bare_string_target():
     with pytest.raises(DatabaseSafetyError):
-        drop_database(_admin_connection(), "linuxlab_test")
+        create_database(_admin_connection(), "linuxlab_gate_central_rabc123", "central")
+
+
+def test_create_database_refuses_foreign_run_looking_string():
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), "linuxlab_gate_central_other_run", "central")
+
+
+def test_create_database_refuses_production_like_string():
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), "linuxlab_gate_central_production", "central")
+
+
+def test_create_database_refuses_embedded_dev_name_string():
+    with pytest.raises(DatabaseSafetyError):
+        create_database(
+            _admin_connection(), "linuxlab_gate_restore_node_linuxlab_node_dev", "restore_node"
+        )
+
+
+def test_create_database_refuses_prefix_only_string():
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), "linuxlab_gate_central_", "central")
+
+
+def test_create_database_refuses_unknown_member():
+    names = GateDatabaseNames.for_run(_run_id())
+    with pytest.raises(DatabaseSafetyError):
+        create_database(_admin_connection(), names, "not_a_real_member")
+
+
+@pytest.mark.parametrize(
+    "op,args",
+    [
+        ("create_database", ()),
+        ("drop_database", ()),
+    ],
+)
+def test_no_connection_is_opened_for_a_rejected_bare_string(op, args, monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    def _fail_if_called(*a, **kw):
+        raise AssertionError(f"{op} must not open a DB connection for a rejected target")
+
+    monkeypatch.setattr(database_module, "_connect_admin", _fail_if_called)
+    func = getattr(database_module, op)
+
+    with pytest.raises(DatabaseSafetyError):
+        func(_admin_connection(), "linuxlab_gate_central_other_run", "central", *args)
+
+
+def test_dump_database_refuses_bare_string_and_opens_no_subprocess(tmp_path, monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    def _fail_if_called(*a, **kw):
+        raise AssertionError("dump_database must not invoke pg_dump for a rejected target")
+
+    monkeypatch.setattr(database_module.subprocess, "run", _fail_if_called)
+
+    with pytest.raises(DatabaseSafetyError):
+        dump_database(_admin_connection(), "linuxlab_central_dev", "central", tmp_path / "d.bin")
+
+
+def test_restore_database_refuses_bare_string_and_opens_no_subprocess(tmp_path, monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    def _fail_if_called(*a, **kw):
+        raise AssertionError("restore_database must not invoke pg_restore for a rejected target")
+
+    monkeypatch.setattr(database_module.subprocess, "run", _fail_if_called)
+    dump_path = tmp_path / "dump.bin"
+    dump_path.write_bytes(b"not-a-real-dump")
+
+    with pytest.raises(DatabaseSafetyError):
+        restore_database(_admin_connection(), "linuxlab_test", "restore_node", dump_path)
+
+
+def test_run_migrations_pins_postgres_db_to_the_owned_name_ignoring_caller_override(monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    names = GateDatabaseNames.for_run(_run_id())
+    captured = {}
+
+    def _fake_run(argv, cwd, env, check, capture_output, text):
+        captured["env"] = env
+
+    monkeypatch.setattr(database_module.subprocess, "run", _fake_run)
+
+    database_module.run_migrations(
+        names, "central", {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central", "POSTGRES_DB": "linuxlab_central_dev"}
+    )
+
+    assert captured["env"]["POSTGRES_DB"] == names.central
 
 
 # --- real PostgreSQL create/drop --------------------------------------------
@@ -104,29 +220,43 @@ def test_drop_database_refuses_unsafe_name():
 
 def test_create_and_drop_real_ephemeral_database():
     db_admin = _admin_connection()
-    run_id = "r" + uuid.uuid4().hex[:10]
-    name = GateDatabaseNames.for_run(run_id).central
+    names = GateDatabaseNames.for_run(_run_id())
 
-    create_database(db_admin, name)
+    create_database(db_admin, names, "central")
     try:
-        with _connect(db_admin, name) as conn:
+        with _connect(db_admin, names.central) as conn:
             conn.execute("SELECT 1")  # connects successfully -- DB really exists
     finally:
-        drop_database(db_admin, name)
+        drop_database(db_admin, names, "central")
 
     with _connect(db_admin, "postgres") as conn:
         exists = conn.execute(
-            "SELECT 1 FROM pg_database WHERE datname = %s", (name,)
+            "SELECT 1 FROM pg_database WHERE datname = %s", (names.central,)
         ).fetchone()
     assert exists is None
 
 
 def test_drop_database_is_idempotent_for_a_name_that_never_existed():
     db_admin = _admin_connection()
-    run_id = "r" + uuid.uuid4().hex[:10]
-    name = GateDatabaseNames.for_run(run_id).central
+    names = GateDatabaseNames.for_run(_run_id())
 
-    drop_database(db_admin, name)  # does not raise even though it never existed
+    drop_database(db_admin, names, "central")  # does not raise even though it never existed
+
+
+def test_create_database_for_one_run_never_touches_another_runs_names():
+    db_admin = _admin_connection()
+    mine = GateDatabaseNames.for_run(_run_id())
+    other = GateDatabaseNames.for_run(_run_id())
+
+    create_database(db_admin, mine, "central")
+    try:
+        with _connect(db_admin, "postgres") as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (other.central,)
+            ).fetchone()
+        assert exists is None
+    finally:
+        drop_database(db_admin, mine, "central")
 
 
 # --- dump / restore ----------------------------------------------------
@@ -134,41 +264,27 @@ def test_drop_database_is_idempotent_for_a_name_that_never_existed():
 
 def test_dump_and_restore_preserves_a_row(tmp_path):
     db_admin = _admin_connection()
-    run_id = "r" + uuid.uuid4().hex[:10]
-    names = GateDatabaseNames.for_run(run_id)
+    names = GateDatabaseNames.for_run(_run_id())
 
-    create_database(db_admin, names.central)
+    create_database(db_admin, names, "central")
     try:
         with _connect(db_admin, names.central) as conn:
             conn.execute("CREATE TABLE gate_probe (id serial primary key, label text)")
             conn.execute("INSERT INTO gate_probe (label) VALUES ('gate-dump-restore-proof')")
 
         dump_path = tmp_path / "central.dump"
-        dump_database(db_admin, names.central, dump_path)
+        dump_database(db_admin, names, "central", dump_path)
         assert dump_path.exists()
         assert dump_path.stat().st_size > 0
 
-        create_database(db_admin, names.restore_central)
+        create_database(db_admin, names, "restore_central")
         try:
-            restore_database(db_admin, names.restore_central, dump_path)
+            restore_database(db_admin, names, "restore_central", dump_path)
 
             with _connect(db_admin, names.restore_central) as conn:
                 row = conn.execute("SELECT label FROM gate_probe").fetchone()
             assert row == ("gate-dump-restore-proof",)
         finally:
-            drop_database(db_admin, names.restore_central)
+            drop_database(db_admin, names, "restore_central")
     finally:
-        drop_database(db_admin, names.central)
-
-
-def test_dump_database_refuses_unsafe_source_name(tmp_path):
-    with pytest.raises(DatabaseSafetyError):
-        dump_database(_admin_connection(), "linuxlab_central_dev", tmp_path / "dump.bin")
-
-
-def test_restore_database_refuses_unsafe_target_name(tmp_path):
-    dump_path = tmp_path / "dump.bin"
-    dump_path.write_bytes(b"not-a-real-dump")
-
-    with pytest.raises(DatabaseSafetyError):
-        restore_database(_admin_connection(), "linuxlab_test", dump_path)
+        drop_database(db_admin, names, "central")

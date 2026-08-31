@@ -1,12 +1,16 @@
 """Task 15 fail-closed ephemeral PostgreSQL lifecycle and recovery
 primitives (T15-D06, T15-D19, T15-D23).
 
-Every database name any function here touches is validated against a
-narrow allow-list of gate-owned prefixes BEFORE the operation runs --
-this module refuses to create, drop, dump, or restore into a name that
-doesn't look like one of its own ephemeral databases, even if asked to.
-It never targets `linuxlab_central_dev`/`linuxlab_node_dev`/
-`linuxlab_test` or any other name outside its own prefixes.
+Checkpoint corrective (finding #1): prefix matching alone is not
+authorization. Every destructive/data-moving operation requires a real
+`GateDatabaseNames` for the current run plus a role selector
+("central"/"node"/"restore_central"/"restore_node") -- there is NO
+public function here that accepts a bare database-name string at all.
+A caller can only ever select which of the current run's own four
+names to operate on; it can never supply an arbitrary name value, so a
+foreign-run name, a production-like name, an embedded-dev-DB name, or
+a bare prefix can never be authorized, even if it happens to match the
+gate's naming pattern.
 """
 
 import os
@@ -18,6 +22,8 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
+from .environment import assert_valid_run_id
+
 _GATE_NAME_PATTERN_BY_PREFIX = (
     "linuxlab_gate_central_",
     "linuxlab_gate_node_",
@@ -25,10 +31,14 @@ _GATE_NAME_PATTERN_BY_PREFIX = (
     "linuxlab_gate_restore_node_",
 )
 
+_MEMBERS = ("central", "node", "restore_central", "restore_node")
+
 
 class DatabaseSafetyError(Exception):
     """Raised when a database name fails the ephemeral-name safety
-    check. Maps to PRECHECK_FAILURE."""
+    check, or when a caller attempts to operate outside the
+    GateDatabaseNames + member-selector API surface. Maps to
+    PRECHECK_FAILURE."""
 
 
 def assert_ephemeral_database_name(name: str) -> None:
@@ -52,6 +62,7 @@ class GateDatabaseNames:
 
     @classmethod
     def for_run(cls, run_id: str) -> "GateDatabaseNames":
+        assert_valid_run_id(run_id)
         return cls(
             run_id=run_id,
             central=f"linuxlab_gate_central_{run_id}",
@@ -62,6 +73,26 @@ class GateDatabaseNames:
 
     def all_names(self):
         return (self.central, self.node, self.restore_central, self.restore_node)
+
+
+def _resolve_owned_name(gate_names, member: str) -> str:
+    """The ONLY way any function below learns which database name to
+    operate on. `gate_names` must be a real GateDatabaseNames (never a
+    bare string -- a caller cannot pass an arbitrary name at all), and
+    `member` must be one of the four known roles. The resolved name is
+    re-validated for shape as defense in depth before it ever reaches
+    a subprocess/connection."""
+    if not isinstance(gate_names, GateDatabaseNames):
+        raise DatabaseSafetyError(
+            "database operations require a real GateDatabaseNames for the "
+            "current run, produced by GateDatabaseNames.for_run(run_id) -- "
+            "a bare database name string is never accepted"
+        )
+    if member not in _MEMBERS:
+        raise DatabaseSafetyError(f"unknown database role {member!r}; must be one of {_MEMBERS}")
+    name = getattr(gate_names, member)
+    assert_ephemeral_database_name(name)
+    return name
 
 
 def _connect_admin(db_admin, dbname="postgres"):
@@ -75,17 +106,17 @@ def _connect_admin(db_admin, dbname="postgres"):
     )
 
 
-def create_database(db_admin, name: str) -> None:
-    assert_ephemeral_database_name(name)
+def create_database(db_admin, gate_names, member: str) -> None:
+    name = _resolve_owned_name(gate_names, member)
     with _connect_admin(db_admin) as conn:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
 
 
-def drop_database(db_admin, name: str) -> None:
+def drop_database(db_admin, gate_names, member: str) -> None:
     """Idempotent: dropping a name that never existed is a safe no-op,
     since a release-gate cleanup pass may run after a partial/failed
     create."""
-    assert_ephemeral_database_name(name)
+    name = _resolve_owned_name(gate_names, member)
     with _connect_admin(db_admin) as conn:
         conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -95,12 +126,14 @@ def drop_database(db_admin, name: str) -> None:
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
 
 
-def run_migrations(profile_env: dict, *, repo_root=None) -> None:
-    """Explicitly run `manage.py migrate` for the given profile/database
+def run_migrations(gate_names, member: str, profile_env: dict, *, repo_root=None) -> None:
+    """Explicitly run `manage.py migrate` for the given profile
     environment (T15-D22: migration is an explicit release step, never
-    application startup)."""
+    application startup). POSTGRES_DB is always pinned to the resolved
+    owned name LAST, so nothing in `profile_env` can override it."""
+    name = _resolve_owned_name(gate_names, member)
     repo_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
-    child_env = {**os.environ, **profile_env}
+    child_env = {**os.environ, **profile_env, "POSTGRES_DB": name}
     subprocess.run(
         [sys.executable, "manage.py", "migrate", "--noinput"],
         cwd=str(repo_root),
@@ -111,8 +144,8 @@ def run_migrations(profile_env: dict, *, repo_root=None) -> None:
     )
 
 
-def dump_database(db_admin, name: str, dump_path) -> None:
-    assert_ephemeral_database_name(name)
+def dump_database(db_admin, gate_names, member: str, dump_path) -> None:
+    name = _resolve_owned_name(gate_names, member)
     child_env = {**os.environ, "PGPASSWORD": db_admin.password}
     subprocess.run(
         [
@@ -131,8 +164,8 @@ def dump_database(db_admin, name: str, dump_path) -> None:
     )
 
 
-def restore_database(db_admin, target_name: str, dump_path) -> None:
-    assert_ephemeral_database_name(target_name)
+def restore_database(db_admin, gate_names, member: str, dump_path) -> None:
+    name = _resolve_owned_name(gate_names, member)
     child_env = {**os.environ, "PGPASSWORD": db_admin.password}
     subprocess.run(
         [
@@ -141,7 +174,7 @@ def restore_database(db_admin, target_name: str, dump_path) -> None:
             "-p", str(db_admin.port),
             "-U", db_admin.user,
             "--no-owner",
-            "-d", target_name,
+            "-d", name,
             str(dump_path),
         ],
         env=child_env,
