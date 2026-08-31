@@ -438,3 +438,58 @@ def test_concurrent_activation_cannot_race_a_new_attempt_start(installed_active_
 
     attempt = Attempt.objects.get(pk=results["attempt_pk"])
     assert attempt.installed_activity_version.package_id == world["package"].pk
+
+
+# --- T15-D27 corrective (Task 5): installed finalization is one atomic
+# --- rollback boundary, not a sequence of independently-committed writes --
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_submit_installed_attempt_rolls_back_everything_on_late_failure(installed_active_world):
+    """A failure inside _finalize_submission() AFTER Result/Progress/
+    DomainEvent have all been written -- here, a genuine operational
+    misconfiguration (sync enabled with no Node identity configured,
+    which enqueue_sync_event() itself already rejects) -- must roll back
+    the WHOLE submission as one unit: no Result, no Progress row, no
+    DomainEvent, and the Attempt itself remains unsubmitted, exactly as
+    if submit_installed_attempt() had never been called at all."""
+    from linuxlab.sync.enqueue import SyncConfigurationError
+
+    world = installed_active_world
+    learner = Learner.objects.create(account=None)
+    context = _context(world)
+    attempt = start_installed_attempt(
+        learner, context, world["definition"].public_id, world["activity_version"].version
+    )
+    submission = {
+        "responses": [
+            {
+                "question_public_id": str(world["question"].public_id),
+                "question_version": world["question_version"].version,
+                "selected_option_id": "a",
+            }
+        ]
+    }
+
+    with (
+        override_settings(LINUXLAB_SYNC_ENABLED=True, LINUXLAB_NODE_ID=None),
+        pytest.raises(SyncConfigurationError),
+    ):
+        submit_installed_attempt(attempt, submission, world["activity_registry"])
+
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+    assert attempt.submission is None
+    assert not hasattr(attempt, "result")
+    assert Progress.objects.filter(
+        learner=learner, activity_definition_public_id=world["definition"].public_id
+    ).exists() is False
+    assert not DomainEvent.objects.filter(
+        event_type="activity.completed", aggregate_id=attempt.public_id
+    ).exists()
+
+    # The attempt is genuinely still submittable afterward -- the failed
+    # attempt left no partial state behind for a retry to trip over.
+    with override_settings(LINUXLAB_SYNC_ENABLED=False):
+        result = submit_installed_attempt(attempt, submission, world["activity_registry"])
+    assert result.score == 1

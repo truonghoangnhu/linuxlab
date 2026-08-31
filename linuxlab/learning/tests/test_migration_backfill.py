@@ -1,9 +1,12 @@
-"""T15-D27 S5: existing Progress rows (all Central-style, created before
-installed execution existed) are backfilled with their stable
-activity_definition_public_id when migrating to 0002."""
+"""T15-D27 S5, upgraded by the T15-D27 corrective (Task 5, "representative
+Attempt + Progress"): migrating a pre-T15-D27 database forward preserves
+existing Central-style Attempts unchanged (installed_activity_version_id
+NULL), backfills existing Progress rows with their stable
+activity_definition_public_id, and leaves the new XOR CheckConstraint live
+and enforced."""
 
 import pytest
-from django.db import connections
+from django.db import IntegrityError, connections, transaction
 from django.db.migrations.executor import MigrationExecutor
 
 APP = "learning"
@@ -27,7 +30,7 @@ def _restore_leaf(executor):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_migration_0002_backfills_activity_definition_public_id():
+def test_migration_0002_preserves_attempts_and_backfills_progress():
     executor = MigrationExecutor(connections["default"])
 
     try:
@@ -39,11 +42,15 @@ def test_migration_0002_backfills_activity_definition_public_id():
         Learner = old_apps.get_model("identity", "Learner")
         ActivityDefinition = old_apps.get_model("activities", "ActivityDefinition")
         ActivityVersion = old_apps.get_model("activities", "ActivityVersion")
+        Attempt = old_apps.get_model(APP, "Attempt")
         Progress = old_apps.get_model(APP, "Progress")
 
         learner = Learner.objects.create(account=None)
         definition = ActivityDefinition.objects.create(name="Legacy activity", type_key="legacy")
-        ActivityVersion.objects.create(definition=definition, version=1, config={})
+        activity_version = ActivityVersion.objects.create(definition=definition, version=1, config={})
+        legacy_attempt = Attempt.objects.create(
+            learner=learner, activity_version=activity_version, submission=None, submitted_at=None
+        )
         legacy_progress = Progress.objects.create(
             learner=learner, activity_definition=definition, completed=True, best_score=1
         )
@@ -54,10 +61,23 @@ def test_migration_0002_backfills_activity_definition_public_id():
 
         new_state = executor.loader.project_state(AFTER)
         new_apps = new_state.apps
+        NewAttempt = new_apps.get_model(APP, "Attempt")
         NewProgress = new_apps.get_model(APP, "Progress")
 
-        migrated = NewProgress.objects.get(pk=legacy_progress.pk)
-        assert migrated.activity_definition_public_id == original_definition_public_id
-        assert migrated.activity_definition_id == definition.pk
+        migrated_attempt = NewAttempt.objects.get(pk=legacy_attempt.pk)
+        assert migrated_attempt.activity_version_id == activity_version.pk
+        assert migrated_attempt.installed_activity_version_id is None
+
+        migrated_progress = NewProgress.objects.get(pk=legacy_progress.pk)
+        assert migrated_progress.activity_definition_public_id == original_definition_public_id
+        assert migrated_progress.activity_definition_id == definition.pk
+
+        # The new XOR CheckConstraint is live and enforced post-migration,
+        # not merely declared: a row satisfying neither/both execution
+        # sources must be rejected by PostgreSQL itself.
+        with pytest.raises(IntegrityError), transaction.atomic():
+            NewAttempt.objects.create(
+                learner_id=learner.pk, activity_version=None, installed_activity_version=None
+            )
     finally:
         _restore_leaf(executor)
