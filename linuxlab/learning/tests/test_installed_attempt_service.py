@@ -16,7 +16,7 @@ from django.test import override_settings
 
 from linuxlab.core.models import DomainEvent
 from linuxlab.identity.models import Learner
-from linuxlab.learning.models import Attempt, Progress
+from linuxlab.learning.models import Attempt, Progress, Result
 from linuxlab.learning.services import (
     start_installed_attempt,
     submit,
@@ -25,6 +25,7 @@ from linuxlab.learning.services import (
 from linuxlab.runtime.context import open_runtime_context
 from linuxlab.runtime.exceptions import RuntimeArtifactNotFound
 from linuxlab.runtime.tests.conftest import republish
+from linuxlab.sync.enqueue import enqueue_sync_event
 from linuxlab.sync.services import activate_package
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -491,14 +492,18 @@ def test_concurrent_activation_cannot_race_a_new_attempt_start(installed_active_
 
 
 @override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
-def test_submit_installed_attempt_rolls_back_everything_on_late_failure(installed_active_world):
+def test_submit_installed_attempt_rolls_back_everything_on_pre_insert_failure(installed_active_world):
     """A failure inside _finalize_submission() AFTER Result/Progress/
-    DomainEvent have all been written -- here, a genuine operational
-    misconfiguration (sync enabled with no Node identity configured,
-    which enqueue_sync_event() itself already rejects) -- must roll back
-    the WHOLE submission as one unit: no Result, no Progress row, no
-    DomainEvent, and the Attempt itself remains unsubmitted, exactly as
-    if submit_installed_attempt() had never been called at all."""
+    DomainEvent have all been written, but where enqueue_sync_event()
+    itself rejects BEFORE inserting any Outbox row -- here, a genuine
+    operational misconfiguration (sync enabled with no Node identity
+    configured) -- must roll back the WHOLE submission as one unit: no
+    Result, no Progress row, no DomainEvent, and the Attempt itself
+    remains unsubmitted, exactly as if submit_installed_attempt() had
+    never been called at all. See the sibling
+    test_submit_installed_attempt_rolls_back_a_real_committed_outbox_insert
+    below for the stronger proof where a real Outbox row genuinely exists
+    before the injected failure."""
     from linuxlab.sync.enqueue import SyncConfigurationError
 
     world = installed_active_world
@@ -539,3 +544,83 @@ def test_submit_installed_attempt_rolls_back_everything_on_late_failure(installe
     with override_settings(LINUXLAB_SYNC_ENABLED=False):
         result = submit_installed_attempt(attempt, submission, world["activity_registry"])
     assert result.score == 1
+
+
+def test_submit_installed_attempt_rolls_back_a_real_committed_outbox_insert(installed_active_world, settings):
+    """T15-D27 final corrective (stronger rollback proof): with sync
+    genuinely enabled and a VALID Node identity configured,
+    enqueue_sync_event() succeeds and really inserts an OutboxMessage row
+    -- observed here, inside the still-open transaction, before an
+    injected failure is raised immediately afterward. A pre-insert
+    validation failure (the sibling test above) does not exercise this:
+    this test proves that even an Outbox row PostgreSQL has already
+    accepted is still rolled back along with Result/Progress/DomainEvent/
+    Attempt when a later step in the same transaction fails."""
+    import uuid
+
+    from linuxlab.sync.models import OutboxMessage
+
+    node_id = uuid.uuid4()
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = str(node_id)
+
+    world = installed_active_world
+    learner = Learner.objects.create(account=None)
+    context = _context(world)
+    attempt = start_installed_attempt(
+        learner, context, world["definition"].public_id, world["activity_version"].version
+    )
+    submission = {
+        "responses": [
+            {
+                "question_public_id": str(world["question"].public_id),
+                "question_version": world["question_version"].version,
+                "selected_option_id": "a",
+            }
+        ]
+    }
+
+    before_results = Result.objects.count()
+    before_domain_events = DomainEvent.objects.count()
+    before_progress = Progress.objects.filter(
+        learner=learner, activity_definition_public_id=world["definition"].public_id
+    ).count()
+    assert OutboxMessage.objects.count() == 0
+
+    class InjectedFailure(Exception):
+        pass
+
+    real_enqueue_sync_event = enqueue_sync_event
+    outbox_observed_before_failure = {}
+
+    def enqueue_then_fail(*args, **kwargs):
+        real_enqueue_sync_event(*args, **kwargs)
+        # The real INSERT has genuinely happened on this connection,
+        # inside the still-open transaction -- observed here, before the
+        # injected failure, so the assertion below proves this is a
+        # POST-insert rollback, not a pre-insert validation short-circuit.
+        outbox_observed_before_failure["count"] = OutboxMessage.objects.count()
+        raise InjectedFailure("simulated failure after a real Outbox insert")
+
+    with (
+        patch("linuxlab.learning.services.enqueue_sync_event", side_effect=enqueue_then_fail),
+        pytest.raises(InjectedFailure),
+    ):
+        submit_installed_attempt(attempt, submission, world["activity_registry"])
+
+    assert outbox_observed_before_failure.get("count") == 1, (
+        "the real Outbox INSERT was never observed before the injected "
+        "failure -- this test would not actually prove post-insert rollback"
+    )
+
+    assert Result.objects.count() == before_results
+    assert Progress.objects.filter(
+        learner=learner, activity_definition_public_id=world["definition"].public_id
+    ).count() == before_progress
+    assert DomainEvent.objects.count() == before_domain_events
+    assert OutboxMessage.objects.count() == 0
+
+    attempt.refresh_from_db()
+    assert attempt.submitted_at is None
+    assert attempt.submission is None
+    assert not hasattr(attempt, "result")
