@@ -85,6 +85,24 @@ def _has_valid_runtime_context_provenance(context):
     return hmac.compare_digest(actual, expected)
 
 
+def verify_context_provenance(context):
+    """Public provenance-ONLY check (T15-D27 corrective): raises
+    RuntimeContextInvalid if `context`'s HMAC seal does not verify
+    against its own claimed identity fields. Touches no database state at
+    all -- it proves only that `context` was minted by
+    open_runtime_context()/open_pinned_context() in this process, never
+    that the package it claims still exists, still matches, or is still
+    ACTIVE. A caller needing that (e.g. linuxlab.learning starting a new
+    installed Attempt) performs a fresh, LOCKED re-check of the actual
+    row itself -- see linuxlab.sync.services.
+    lock_active_installed_activity_for_execution() -- rather than trusting
+    this context's already-read identity fields, which may be stale by
+    the time the lock is acquired.
+    """
+    if not _has_valid_runtime_context_provenance(context):
+        raise RuntimeContextInvalid("RuntimePackageContext provenance is missing or invalid")
+
+
 def open_runtime_context(package_type, source_public_id):
     """Pin the exactly-one ACTIVE InstalledPackage for
     (package_type, source_public_id) as an immutable RuntimePackageContext.

@@ -35,6 +35,7 @@ rebuild or re-verify anything -- they only flip InstalledPackage.state
 
 import json
 import uuid
+from contextlib import contextmanager
 
 from django.conf import settings
 from django.db import IntegrityError, models, transaction
@@ -70,6 +71,16 @@ class PackageActivationError(Exception):
 
 class PackageRollbackError(Exception):
     pass
+
+
+class InstalledActivityNotFoundError(Exception):
+    """No InstalledActivityVersion exists for the given package identity
+    scope (T15-D27 corrective). Raised only by
+    lock_active_installed_activity_for_execution(); callers needing a
+    runtime-domain exception (e.g. linuxlab.learning, which already
+    depends on linuxlab.runtime) translate this at their own boundary --
+    this module never imports linuxlab.runtime itself (that would be
+    circular: linuxlab.runtime already depends on linuxlab.sync)."""
 
 
 def import_package(package_bytes, activity_registry, trusted_public_key):
@@ -343,6 +354,76 @@ def activate_package(package):
         activated = InstalledPackage.objects.get(pk=candidate.pk)
 
     return activated
+
+
+@contextmanager
+def lock_active_installed_activity_for_execution(
+    *,
+    package_pk,
+    package_type,
+    source_public_id,
+    package_version,
+    payload_sha256,
+    activity_public_id,
+    version,
+):
+    """T15-D27 corrective (Important finding): the sync-owned lifecycle-
+    lock boundary for starting a NEW installed Attempt.
+
+    Locks the exact same (package_type, source_public_id) row scope, in
+    the exact same pk order, that activate_package()/rollback_package()
+    lock -- so a concurrent activation/rollback of the same source
+    serializes on that shared lock instead of racing a caller that is
+    about to insert an Attempt against "the currently active package".
+
+    MUST be called inside the caller's own transaction.atomic(); the row
+    lock is held for as long as that transaction remains open, which is
+    what lets the caller safely create an Attempt against the yielded
+    InstalledActivityVersion (while still inside this `with` block, or at
+    least still inside the same outer transaction) without a concurrent
+    activation archiving its package in between the check and the insert.
+
+    Every identity field the caller claims is re-verified against the
+    freshly locked row, not merely package_pk: the caller's
+    RuntimePackageContext may have been opened (and its identity read)
+    before this lock was ever acquired, so nothing about it is trusted
+    without a fresh check under lock. Raises PackageActivationError if
+    the package no longer exists, its identity no longer matches every
+    claimed field, or it is not currently ACTIVE; raises
+    InstalledActivityNotFoundError if no InstalledActivityVersion for
+    (activity_public_id, version) exists in that (now-locked) package.
+    """
+    scope_rows = list(
+        InstalledPackage.objects.select_for_update()
+        .filter(package_type=package_type, source_public_id=source_public_id)
+        .order_by("pk")
+    )
+    package = next((row for row in scope_rows if row.pk == package_pk), None)
+    if package is None:
+        raise PackageActivationError(f"InstalledPackage {package_pk} no longer exists")
+
+    if (
+        package.package_type != package_type
+        or package.source_public_id != source_public_id
+        or package.package_version != package_version
+        or package.payload_sha256 != payload_sha256
+    ):
+        raise PackageActivationError(
+            f"InstalledPackage {package_pk} identity does not match the caller's claim"
+        )
+
+    if package.state != ACTIVE:
+        raise PackageActivationError(f"InstalledPackage {package_pk} is not active")
+
+    installed_activity = InstalledActivityVersion.objects.filter(
+        package=package, activity_public_id=activity_public_id, version=version
+    ).first()
+    if installed_activity is None:
+        raise InstalledActivityNotFoundError(
+            f"no activity {activity_public_id} v{version} in InstalledPackage {package_pk}"
+        )
+
+    yield installed_activity
 
 
 def rollback_package(package_type, source_public_id):

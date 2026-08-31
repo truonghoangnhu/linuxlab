@@ -13,7 +13,6 @@ from linuxlab.learning.models import Attempt, Result
 from linuxlab.learning.projections import refresh_progress
 from linuxlab.runtime.context import open_pinned_context
 from linuxlab.sync.enqueue import enqueue_sync_event
-from linuxlab.sync.models import ACTIVE
 
 _GUEST_CLAIM_SOURCE = "guest_claim"
 _CLAIM_ITEM_KEYS = {"activity_public_id", "activity_version"}
@@ -336,17 +335,48 @@ def start_installed_attempt(learner, context, activity_public_id, version):
     executions may only begin against the active package (T15-D27 S7) --
     an existing Attempt, once started, stays pinned to its package even
     after a newer package activates or this one is archived, but nothing
-    NEW may start against a non-active package. context provenance/
-    identity is re-verified by resolving the pinned InstalledActivityVersion
-    through the runtime boundary, exactly like every other runtime lookup.
+    NEW may start against a non-active package.
+
+    T15-D27 corrective (Important finding): the ACTIVE check and the
+    Attempt INSERT are one atomic, LOCKED serialization boundary
+    (sync.services.lock_active_installed_activity_for_execution()) --
+    never a plain unlocked read followed by a separate insert, which
+    would let a concurrent activate_package()/rollback_package() archive
+    this exact package in the window between the two. Context provenance
+    (proof `context` was genuinely minted by open_runtime_context(), not
+    hand-constructed) is verified first and separately -- it is a pure
+    check with no database access -- but the package/activity identity
+    and ACTIVE state themselves are always re-verified fresh, under lock,
+    never trusted from the context's already-read fields.
     """
-    from linuxlab.runtime.execution import get_installed_activity_for_attempt
+    from linuxlab.runtime.context import verify_context_provenance
+    from linuxlab.runtime.exceptions import RuntimeArtifactNotFound
+    from linuxlab.sync.services import (
+        InstalledActivityNotFoundError,
+        PackageActivationError,
+        lock_active_installed_activity_for_execution,
+    )
 
-    installed_activity = get_installed_activity_for_attempt(context, activity_public_id, version)
-    if installed_activity.package.state != ACTIVE:
-        raise ValueError("cannot start a new Attempt against a non-active package")
+    verify_context_provenance(context)
 
-    return Attempt.objects.create(learner=learner, installed_activity_version=installed_activity)
+    with transaction.atomic():
+        try:
+            with lock_active_installed_activity_for_execution(
+                package_pk=context.package_pk,
+                package_type=context.package_type,
+                source_public_id=context.source_public_id,
+                package_version=context.package_version,
+                payload_sha256=context.payload_sha256,
+                activity_public_id=activity_public_id,
+                version=version,
+            ) as installed_activity:
+                return Attempt.objects.create(
+                    learner=learner, installed_activity_version=installed_activity
+                )
+        except InstalledActivityNotFoundError as exc:
+            raise RuntimeArtifactNotFound(str(exc)) from exc
+        except PackageActivationError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 def submit_installed_attempt(attempt, submission, activity_registry):

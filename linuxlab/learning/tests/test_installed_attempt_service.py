@@ -6,12 +6,17 @@ finalize through the same shared responsibilities as the Central path, and
 never re-resolve "the current active package" for an already-started
 Attempt."""
 
+import threading
+import time
+from unittest.mock import patch
+
 import pytest
+from django.db import close_old_connections, connection
 from django.test import override_settings
 
 from linuxlab.core.models import DomainEvent
 from linuxlab.identity.models import Learner
-from linuxlab.learning.models import Progress
+from linuxlab.learning.models import Attempt, Progress
 from linuxlab.learning.services import (
     start_installed_attempt,
     submit,
@@ -301,7 +306,135 @@ def test_new_attempt_cannot_start_against_a_since_archived_package(installed_act
     activate_package(new_package)  # archives world["package"]
 
     learner = Learner.objects.create(account=None)
-    with pytest.raises(ValueError, match="non-active package"):
+    with pytest.raises(ValueError, match="not active"):
         start_installed_attempt(
             learner, context, world["definition"].public_id, world["activity_version"].version
         )
+
+
+# --- T15-D27 corrective: genuine concurrent race between attempt-start and
+# --- activation, not merely the sequential "already archived" case above --
+
+
+class _AttemptStarterWorker(threading.Thread):
+    """Starts an installed Attempt on its own DB connection. Attempt.objects
+    .create() is patched (with wraps=, so real behavior is unchanged) to
+    signal `lock_acquired` and then block on `release_insert` immediately
+    before the actual INSERT -- this is the exact point at which, if
+    start_installed_attempt() correctly holds the same lifecycle lock
+    activate_package() uses, a concurrent activation of a different
+    package for the same source MUST be blocked too."""
+
+    def __init__(self, learner, context, activity_public_id, version, lock_acquired, release_insert, results):
+        super().__init__()
+        self.learner = learner
+        self.context = context
+        self.activity_public_id = activity_public_id
+        self.version = version
+        self.lock_acquired = lock_acquired
+        self.release_insert = release_insert
+        self.results = results
+
+    def run(self):
+        close_old_connections()
+        try:
+            real_create = Attempt.objects.create
+
+            def _signal_then_create(*args, **kwargs):
+                self.lock_acquired.set()
+                self.release_insert.wait(timeout=5)
+                return real_create(*args, **kwargs)
+
+            with patch.object(Attempt.objects, "create", side_effect=_signal_then_create):
+                attempt = start_installed_attempt(
+                    self.learner, self.context, self.activity_public_id, self.version
+                )
+            self.results["attempt_pk"] = attempt.pk
+        finally:
+            connection.close()
+
+
+class _ConcurrentActivatorWorker(threading.Thread):
+    """Waits for the starter to signal that it holds the lock, then
+    attempts to activate a DIFFERENT package for the SAME source. If
+    start_installed_attempt() holds the correct lifecycle lock, this call
+    must block until the starter's transaction commits or rolls back --
+    recorded here via a wall-clock timestamp, not just eventual success,
+    since an unlocked implementation would also eventually "succeed" just
+    without ever actually blocking."""
+
+    def __init__(self, package, lock_acquired, results):
+        super().__init__()
+        self.package = package
+        self.lock_acquired = lock_acquired
+        self.results = results
+
+    def run(self):
+        close_old_connections()
+        try:
+            self.lock_acquired.wait(timeout=5)
+            activate_package(self.package)
+            self.results["activate_finished_at"] = time.monotonic()
+        finally:
+            connection.close()
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_concurrent_activation_cannot_race_a_new_attempt_start(installed_active_world):
+    """T15-D27 corrective (Important finding): starting a new installed
+    Attempt and activating a different package for the SAME source must
+    serialize on the same lifecycle lock activate_package() itself uses --
+    never let a concurrent activation archive the package a new Attempt is
+    in the middle of pinning to."""
+    from linuxlab.publication.package import build_package
+    from linuxlab.sync.services import import_package
+
+    world = installed_active_world
+    learner = Learner.objects.create(account=None)
+    context = _context(world)  # opened while world["package"] (A) is ACTIVE
+
+    new_snapshot = republish(world)
+    new_package_bytes = build_package(new_snapshot, world["activity_registry"], world["private_key"])
+    package_b = import_package(new_package_bytes, world["activity_registry"], world["public_key"])
+
+    lock_acquired = threading.Event()
+    release_insert = threading.Event()
+    results = {}
+
+    starter = _AttemptStarterWorker(
+        learner, context, world["definition"].public_id, world["activity_version"].version,
+        lock_acquired, release_insert, results,
+    )
+    activator = _ConcurrentActivatorWorker(package_b, lock_acquired, results)
+
+    try:
+        starter.start()
+        activator.start()
+
+        assert lock_acquired.wait(timeout=5), "starter never reached the pre-insert signal point"
+        # The activator has already been released to attempt activate_package();
+        # give it a real chance to actually reach (and block on) the lock
+        # before releasing the starter -- otherwise this proves nothing.
+        time.sleep(0.3)
+        # Record the fact rather than asserting immediately: an unlocked
+        # implementation lets the activator finish here, and asserting
+        # right away (raising before release_insert.set() below runs)
+        # would leave the starter thread permanently blocked past this
+        # test's teardown, corrupting a LATER test instead of this one.
+        activated_too_early = "activate_finished_at" in results
+    finally:
+        released_at = time.monotonic()
+        release_insert.set()
+        starter.join(timeout=5)
+        activator.join(timeout=5)
+
+    assert not activated_too_early, (
+        "activate_package() completed before the starter's transaction "
+        "committed -- it was not actually blocked by the same lifecycle lock"
+    )
+    assert "attempt_pk" in results
+    assert "activate_finished_at" in results
+    assert results["activate_finished_at"] >= released_at
+
+    attempt = Attempt.objects.get(pk=results["attempt_pk"])
+    assert attempt.installed_activity_version.package_id == world["package"].pk
