@@ -18,6 +18,24 @@ from pathlib import Path
 
 _RUN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
+# Checkpoint corrective 3 (finding #1): PostgreSQL silently truncates any
+# identifier longer than this to fit -- two distinct run IDs that only
+# differ after the truncation point would then collide onto the SAME
+# actual database. NAMEDATALEN in PostgreSQL is 64 (one byte reserved
+# for the trailing NUL), so 63 is the actual usable identifier length.
+POSTGRES_IDENTIFIER_MAX_BYTES = 63
+
+# The longest prefix any canonical gate database name is built from
+# (scripts/release_gate/database.py: `f"linuxlab_gate_{role}_{run_id}"`
+# for role="restore_central"). Every accepted run_id must leave enough
+# room under this, the worst case, so that NO role's canonical name --
+# central/node/restore_central/restore_node -- can ever be truncated.
+LONGEST_GATE_DB_PREFIX = "linuxlab_gate_restore_central_"
+
+MAX_GATE_RUN_ID_BYTES = POSTGRES_IDENTIFIER_MAX_BYTES - len(
+    LONGEST_GATE_DB_PREFIX.encode("ascii")
+)
+
 
 class PreflightError(Exception):
     """Raised for any condition that must abort before a gate run even
@@ -27,13 +45,24 @@ class PreflightError(Exception):
 def generate_run_id() -> str:
     """A short, lowercase, filesystem/DB-identifier-safe run id -- safe
     to embed directly in `linuxlab_gate_central_<run_id>`-style database
-    names and artifact directory names."""
+    names and artifact directory names. 13 bytes, well within
+    MAX_GATE_RUN_ID_BYTES."""
     return "r" + uuid.uuid4().hex[:12]
 
 
 def assert_valid_run_id(run_id: str) -> None:
     if not isinstance(run_id, str) or not _RUN_ID_PATTERN.match(run_id):
         raise PreflightError(f"run_id {run_id!r} is not filesystem/DB-name safe")
+    byte_length = len(run_id.encode("ascii"))
+    if byte_length > MAX_GATE_RUN_ID_BYTES:
+        raise PreflightError(
+            f"run_id {run_id!r} is {byte_length} bytes, exceeding the "
+            f"{MAX_GATE_RUN_ID_BYTES}-byte limit derived from PostgreSQL's "
+            f"{POSTGRES_IDENTIFIER_MAX_BYTES}-byte identifier limit and the "
+            f"longest gate database name prefix ({LONGEST_GATE_DB_PREFIX!r}) -- "
+            "a longer run_id risks silent truncation and collision with a "
+            "different run"
+        )
 
 
 def resolve_git_sha(repo_root=None) -> str:

@@ -31,7 +31,11 @@ from scripts.release_gate.database import (
     dump_database,
     restore_database,
 )
-from scripts.release_gate.environment import DatabaseAdminConnection, PreflightError
+from scripts.release_gate.environment import (
+    MAX_GATE_RUN_ID_BYTES,
+    DatabaseAdminConnection,
+    PreflightError,
+)
 
 
 def _admin_connection():
@@ -447,6 +451,99 @@ def test_create_database_for_one_run_never_touches_another_runs_names():
         assert exists is None
     finally:
         drop_database(db_admin, mine, "central")
+
+
+# --- checkpoint corrective 3 (finding #1): PostgreSQL identifier length ----
+
+
+def test_gate_database_names_for_run_at_max_byte_length_produces_names_within_postgres_limit():
+    run_id = "r" + "a" * (MAX_GATE_RUN_ID_BYTES - 1)
+    assert len(run_id.encode("ascii")) == MAX_GATE_RUN_ID_BYTES
+
+    names = GateDatabaseNames.for_run(run_id)
+
+    for name in names.all_names():
+        assert len(name.encode("ascii")) <= 63
+    assert len(set(names.all_names())) == 4  # all four roles remain distinct
+
+
+def test_gate_database_names_for_run_rejects_a_run_id_one_byte_over_the_limit():
+    over_limit_run_id = "r" + "a" * MAX_GATE_RUN_ID_BYTES  # 34 bytes total
+
+    with pytest.raises(PreflightError):
+        GateDatabaseNames.for_run(over_limit_run_id)
+
+
+def test_gate_database_names_for_run_rejects_a_113_byte_run_id():
+    """The exact reviewer probe."""
+    over_limit_run_id = "r" + "a" * 112
+
+    with pytest.raises(PreflightError):
+        GateDatabaseNames.for_run(over_limit_run_id)
+
+
+def test_create_database_refuses_over_length_run_id_before_any_connection(monkeypatch):
+    import scripts.release_gate.database as database_module
+
+    monkeypatch.setattr(
+        database_module,
+        "_connect_admin",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    over_limit_run_id = "r" + "a" * 112  # 113 bytes
+
+    with pytest.raises(PreflightError):
+        names = GateDatabaseNames.for_run(over_limit_run_id)
+        create_database(_admin_connection(), names, "central")
+
+
+def test_two_near_boundary_run_ids_never_collide_on_real_postgresql():
+    """Real PostgreSQL cross-run isolation proof: two distinct accepted
+    (<=33-byte) run IDs that differ only in their very last character
+    must produce genuinely distinct, non-colliding databases -- proving
+    the byte bound is tight enough that PostgreSQL's own server-side
+    truncation can never merge two different runs' databases."""
+    db_admin = _admin_connection()
+    common_prefix = "r" + "a" * (MAX_GATE_RUN_ID_BYTES - 2)
+    run_id_a = common_prefix + "x"
+    run_id_b = common_prefix + "y"
+    assert len(run_id_a.encode("ascii")) == MAX_GATE_RUN_ID_BYTES
+    assert len(run_id_b.encode("ascii")) == MAX_GATE_RUN_ID_BYTES
+
+    names_a = GateDatabaseNames.for_run(run_id_a)
+    names_b = GateDatabaseNames.for_run(run_id_b)
+    assert names_a.central != names_b.central
+
+    create_database(db_admin, names_a, "central")
+    create_database(db_admin, names_b, "central")
+    try:
+        with _connect(db_admin, names_a.central) as conn:
+            conn.execute("SELECT 1")
+        with _connect(db_admin, names_b.central) as conn:
+            conn.execute("SELECT 1")
+
+        drop_database(db_admin, names_b, "central")
+
+        with _connect(db_admin, "postgres") as conn:
+            exists_a = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names_a.central,)
+            ).fetchone()
+            exists_b = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names_b.central,)
+            ).fetchone()
+        assert exists_a is not None, "run A must survive run B's drop -- no collision"
+        assert exists_b is None
+    finally:
+        drop_database(db_admin, names_a, "central")
+        drop_database(db_admin, names_b, "central")
+
+
+def test_generated_run_id_satisfies_grammar_and_byte_limit():
+    from scripts.release_gate.environment import generate_run_id
+
+    for _ in range(20):
+        run_id = generate_run_id()
+        GateDatabaseNames.for_run(run_id)  # does not raise
 
 
 # --- dump / restore ----------------------------------------------------

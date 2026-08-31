@@ -11,6 +11,9 @@ import subprocess
 import pytest
 
 from scripts.release_gate.environment import (
+    LONGEST_GATE_DB_PREFIX,
+    MAX_GATE_RUN_ID_BYTES,
+    POSTGRES_IDENTIFIER_MAX_BYTES,
     GateRunIdentity,
     PreflightError,
     assert_clean_working_tree,
@@ -42,6 +45,54 @@ def test_assert_valid_run_id_rejects_unsafe_values(bad_id):
 
 def test_generate_run_id_is_unique_across_calls():
     assert generate_run_id() != generate_run_id()
+
+
+# --- checkpoint corrective 3 (finding #1): PostgreSQL identifier length ----
+
+
+def test_max_gate_run_id_bytes_is_derived_from_postgres_limit_and_longest_prefix():
+    """PostgreSQL's identifier limit is 63 bytes; the longest canonical
+    gate database name prefix is `linuxlab_gate_restore_central_`
+    (see scripts/release_gate/database.py's canonical name construction)
+    -- the run-id byte bound must be derived from these, not a bare
+    magic number."""
+    assert POSTGRES_IDENTIFIER_MAX_BYTES == 63
+    assert LONGEST_GATE_DB_PREFIX == "linuxlab_gate_restore_central_"
+    assert MAX_GATE_RUN_ID_BYTES == POSTGRES_IDENTIFIER_MAX_BYTES - len(
+        LONGEST_GATE_DB_PREFIX.encode("ascii")
+    )
+    assert MAX_GATE_RUN_ID_BYTES == 33
+
+
+def test_assert_valid_run_id_accepts_exactly_the_maximum_byte_length():
+    run_id = "r" + "a" * (MAX_GATE_RUN_ID_BYTES - 1)
+    assert len(run_id.encode("ascii")) == MAX_GATE_RUN_ID_BYTES == 33
+
+    assert_valid_run_id(run_id)  # does not raise
+
+
+def test_assert_valid_run_id_rejects_one_byte_over_the_maximum():
+    run_id = "r" + "a" * MAX_GATE_RUN_ID_BYTES  # 34 bytes total
+    assert len(run_id.encode("ascii")) == MAX_GATE_RUN_ID_BYTES + 1 == 34
+
+    with pytest.raises(PreflightError):
+        assert_valid_run_id(run_id)
+
+
+def test_assert_valid_run_id_rejects_a_113_byte_run_id():
+    """The exact reviewer probe."""
+    run_id = "r" + "a" * 112
+    assert len(run_id) == 113
+
+    with pytest.raises(PreflightError):
+        assert_valid_run_id(run_id)
+
+
+def test_generate_run_id_always_satisfies_the_byte_limit():
+    for _ in range(50):
+        run_id = generate_run_id()
+        assert len(run_id.encode("ascii")) <= MAX_GATE_RUN_ID_BYTES
+        assert_valid_run_id(run_id)  # does not raise
 
 
 # --- git state ----------------------------------------------------------
