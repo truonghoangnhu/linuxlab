@@ -92,6 +92,33 @@ def _cmd_issue_node_credential(args):
     return {"node_id": str(credential.node_id), "secret": credential.secret}
 
 
+def _cmd_revoke_node_credential(args):
+    from scripts.release_gate import actions
+
+    actions.revoke_node_credential(args.node_id)
+    return {"revoked": True, "node_id": args.node_id}
+
+
+def _cmd_count_installed_packages(args):
+    from scripts.release_gate import actions
+
+    return {"count": actions.count_installed_packages(args.package_type, args.source_public_id)}
+
+
+def _cmd_find_active_package(args):
+    from scripts.release_gate import actions
+
+    found = actions.find_active_package(args.package_type, args.source_public_id)
+    if found is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "package_version": found.package_version,
+        "payload_sha256": found.payload_sha256,
+        "state": found.state,
+    }
+
+
 def _cmd_find_inbox_message(args):
     from scripts.release_gate import actions
 
@@ -237,6 +264,20 @@ def _build_parser():
     issue_credential = subparsers.add_parser("issue-node-credential")
     issue_credential.add_argument("--display-name", required=True)
     issue_credential.set_defaults(func=_cmd_issue_node_credential)
+
+    revoke_credential = subparsers.add_parser("revoke-node-credential")
+    revoke_credential.add_argument("--node-id", required=True)
+    revoke_credential.set_defaults(func=_cmd_revoke_node_credential)
+
+    count_packages = subparsers.add_parser("count-installed-packages")
+    count_packages.add_argument("--package-type", required=True)
+    count_packages.add_argument("--source-public-id", required=True)
+    count_packages.set_defaults(func=_cmd_count_installed_packages)
+
+    find_active_package = subparsers.add_parser("find-active-package")
+    find_active_package.add_argument("--package-type", required=True)
+    find_active_package.add_argument("--source-public-id", required=True)
+    find_active_package.set_defaults(func=_cmd_find_active_package)
 
     find_inbox = subparsers.add_parser("find-inbox-message")
     find_inbox.add_argument("--event-id", required=True)

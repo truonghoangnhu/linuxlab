@@ -42,8 +42,10 @@ from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.package import build_package as _build_package
 from linuxlab.publication.snapshots import publish_learning_path
 from linuxlab.sync.authentication import issue_node_registration
-from linuxlab.sync.models import InboxMessage, OutboxMessage
+from linuxlab.sync.authentication import revoke_node_registration as _revoke_node_registration
+from linuxlab.sync.models import InboxMessage, InstalledPackage, OutboxMessage
 from linuxlab.sync.services import activate_package as _activate_package
+from linuxlab.sync.services import get_active_package
 from linuxlab.sync.services import import_package as _import_package
 
 
@@ -203,6 +205,13 @@ def count_inbox_messages(event_id):
     return InboxMessage.objects.filter(event_id=event_id).count()
 
 
+def revoke_node_credential(node_id):
+    """Central-only. Immediately disables a Node's registration through
+    the existing Task 14 public/domain service (revoke_node_registration())
+    -- used by the N2 invalid/revoked-credential negative scenario."""
+    _revoke_node_registration(node_id)
+
+
 def verify_import_and_activate_package(package_bytes, trusted_public_key):
     """Node-only. Verifies, imports (stages), and activates a real signed
     `.llpkg` through the exact Task 11/12 public trust boundary --
@@ -233,6 +242,25 @@ def find_outbox_message_by_attempt(attempt_public_id):
     return OutboxMessage.objects.filter(
         aggregate_type="attempt", aggregate_public_id=attempt_public_id
     ).first()
+
+
+def count_installed_packages(package_type, source_public_id):
+    """Node-only, READ-ONLY. Exactly how many InstalledPackage rows exist
+    for (package_type, source_public_id) across every lifecycle state
+    (staged/active/archived) -- used by the N1 invalid-signature scenario
+    to prove a failed/rejected import leaves NO partial trusted inventory
+    row at all, not merely that none became active."""
+    return InstalledPackage.objects.filter(
+        package_type=package_type, source_public_id=source_public_id
+    ).count()
+
+
+def find_active_package(package_type, source_public_id):
+    """Node-only, READ-ONLY. Returns the exactly-one ACTIVE InstalledPackage
+    for (package_type, source_public_id), or None -- the same public
+    lookup Node runtime itself uses (linuxlab.sync.services.
+    get_active_package()), used here only for scenario assertions."""
+    return get_active_package(package_type, source_public_id)
 
 
 def find_attempt(attempt_public_id):

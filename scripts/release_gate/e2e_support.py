@@ -155,6 +155,7 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
 
     central = None
     node = None
+    deployment = None
     try:
         central_profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
         node_profile_env_for_migrate = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"}
@@ -190,7 +191,15 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
             node = start_gunicorn(node_profile_env, node_listener, tmp_path / "node.log")
             wait_ready(node, timeout_seconds=READY_TIMEOUT_SECONDS)
 
-        yield DualDeployment(
+        # Kept as a local reference (not just yielded) so `finally` below
+        # can stop whatever process this object's .central/.node fields
+        # point to AT TEARDOWN TIME -- a scenario that restarts Central
+        # or Node (N4/N5) reassigns deployment.central/deployment.node on
+        # this exact same object to the new ManagedProcess, and the
+        # original pre-restart handles must never be the ones "stopped"
+        # (they are usually already dead by then; stopping the CURRENT
+        # live process is what actually matters).
+        deployment = DualDeployment(
             run_id=run_id,
             gate_names=gate_names,
             db_admin=db_admin,
@@ -204,11 +213,18 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
             private_key_path=private_key_path,
             public_key_path=public_key_path,
         )
+        yield deployment
     finally:
-        if node is not None:
-            stop_process(node)
-        if central is not None:
-            stop_process(central)
+        if deployment is not None:
+            if deployment.node is not None:
+                stop_process(deployment.node)
+            if deployment.central is not None:
+                stop_process(deployment.central)
+        else:
+            if node is not None:
+                stop_process(node)
+            if central is not None:
+                stop_process(central)
         drop_database(db_admin, gate_names, "node")
         drop_database(db_admin, gate_names, "central")
 
