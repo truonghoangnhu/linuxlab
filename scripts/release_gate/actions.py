@@ -220,3 +220,64 @@ def find_outbox_message(event_id):
     """Node-only, READ-ONLY. Returns the exact local Outbox record for
     `event_id`, or None. Assertion support only."""
     return OutboxMessage.objects.filter(event_id=event_id).first()
+
+
+def find_outbox_message_by_attempt(attempt_public_id):
+    """Node-only, READ-ONLY. Returns the local Outbox record whose
+    aggregate_public_id is `attempt_public_id` (the Task 14 v1 wire
+    contract: aggregate_type="attempt", aggregate_public_id=attempt.
+    public_id -- unchanged, unversioned, T15-D27 final corrective S12),
+    or None. Lets a caller that only knows the Attempt's public_id (e.g.
+    from an HTTP submit response) find its Outbox row without needing to
+    separately track the event_id."""
+    return OutboxMessage.objects.filter(
+        aggregate_type="attempt", aggregate_public_id=attempt_public_id
+    ).first()
+
+
+def find_attempt(attempt_public_id):
+    """Node-only, READ-ONLY. Returns the exact local Attempt for
+    `attempt_public_id`, or None -- for provenance assertions (exact
+    pinned InstalledActivityVersion/package identity), never used to
+    create or mutate anything."""
+    from linuxlab.learning.services import get_attempt_by_public_id
+
+    return get_attempt_by_public_id(attempt_public_id)
+
+
+def find_progress(learner_id, activity_definition_public_id):
+    """Node-only, READ-ONLY. Returns the exact local Progress row for
+    (learner_id, activity_definition_public_id), or None, plus how many
+    such rows exist -- used to prove exactly one logical Progress record
+    exists per learner/activity, never zero or more than one."""
+    from linuxlab.learning.models import Progress
+
+    queryset = Progress.objects.filter(
+        learner_id=learner_id, activity_definition_public_id=activity_definition_public_id
+    )
+    return queryset.count(), queryset.first()
+
+
+def resend_outbox_message(event_id, central_url, node_id, secret, *, allow_insecure_http=True):
+    """Node-only. Rebuilds the EXACT wire envelope originally captured
+    for an existing local OutboxMessage row (envelope_for() -- never a
+    reserialization of current domain state) and resends it to Central
+    through a real HttpSyncTransport, exactly as a genuine Node retry
+    after a lost ACK would. Used to prove Central's idempotent duplicate
+    handling (T15-D09 N3) without ever touching trusted Outbox/Inbox
+    state directly -- this never mutates the local OutboxMessage row's
+    delivery metadata itself (that remains flush_outbox()'s job); it only
+    performs one additional real HTTP delivery attempt of an event that
+    may already have DELIVERED, and returns Central's ack.
+    """
+    from linuxlab.sync.contracts import BatchAck
+    from linuxlab.sync.outbox import envelope_for
+    from linuxlab.sync.transports import HttpSyncTransport
+
+    row = OutboxMessage.objects.get(event_id=event_id)
+    envelope = envelope_for(row)
+    transport = HttpSyncTransport(
+        central_url, node_id, secret, allow_insecure_http=allow_insecure_http
+    )
+    batch_ack: BatchAck = transport.send_batch((envelope,))
+    return batch_ack
