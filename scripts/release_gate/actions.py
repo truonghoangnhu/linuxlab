@@ -189,6 +189,27 @@ def issue_node_credential(display_name):
     return issue_node_registration(display_name)
 
 
+def find_publication_snapshot(source_public_id, package_version):
+    """Central-only, READ-ONLY. Returns the exact PublicationSnapshot for
+    (kind="learning_path", source_public_id, package_version), or None --
+    used to prove published content/package metadata survives a backup/
+    restore cycle."""
+    from linuxlab.publication.models import PublicationSnapshot
+
+    return PublicationSnapshot.objects.filter(
+        kind="learning_path", source_public_id=source_public_id, version=package_version
+    ).first()
+
+
+def find_node_registration(node_id):
+    """Central-only, READ-ONLY. Returns the exact NodeRegistration for
+    `node_id`, or None -- used to prove Node registration state survives
+    a backup/restore cycle."""
+    from linuxlab.sync.models import NodeRegistration
+
+    return NodeRegistration.objects.filter(node_id=node_id).first()
+
+
 def find_inbox_message(event_id):
     """Central-only, READ-ONLY. Returns the exact durable Inbox record
     for `event_id`, or None. Assertion support only -- this bridge never

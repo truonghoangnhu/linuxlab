@@ -119,6 +119,29 @@ def _cmd_find_active_package(args):
     }
 
 
+def _cmd_find_publication_snapshot(args):
+    from scripts.release_gate import actions
+
+    found = actions.find_publication_snapshot(args.source_public_id, args.package_version)
+    if found is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "source_public_id": str(found.source_public_id),
+        "version": found.version,
+        "content_hash": found.content_hash,
+    }
+
+
+def _cmd_find_node_registration(args):
+    from scripts.release_gate import actions
+
+    found = actions.find_node_registration(args.node_id)
+    if found is None:
+        return {"found": False}
+    return {"found": True, "node_id": str(found.node_id), "enabled": found.enabled}
+
+
 def _cmd_find_inbox_message(args):
     from scripts.release_gate import actions
 
@@ -278,6 +301,15 @@ def _build_parser():
     find_active_package.add_argument("--package-type", required=True)
     find_active_package.add_argument("--source-public-id", required=True)
     find_active_package.set_defaults(func=_cmd_find_active_package)
+
+    find_snapshot = subparsers.add_parser("find-publication-snapshot")
+    find_snapshot.add_argument("--source-public-id", required=True)
+    find_snapshot.add_argument("--package-version", type=int, required=True)
+    find_snapshot.set_defaults(func=_cmd_find_publication_snapshot)
+
+    find_registration = subparsers.add_parser("find-node-registration")
+    find_registration.add_argument("--node-id", required=True)
+    find_registration.set_defaults(func=_cmd_find_node_registration)
 
     find_inbox = subparsers.add_parser("find-inbox-message")
     find_inbox.add_argument("--event-id", required=True)
