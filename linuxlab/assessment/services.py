@@ -4,6 +4,10 @@ from django.utils import timezone
 from linuxlab.assessment.models import Question, QuestionVersion
 
 
+def create_question(*, name: str) -> Question:
+    return Question.objects.create(name=name)
+
+
 def create_question_version(question, type_key, content, answer_key, scoring):
     with transaction.atomic():
         locked_question = Question.objects.select_for_update().get(pk=question.pk)

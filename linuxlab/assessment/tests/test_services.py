@@ -7,6 +7,7 @@ from linuxlab.assessment.models import Question, QuestionVersion
 from linuxlab.assessment.providers import SingleChoiceProvider
 from linuxlab.assessment.registry import QuestionRegistry
 from linuxlab.assessment.services import (
+    create_question,
     create_question_version,
     get_question_version,
     publish_question_version,
@@ -46,6 +47,16 @@ def registry():
 @pytest.fixture
 def question(db):
     return Question.objects.create(name="Shell basics quiz item")
+
+
+# --- create_question (Task 15 authoring root public boundary corrective) ----
+
+
+def test_create_question_creates_a_root_question(db):
+    question = create_question(name="Shell basics quiz item")
+    assert isinstance(question, Question)
+    assert question.name == "Shell basics quiz item"
+    assert question.public_id is not None
 
 
 # --- version creation ---------------------------------------------------

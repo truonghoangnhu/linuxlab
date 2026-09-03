@@ -4,6 +4,10 @@ from django.utils import timezone
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 
 
+def create_activity_definition(*, name: str, type_key: str) -> ActivityDefinition:
+    return ActivityDefinition.objects.create(name=name, type_key=type_key)
+
+
 def create_activity_version(definition, config=None, required_capabilities=None):
     config = {} if config is None else config
     required_capabilities = [] if required_capabilities is None else required_capabilities

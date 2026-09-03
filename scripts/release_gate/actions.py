@@ -1,17 +1,19 @@
 """Task 15 Task 7: profile-scoped application action bridge (T15-D05,
 T15-D17).
 
-Every function here calls ONLY existing public/domain service functions
-already used throughout linuxlab's own application code and test suite --
-Question/ActivityDefinition authoring, create_question_version()/
-publish_question_version(), create_activity_version()/
-publish_activity_version(), publish_learning_path(), build_package(),
-import_package(), activate_package(), issue_node_registration(). This
-module reproduces no business logic of its own; it only sequences those
-existing calls with explicit inputs/outputs so release-gate orchestration
-(a later task) can drive Central/Node actions without embedding LinuxLab
-domain logic in scripts/. There is no InstalledPackage.objects.create(),
-no direct trusted Outbox/Inbox fabrication, and no answer-key material in
+Every function here calls ONLY existing public/domain service functions --
+create_question()/create_activity_definition() (Task 15 authoring root
+public boundary corrective) for Question/ActivityDefinition root
+authoring, create_question_version()/publish_question_version(),
+create_activity_version()/publish_activity_version(),
+publish_learning_path(), build_package(), import_package(),
+activate_package(), issue_node_registration(). This module reproduces no
+business logic of its own; it only sequences those existing calls with
+explicit inputs/outputs so release-gate orchestration (a later task) can
+drive Central/Node actions without embedding LinuxLab domain logic in
+scripts/. There is no direct ORM creation of Question or
+ActivityDefinition roots, no InstalledPackage.objects.create(), no
+direct trusted Outbox/Inbox fabrication, and no answer-key material in
 any return value here.
 
 Every function assumes Django has ALREADY been configured (django.setup())
@@ -33,11 +35,17 @@ from dataclasses import dataclass
 from django.conf import settings
 
 from linuxlab.activities.default_registry import build_default_activity_registry
-from linuxlab.activities.models import ActivityDefinition
-from linuxlab.activities.services import create_activity_version, publish_activity_version
+from linuxlab.activities.services import (
+    create_activity_definition,
+    create_activity_version,
+    publish_activity_version,
+)
 from linuxlab.assessment.default_registry import build_default_question_registry
-from linuxlab.assessment.models import Question
-from linuxlab.assessment.services import create_question_version, publish_question_version
+from linuxlab.assessment.services import (
+    create_question,
+    create_question_version,
+    publish_question_version,
+)
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.package import build_package as _build_package
 from linuxlab.publication.snapshots import publish_learning_path
@@ -105,7 +113,7 @@ def author_and_publish_single_choice_activity(
     question_registry = build_default_question_registry()
     activity_registry = build_default_activity_registry()
 
-    question = Question.objects.create(name=question_name)
+    question = create_question(name=question_name)
     question_version = create_question_version(
         question,
         type_key="single_choice",
@@ -115,7 +123,7 @@ def author_and_publish_single_choice_activity(
     )
     published_question = publish_question_version(question_version, question_registry)
 
-    definition = ActivityDefinition.objects.create(name=activity_name, type_key="assessment")
+    definition = create_activity_definition(name=activity_name, type_key="assessment")
     activity_version = create_activity_version(
         definition,
         config={

@@ -7,6 +7,7 @@ from django.db import close_old_connections, connection
 from linuxlab.activities.models import ActivityDefinition, ActivityVersion
 from linuxlab.activities.registry import ActivityRegistry
 from linuxlab.activities.services import (
+    create_activity_definition,
     create_activity_version,
     get_activity_version,
     publish_activity_version,
@@ -34,6 +35,18 @@ def registry():
 @pytest.fixture
 def definition(db):
     return ActivityDefinition.objects.create(name="Fake activity", type_key="fake")
+
+
+# --- create_activity_definition (Task 15 authoring root public boundary
+# corrective) -----------------------------------------------------------
+
+
+def test_create_activity_definition_creates_a_root_definition(db):
+    definition = create_activity_definition(name="Fake activity", type_key="assessment")
+    assert isinstance(definition, ActivityDefinition)
+    assert definition.name == "Fake activity"
+    assert definition.type_key == "assessment"
+    assert definition.public_id is not None
 
 
 # --- Version creation -------------------------------------------------

@@ -16,8 +16,10 @@ boundary usage). Task 8 proves the same functions work across a real,
 separate dual PostgreSQL/Gunicorn deployment.
 """
 
+import inspect
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -27,6 +29,7 @@ from linuxlab.sync.authentication import authenticate_node
 from linuxlab.sync.contracts import ACCEPTED, DUPLICATE, WireEventEnvelope
 from linuxlab.sync.ingestion import ingest_event
 from linuxlab.sync.models import InboxMessage, OutboxMessage
+from scripts.release_gate import actions as actions_module
 from scripts.release_gate.actions import (
     AuthoredSingleChoiceContent,
     author_and_publish_single_choice_activity,
@@ -80,6 +83,57 @@ def test_author_and_publish_result_carries_no_answer_key_material():
     serialized = json.dumps(authored.snapshot.payload)
     assert "answer_key" not in serialized
     assert "correct_option_id" not in serialized
+
+
+# --- Authoring root public boundary (Task 15 corrective, finding #6) -------
+
+
+def test_author_and_publish_delegates_root_creation_to_owning_app_services(monkeypatch):
+    """author_and_publish_single_choice_activity() must create its
+    Question and ActivityDefinition roots through the owning apps' own
+    public services -- assessment.services.create_question() and
+    activities.services.create_activity_definition() -- never by calling
+    Question.objects.create()/ActivityDefinition.objects.create() itself."""
+    from linuxlab.activities.models import ActivityDefinition
+    from linuxlab.assessment.models import Question
+
+    calls = {"question": None, "activity_definition": None}
+
+    def _spy_create_question(*, name):
+        question = Question.objects.create(name=name)
+        calls["question"] = {"name": name, "public_id": question.public_id}
+        return question
+
+    def _spy_create_activity_definition(*, name, type_key):
+        definition = ActivityDefinition.objects.create(name=name, type_key=type_key)
+        calls["activity_definition"] = {
+            "name": name,
+            "type_key": type_key,
+            "public_id": definition.public_id,
+        }
+        return definition
+
+    monkeypatch.setattr(actions_module, "create_question", _spy_create_question)
+    monkeypatch.setattr(actions_module, "create_activity_definition", _spy_create_activity_definition)
+
+    authored = _author()
+
+    assert calls["question"] is not None
+    assert calls["question"]["public_id"] == authored.question_public_id
+    assert calls["activity_definition"] is not None
+    assert calls["activity_definition"]["public_id"] == authored.activity_public_id
+    assert calls["activity_definition"]["type_key"] == "assessment"
+
+
+def test_actions_module_never_directly_mutates_owning_app_root_models():
+    """Permanent regression guard: scripts/release_gate/actions.py must
+    never call Question.objects.create()/ActivityDefinition.objects.create()
+    itself -- root creation belongs exclusively to the owning apps'
+    public services. Source-level check so this can never silently
+    regress back to a direct ORM bypass."""
+    source = Path(inspect.getfile(actions_module)).read_text()
+    assert "Question.objects.create(" not in source
+    assert "ActivityDefinition.objects.create(" not in source
 
 
 def test_republish_learning_path_produces_a_new_distinct_version():
