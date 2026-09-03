@@ -24,11 +24,11 @@ from scripts.release_gate.e2e_support import (
     run_action,
     run_sync_worker_once,
 )
+from scripts.release_gate.one_shot_proxy import OneShotResponseDroppingProxy
 from scripts.release_gate.processes import (
     reserve_listener,
-    start_gunicorn,
+    restart_gunicorn,
     stop_process,
-    wait_ready,
 )
 
 _CONTENT = {
@@ -102,41 +102,108 @@ def _submit_a_real_attempt(deployment, authored):
     return session, attempt_url_path, submit_body
 
 
-# --- N1: invalid signature ---------------------------------------------------
+# --- N1: invalid signature ----------------------------------------------------
 
 
-def test_n1_invalid_signature_leaves_no_partial_trusted_inventory(tmp_path):
-    """Desired final state: import is rejected. Forbidden invariant: any
-    InstalledPackage row (even a rejected/half-written one) exists for
-    this source afterward."""
+def test_n1_tampered_replacement_leaves_existing_active_package_fully_unchanged(tmp_path):
+    """Desired final state: Node already has a real, valid, ACTIVE
+    package A (same identity/hash, still HTTP-usable, installed
+    artifacts intact) BEFORE the attack, and A remains in exactly that
+    state afterward. Forbidden invariant: A is archived/deactivated/
+    replaced by the rejected import, or any partial trusted row for the
+    tampered replacement B is created. No mocked verifier failure --
+    B is a real republish of the SAME source, really signed, then really
+    tampered, and rejected through the real Task 11/12 public import
+    lifecycle API."""
     with dual_deployment(tmp_path) as deployment:
-        authored, package_path = author_and_package(
+        # --- Baseline: package A is really imported and ACTIVE -----------
+        authored_a, package_a_path = author_and_package(
             deployment, prompt=_CONTENT["prompt"], options=_CONTENT["options"], correct_option_id="a"
         )
-        tampered_path = _tamper_signature(package_path)
+        activated_a = import_and_activate(deployment, package_a_path)
+        assert activated_a["state"] == "active"
 
+        def _active_a():
+            return run_action(
+                deployment.node_profile_env,
+                "find-active-package",
+                "--package-type",
+                "learning_path",
+                "--source-public-id",
+                authored_a["source_public_id"],
+            )
+
+        def _inventory_count():
+            return run_action(
+                deployment.node_profile_env,
+                "count-installed-packages",
+                "--package-type",
+                "learning_path",
+                "--source-public-id",
+                authored_a["source_public_id"],
+            )["count"]
+
+        active_before = _active_a()
+        assert active_before["found"] is True
+        assert active_before["package_version"] == authored_a["package_version"]
+        assert active_before["state"] == "active"
+        payload_sha256_before = active_before["payload_sha256"]
+        assert _inventory_count() == 1
+
+        # A is real, HTTP-usable content -- not just a DB row.
+        session = http_bridge.LearnerSession.start(deployment.node.base_url)
+        landing_status_before, landing_body_before = http_bridge.get_landing(
+            session, authored_a["source_public_id"], authored_a["activity_public_id"], authored_a["activity_version"]
+        )
+        assert landing_status_before == 200
+        assert _CONTENT["prompt"] in landing_body_before
+
+        # --- Replacement B: a real new version of the SAME source, really
+        # signed, then really tampered -- never a mocked verifier failure.
+        republished_b = run_action(
+            deployment.central_profile_env, "republish", "--source-public-id", authored_a["source_public_id"]
+        )
+        assert republished_b["package_version"] != authored_a["package_version"]
+
+        package_b_path = (
+            deployment.tmp_dir
+            / f"package-b-{republished_b['source_public_id']}-v{republished_b['package_version']}.llpkg"
+        )
+        run_action(
+            deployment.central_profile_env,
+            "build-and-sign-package",
+            "--source-public-id",
+            republished_b["source_public_id"],
+            "--package-version",
+            str(republished_b["package_version"]),
+            "--private-key-file",
+            str(deployment.private_key_path),
+            "--output-file",
+            str(package_b_path),
+        )
+        tampered_b_path = _tamper_signature(package_b_path)
+
+        # --- Real rejection through the real public import lifecycle API --
         with pytest.raises(ActionError, match="PackageImportError"):
-            import_and_activate(deployment, tampered_path)
+            import_and_activate(deployment, tampered_b_path)
 
-        count = run_action(
-            deployment.node_profile_env,
-            "count-installed-packages",
-            "--package-type",
-            "learning_path",
-            "--source-public-id",
-            authored["source_public_id"],
-        )
-        assert count["count"] == 0
+        # --- A is EXACTLY unchanged: same identity, still active, no
+        # archive/deactivation side effect, installed artifacts intact ----
+        active_after = _active_a()
+        assert active_after["found"] is True
+        assert active_after["package_version"] == authored_a["package_version"]
+        assert active_after["payload_sha256"] == payload_sha256_before
+        assert active_after["state"] == "active"
 
-        active = run_action(
-            deployment.node_profile_env,
-            "find-active-package",
-            "--package-type",
-            "learning_path",
-            "--source-public-id",
-            authored["source_public_id"],
+        # No partial trusted B inventory row -- still exactly the one A row.
+        assert _inventory_count() == 1
+
+        # A is still HTTP-usable with unchanged content.
+        landing_status_after, landing_body_after = http_bridge.get_landing(
+            session, authored_a["source_public_id"], authored_a["activity_public_id"], authored_a["activity_version"]
         )
-        assert active["found"] is False
+        assert landing_status_after == 200
+        assert _CONTENT["prompt"] in landing_body_after
 
 
 # --- N2: invalid/revoked credential ------------------------------------------
@@ -185,7 +252,19 @@ def test_n3_ack_lost_then_retry_yields_exactly_one_inbox_and_eventual_delivery(t
     across both the original delivery and the retry; Node eventually
     reaches DELIVERED. Forbidden invariant: a second Inbox row for the
     same event, or the retry being treated as a fresh/duplicate business
-    event rather than the same idempotent event_id."""
+    event rather than the same idempotent event_id.
+
+    ACK loss is a REAL commit-before-ACK-loss boundary: the Node's real
+    HttpSyncTransport talks to a real one-shot response-dropping TCP
+    proxy (scripts.release_gate.one_shot_proxy) in front of the real
+    Central HTTP endpoint. Central fully receives and durably commits
+    the request; the proxy then closes the downstream connection before
+    Node ever receives a usable response -- never a pre-created Inbox,
+    never direct Central ORM fabrication, never a fake duplicate
+    response, never direct Node delivery-state mutation. The retry
+    afterward goes through the Node's own normal worker/backoff path
+    directly to the real Central, exercising Central's real duplicate
+    handling."""
     with dual_deployment(tmp_path) as deployment:
         authored, package_path = author_and_package(
             deployment, prompt=_CONTENT["prompt"], options=_CONTENT["options"], correct_option_id="a"
@@ -199,37 +278,45 @@ def test_n3_ack_lost_then_retry_yields_exactly_one_inbox_and_eventual_delivery(t
         )
         event_id = outbox["event_id"]
 
-        # "ACK lost": deliver the envelope directly (bypassing
-        # flush_outbox()'s own delivery-state bookkeeping) so Central
-        # durably stores it while the Node's local Outbox row never
-        # learns of the ACK -- exactly what a genuinely lost response
-        # looks like from the Node's own state, achieved honestly rather
-        # than through network-level fault injection.
-        first_send = run_action(
-            deployment.node_profile_env,
-            "resend-outbox-message",
-            "--event-id",
-            event_id,
-            "--central-url",
-            deployment.central.base_url,
-            "--node-id",
-            deployment.node_id,
-            stdin_json={"secret": deployment.node_secret},
+        proxy_listener = reserve_listener()
+        proxy = OneShotResponseDroppingProxy(
+            proxy_listener, deployment.central.listener_host, deployment.central.listener_port
         )
-        assert first_send["results"] == [{"event_id": event_id, "status": "accepted", "code": ""}]
+        proxy.start()
+        try:
+            node_env_via_proxy = {**deployment.node_profile_env, "LINUXLAB_CENTRAL_URL": proxy.base_url}
+
+            # Real Node worker, real HttpSyncTransport, through the real
+            # proxy: Central really receives and commits the batch, but
+            # the response never reaches Node -- a genuine lost ACK.
+            first_flush = run_sync_worker_once(node_env_via_proxy)
+            assert first_flush.returncode == 0, first_flush.stdout + first_flush.stderr
+            assert "claimed=1" in first_flush.stdout
+            assert "released_transient=1" in first_flush.stdout or "delivered=0" in first_flush.stdout
+        finally:
+            proxy.stop()
+
+        # Central durably stored exactly one Inbox row immediately after
+        # the induced client-side failure -- proving the commit-before-
+        # ACK-loss boundary actually happened, not merely that a retry
+        # later converges.
         assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
 
+        # From the Node's own state, the event is still pending/retryable
+        # -- it never learned the ACK.
         outbox_still_pending = run_action(
             deployment.node_profile_env, "find-outbox-message", "--event-id", event_id
         )
         assert outbox_still_pending["state"] == "pending"
 
-        # Node retries via its real worker path: Central recognizes the
-        # same event_id and returns DUPLICATE, which flush_outbox()
-        # itself already treats as a delivered confirmation.
-        flush_result = run_sync_worker_once(deployment.node_profile_env)
-        assert flush_result.returncode == 0
-        assert "delivered=1" in flush_result.stdout
+        # Real worker retry through the NORMAL path, direct to real
+        # Central (no proxy): Central recognizes the same event_id and
+        # returns DUPLICATE, which flush_outbox() itself already treats
+        # as a delivered confirmation. Bounded by the real exponential
+        # backoff the first transient failure scheduled.
+        flush_after_retry = _flush_until_delivered(deployment.node_profile_env)
+        assert flush_after_retry is not None
+        assert "delivered=1" in flush_after_retry.stdout
 
         assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
         outbox_final = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", event_id)
@@ -280,22 +367,32 @@ def test_n4_central_unavailable_node_keeps_learning_and_syncs_after_recovery(tmp
             # Central "returns": a fresh Gunicorn process against the
             # SAME ephemeral Central database -- no data was lost, only
             # the process was down. A fresh process means a fresh
-            # ephemeral loopback port (reserve_listener() binds port 0),
-            # so the Node's own LINUXLAB_CENTRAL_URL must be updated to
-            # match -- exactly the reconfiguration step a real restarted
-            # Central behind a stable reverse-proxy URL would not need,
-            # but this test's own bare-Gunicorn Central has no such
-            # stable front door.
-            central_listener = reserve_listener()
-            restarted_central = start_gunicorn(
-                deployment.central_profile_env, central_listener, deployment.tmp_dir / "central-restarted.log"
+            # ephemeral loopback port, so the Node's own
+            # LINUXLAB_CENTRAL_URL must be updated to match -- exactly
+            # the reconfiguration step a real restarted Central behind a
+            # stable reverse-proxy URL would not need, but this test's
+            # own bare-Gunicorn Central has no such stable front door.
+            #
+            # restart_gunicorn() (Important 3 corrective) enforces the
+            # failure-safe ordering: deployment.central/node_profile_env
+            # are reassigned to the replacement the INSTANT it starts,
+            # before wait_ready() runs -- never after -- so a readiness
+            # failure here could never orphan a genuinely live
+            # replacement process.
+            def _register_restarted_central(new_managed):
+                deployment.central = new_managed
+                deployment.node_profile_env = {
+                    **deployment.node_profile_env,
+                    "LINUXLAB_CENTRAL_URL": new_managed.base_url,
+                }
+
+            restart_gunicorn(
+                deployment.central,
+                deployment.central_profile_env,
+                deployment.tmp_dir / "central-restarted.log",
+                timeout_seconds=20,
+                on_replacement_started=_register_restarted_central,
             )
-            wait_ready(restarted_central, timeout_seconds=20)
-            deployment.central = restarted_central
-            deployment.node_profile_env = {
-                **deployment.node_profile_env,
-                "LINUXLAB_CENTRAL_URL": restarted_central.base_url,
-            }
 
         flush_after_recovery = _flush_until_delivered(deployment.node_profile_env)
         assert flush_after_recovery is not None
@@ -329,14 +426,21 @@ def test_n5_node_restart_preserves_active_package_and_pending_outbox(tmp_path):
         )
         assert outbox_before["state"] == "pending"
 
-        stop_process(deployment.node)
+        # restart_gunicorn() (Important 3 corrective) stops the old
+        # process itself and reassigns `deployment.node` to the
+        # replacement the INSTANT it starts, before wait_ready() runs --
+        # never after -- so a readiness failure here could never orphan
+        # a genuinely live replacement process.
+        def _register_restarted_node(new_managed):
+            deployment.node = new_managed
 
-        node_listener = reserve_listener()
-        restarted_node = start_gunicorn(
-            deployment.node_profile_env, node_listener, deployment.tmp_dir / "node-restarted.log"
+        restart_gunicorn(
+            deployment.node,
+            deployment.node_profile_env,
+            deployment.tmp_dir / "node-restarted.log",
+            timeout_seconds=20,
+            on_replacement_started=_register_restarted_node,
         )
-        wait_ready(restarted_node, timeout_seconds=20)
-        deployment.node = restarted_node
 
         # Readiness recovered and the active package is still usable via
         # a completely fresh HTTP session.
