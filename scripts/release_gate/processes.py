@@ -326,6 +326,54 @@ def wait_ready(
     raise StartupError(f"{url} did not become ready within {timeout_seconds}s: {last_error}")
 
 
+def restart_gunicorn(
+    old_managed: ManagedProcess | None,
+    profile_env: dict,
+    log_path,
+    *,
+    timeout_seconds: float,
+    on_replacement_started,
+    repo_root=None,
+    workers: int = 1,
+    graceful_seconds: float = 10.0,
+) -> ManagedProcess:
+    """Task 15 Tasks 7-10 corrective, Important 3: the ONLY
+    failure-safe way to replace a running Gunicorn process. Hard
+    ordering, enforced here rather than left to each caller to get
+    right independently:
+
+        stop old -> start_gunicorn() -> on_replacement_started(new) -> wait_ready(new)
+
+    `on_replacement_started(new_managed)` is called the INSTANT the
+    replacement's authentic handle exists -- before wait_ready() is
+    ever invoked. A caller passes a callback that immediately writes
+    the new handle into its own deployment-state slot (e.g.
+    `deployment.central = new_managed`). If wait_ready() then raises
+    StartupError, the replacement is already registered wherever the
+    caller's own teardown looks for a process to stop -- there is no
+    window in which a genuinely live replacement is reachable only
+    through this function's own local variable. The forbidden order
+    (start -> wait_ready -> assign) can orphan exactly that process:
+    a caller whose assignment never runs because wait_ready() raised
+    first has no reference left to stop it.
+
+    Raises StartupError if the replacement never becomes ready. The
+    replacement is NOT stopped by this function on that failure --
+    ownership has already passed to the caller via
+    `on_replacement_started`, and stopping it here would race with
+    whatever the caller's own cleanup does next."""
+    if old_managed is not None:
+        stop_process(old_managed, graceful_seconds=graceful_seconds)
+
+    listener = reserve_listener()
+    new_managed = start_gunicorn(
+        profile_env, listener, log_path, repo_root=repo_root, workers=workers
+    )
+    on_replacement_started(new_managed)
+    wait_ready(new_managed, timeout_seconds=timeout_seconds)
+    return new_managed
+
+
 def stop_process(managed: ManagedProcess, graceful_seconds: float = 10.0) -> None:
     """Terminate exactly this managed child: SIGTERM, wait up to
     `graceful_seconds`, escalate to SIGKILL only if it hasn't exited by
