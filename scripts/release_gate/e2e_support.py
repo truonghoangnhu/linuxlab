@@ -18,6 +18,7 @@ in-process multi-database Django configuration.
 import json
 import os
 import subprocess
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,10 @@ from scripts.release_gate.processes import (
     stop_process,
     wait_ready,
 )
-from scripts.release_gate.signing_material import create_ephemeral_signing_keypair
+from scripts.release_gate.signing_material import (
+    create_ephemeral_signing_keypair,
+    delete_private_key,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "scripts" / "release_gate" / "cli.py"
@@ -132,7 +136,7 @@ class DualDeployment:
 
 
 @contextmanager
-def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
+def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_failure=False):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
@@ -165,7 +169,19 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     corrective, Important). Every cleanup action below is idempotent for
     a resource that was never actually created, so registering cleanup
     for both database members and the workspace unconditionally is
-    always safe."""
+    always safe.
+
+    `keep_on_failure` (Task 15 Task 11, local-development-only debugging
+    feature): when True AND the caller's `with` block actually raised
+    (checked via `sys.exc_info()` at teardown time, not merely a flag
+    the caller passed), the ephemeral Central/Node databases and the
+    workspace directory are retained instead of dropped/removed, for
+    local inspection. This NEVER applies on a successful run (the flag
+    alone changes nothing unless the body actually failed), and it NEVER
+    extends to the private signing key -- that is still deleted
+    unconditionally in every case, exactly as already closed. Default
+    (`keep_on_failure=False`) preserves the exact prior unconditional-
+    cleanup behavior."""
     run_id = generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
@@ -174,6 +190,7 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     central = None
     node = None
     deployment = None
+    private_key_path = None
     try:
         workspace.mkdir(parents=True)
         create_database(db_admin, gate_names, "central")
@@ -239,21 +256,40 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     finally:
         current_node = deployment.node if deployment is not None else node
         current_central = deployment.central if deployment is not None else central
+        # Reflects whether the caller's `with` block is currently
+        # unwinding because of an exception -- never a caller-supplied
+        # flag -- so a SUCCESSFUL run is always fully cleaned up even
+        # when keep_on_failure=True was passed.
+        body_failed = sys.exc_info()[0] is not None
 
         cleanup_actions = []
         if current_node is not None:
             cleanup_actions.append(("stop_node_process", lambda p=current_node: stop_process(p)))
         if current_central is not None:
             cleanup_actions.append(("stop_central_process", lambda p=current_central: stop_process(p)))
-        # Processes are stopped (and therefore their log file handles
-        # closed) BEFORE the workspace those logs live in is removed.
-        cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
-        # The hard invariant: Node database cleanup failing must never
-        # skip Central database cleanup. Both are always attempted.
-        cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
-        cleanup_actions.append(
-            ("drop_central_database", lambda: drop_database(db_admin, gate_names, "central"))
-        )
+
+        if keep_on_failure and body_failed:
+            # Local-debug-only: the ephemeral databases and the
+            # workspace directory (the .llpkg, logs, etc.) are retained
+            # for inspection. The private signing key is STILL deleted
+            # unconditionally -- keep-on-failure never permits retaining
+            # it, regardless of where inside the workspace it lives.
+            if private_key_path is not None:
+                cleanup_actions.append(
+                    ("delete_private_key_only", lambda p=private_key_path: delete_private_key(p))
+                )
+        else:
+            # Processes are stopped (and therefore their log file
+            # handles closed) BEFORE the workspace those logs live in
+            # is removed.
+            cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
+            # The hard invariant: Node database cleanup failing must
+            # never skip Central database cleanup. Both are always
+            # attempted.
+            cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
+            cleanup_actions.append(
+                ("drop_central_database", lambda: drop_database(db_admin, gate_names, "central"))
+            )
         run_cleanup_actions(cleanup_actions)
 
 
