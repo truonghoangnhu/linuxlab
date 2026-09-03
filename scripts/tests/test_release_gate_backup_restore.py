@@ -73,7 +73,7 @@ def _submit_one_attempt(deployment, authored):
     return submit_body
 
 
-def _restore_and_verify(deployment, authored, tmp_path, dumps, first, second):
+def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
     """Restores both dumps into the already-created restore_central/
     restore_node databases and runs every application-level assertion.
     Caller owns creating/dropping those two databases."""
@@ -153,7 +153,7 @@ def _restore_and_verify(deployment, authored, tmp_path, dumps, first, second):
     restored_node = None
     try:
         central_listener = reserve_listener()
-        restored_central = start_gunicorn(restored_central_env, central_listener, tmp_path / "restored-central.log")
+        restored_central = start_gunicorn(restored_central_env, central_listener, workspace / "restored-central.log")
         wait_ready(restored_central, timeout_seconds=20)
 
         restored_node_env = {
@@ -165,7 +165,7 @@ def _restore_and_verify(deployment, authored, tmp_path, dumps, first, second):
             "LINUXLAB_SYNC_ALLOW_INSECURE_HTTP": "true",
         }
         node_listener = reserve_listener()
-        restored_node = start_gunicorn(restored_node_env, node_listener, tmp_path / "restored-node.log")
+        restored_node = start_gunicorn(restored_node_env, node_listener, workspace / "restored-node.log")
         wait_ready(restored_node, timeout_seconds=20)
 
         # Node readiness recovered, and the active installed content is
@@ -234,8 +234,8 @@ def test_central_and_node_backup_restore_smoke(tmp_path):
         assert second_outbox["state"] == "pending"
 
         # --- real pg_dump --------------------------------------------------------
-        central_dump_path = tmp_path / "central.dump"
-        node_dump_path = tmp_path / "node.dump"
+        central_dump_path = deployment.tmp_dir / "central.dump"
+        node_dump_path = deployment.tmp_dir / "node.dump"
         dump_database(deployment.db_admin, deployment.gate_names, "central", central_dump_path)
         dump_database(deployment.db_admin, deployment.gate_names, "node", node_dump_path)
         assert central_dump_path.stat().st_size > 0
@@ -248,7 +248,7 @@ def test_central_and_node_backup_restore_smoke(tmp_path):
             _restore_and_verify(
                 deployment,
                 authored,
-                tmp_path,
+                deployment.tmp_dir,
                 (central_dump_path, node_dump_path),
                 (first_attempt_public_id, first_outbox),
                 (second_attempt_public_id, second_outbox),

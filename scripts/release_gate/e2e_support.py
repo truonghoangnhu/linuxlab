@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.release_gate.cleanup import remove_workspace, run_cleanup_actions
 from scripts.release_gate.database import (
     GateDatabaseNames,
     create_database,
@@ -35,10 +36,7 @@ from scripts.release_gate.processes import (
     stop_process,
     wait_ready,
 )
-from scripts.release_gate.signing_material import (
-    create_ephemeral_signing_keypair,
-    delete_private_key,
-)
+from scripts.release_gate.signing_material import create_ephemeral_signing_keypair
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "scripts" / "release_gate" / "cli.py"
@@ -138,13 +136,29 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
-    already configured into the Node process's environment. Tears
-    everything down in `finally`: processes first, then databases,
-    regardless of what the caller's `with` block does.
-    """
+    already configured into the Node process's environment.
+
+    Every generated artifact -- signing keys, .llpkg files, pg_dump
+    files, Gunicorn logs, any other scenario temp artifact a caller
+    places under `deployment.tmp_dir` -- lives inside ONE
+    deployment-owned workspace directory created here, distinct from
+    the caller-supplied `tmp_path` itself (which this function never
+    deletes; it is the pytest fixture's own, not ours to remove).
+
+    Tears everything down in `finally`, regardless of what the caller's
+    `with` block does or how far setup got: stop processes -> remove
+    the whole workspace recursively -> drop the Node database -> drop
+    the Central database. Every one of those steps is attempted even if
+    an earlier one fails (Node database cleanup failing must never skip
+    Central database cleanup) -- run_cleanup_actions() collects every
+    failure and raises one aggregated error only after all have been
+    attempted."""
     run_id = generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
+
+    workspace = Path(tmp_path) / f"gate-workspace-{run_id}"
+    workspace.mkdir(parents=True)
 
     create_database(db_admin, gate_names, "central")
     create_database(db_admin, gate_names, "node")
@@ -152,21 +166,20 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     central = None
     node = None
     deployment = None
-    private_key_path = None
     try:
         central_profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
         node_profile_env_for_migrate = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"}
         run_migrations(gate_names, "central", central_profile_env, repo_root=REPO_ROOT)
         run_migrations(gate_names, "node", node_profile_env_for_migrate, repo_root=REPO_ROOT)
 
-        private_key_path, public_key_path = create_ephemeral_signing_keypair(tmp_path)
+        private_key_path, public_key_path = create_ephemeral_signing_keypair(workspace)
 
         central_listener = reserve_listener()
         central_profile_env = {
             "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
             "POSTGRES_DB": gate_names.central,
         }
-        central = start_gunicorn(central_profile_env, central_listener, tmp_path / "central.log")
+        central = start_gunicorn(central_profile_env, central_listener, workspace / "central.log")
         wait_ready(central, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         credential = run_action(
@@ -185,7 +198,7 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
 
         if start_node:
             node_listener = reserve_listener()
-            node = start_gunicorn(node_profile_env, node_listener, tmp_path / "node.log")
+            node = start_gunicorn(node_profile_env, node_listener, workspace / "node.log")
             wait_ready(node, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         # Kept as a local reference (not just yielded) so `finally` below
@@ -200,7 +213,7 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
             run_id=run_id,
             gate_names=gate_names,
             db_admin=db_admin,
-            tmp_dir=tmp_path,
+            tmp_dir=workspace,
             central=central,
             node=node,
             central_profile_env=central_profile_env,
@@ -212,27 +225,24 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
         )
         yield deployment
     finally:
-        # Processes are stopped BEFORE any sensitive artifact they might
-        # still be using is deleted (Critical 1: private key lifecycle).
-        if deployment is not None:
-            if deployment.node is not None:
-                stop_process(deployment.node)
-            if deployment.central is not None:
-                stop_process(deployment.central)
-        else:
-            if node is not None:
-                stop_process(node)
-            if central is not None:
-                stop_process(central)
-        # Deleted unconditionally here -- success, an assertion failure
-        # propagating from the yielded block, or a partial setup failure
-        # that never reached `yield` at all -- since `private_key_path`
-        # is only ever non-None once create_ephemeral_signing_keypair()
-        # has actually run, and delete_private_key() is idempotent.
-        if private_key_path is not None:
-            delete_private_key(private_key_path)
-        drop_database(db_admin, gate_names, "node")
-        drop_database(db_admin, gate_names, "central")
+        current_node = deployment.node if deployment is not None else node
+        current_central = deployment.central if deployment is not None else central
+
+        cleanup_actions = []
+        if current_node is not None:
+            cleanup_actions.append(("stop_node_process", lambda p=current_node: stop_process(p)))
+        if current_central is not None:
+            cleanup_actions.append(("stop_central_process", lambda p=current_central: stop_process(p)))
+        # Processes are stopped (and therefore their log file handles
+        # closed) BEFORE the workspace those logs live in is removed.
+        cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
+        # The hard invariant: Node database cleanup failing must never
+        # skip Central database cleanup. Both are always attempted.
+        cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
+        cleanup_actions.append(
+            ("drop_central_database", lambda: drop_database(db_admin, gate_names, "central"))
+        )
+        run_cleanup_actions(cleanup_actions)
 
 
 def author_and_package(deployment, *, prompt, options, correct_option_id, max_score=1):

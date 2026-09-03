@@ -42,4 +42,8 @@ def test_private_key_absent_after_partial_setup_failure_before_yield(tmp_path, m
     with pytest.raises(StartupError), e2e_support.dual_deployment(tmp_path):
         pytest.fail("must never reach the yielded block")
 
-    assert not (tmp_path / "release-gate-signing.pem").exists()
+    # The key lives inside a workspace subdirectory whose exact name is
+    # not known here (setup failed before any DualDeployment existed to
+    # expose it) -- rglob proves no such file leaked ANYWHERE under
+    # tmp_path, a strictly stronger check than a single exact path.
+    assert list(tmp_path.rglob("release-gate-signing.pem")) == []
