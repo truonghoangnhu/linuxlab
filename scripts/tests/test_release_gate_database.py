@@ -16,13 +16,18 @@ layer. Every test that creates a real ephemeral database cleans it up
 in `finally`, independent of assertion outcome.
 """
 
+import contextlib
 import os
+import threading
+import time
 import uuid
+from unittest import mock
 
 import psycopg
 import pytest
 
 from scripts.release_gate.database import (
+    DatabaseCleanupError,
     DatabaseSafetyError,
     GateDatabaseNames,
     assert_ephemeral_database_name,
@@ -585,3 +590,140 @@ def test_dump_and_restore_preserves_a_row(tmp_path):
             drop_database(db_admin, names, "restore_central")
     finally:
         drop_database(db_admin, names, "central")
+
+
+# --- privilege-safe cleanup (Task 15 Tasks 7-10 final cleanup corrective,
+# following the same pattern hardened for T15-D27 fresh-migration cleanup) --
+
+
+def test_drop_database_waits_for_a_transient_connection_before_dropping():
+    """A genuine second connection to the ephemeral database must make
+    cleanup WAIT, not fail and not silently proceed -- proven
+    deterministically via an on_wait observability hook plus wall-clock
+    ordering, not merely an eventual successful drop (which an unrelated
+    race could also produce)."""
+    db_admin = _admin_connection()
+    names = GateDatabaseNames.for_run(_run_id())
+    create_database(db_admin, names, "central")
+
+    holder = _connect(db_admin, names.central)
+    try:
+        with _connect(db_admin, "postgres") as conn:
+            count = conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+                (names.central,),
+            ).fetchone()[0]
+        assert count >= 1
+
+        observed_waiting = threading.Event()
+        results = {}
+
+        def _on_wait(remaining):
+            del remaining
+            observed_waiting.set()
+
+        def _run_cleanup():
+            results["waited_iterations"] = drop_database(
+                db_admin, names, "central", poll_interval_seconds=0.05, deadline_seconds=10, on_wait=_on_wait
+            )
+            results["dropped_at"] = time.monotonic()
+
+        cleanup_thread = threading.Thread(target=_run_cleanup)
+        cleanup_thread.start()
+
+        assert observed_waiting.wait(timeout=5), "cleanup never observed the transient connection"
+        close_time = time.monotonic()
+        holder.close()
+
+        cleanup_thread.join(timeout=10)
+        assert not cleanup_thread.is_alive(), "cleanup did not finish after the connection closed"
+
+        assert results.get("waited_iterations", 0) >= 1, "cleanup never actually waited"
+        assert results["dropped_at"] >= close_time, "database was dropped before the connection closed"
+
+        with _connect(db_admin, "postgres") as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names.central,)
+            ).fetchone()
+        assert exists is None
+    finally:
+        with contextlib.suppress(Exception):
+            holder.close()
+        drop_database(db_admin, names, "central")
+
+
+def test_drop_database_never_issues_a_privileged_terminate_query():
+    """Structural proof that no code path in drop_database() ever issues
+    pg_terminate_backend()/pg_signal_backend()-style queries, by spying
+    on every query string actually executed against PostgreSQL while a
+    real transient connection is present and must be waited out."""
+    db_admin = _admin_connection()
+    names = GateDatabaseNames.for_run(_run_id())
+    create_database(db_admin, names, "central")
+
+    holder = _connect(db_admin, names.central)
+    executed_queries = []
+    real_execute = psycopg.Cursor.execute
+
+    def _spy_execute(self, query, *args, **kwargs):
+        executed_queries.append(str(query))
+        return real_execute(self, query, *args, **kwargs)
+
+    try:
+        with mock.patch.object(psycopg.Cursor, "execute", _spy_execute):
+
+            def _close_holder_soon():
+                time.sleep(0.3)
+                holder.close()
+
+            closer = threading.Thread(target=_close_holder_soon)
+            closer.start()
+            drop_database(db_admin, names, "central", poll_interval_seconds=0.05, deadline_seconds=10)
+            closer.join(timeout=5)
+
+        lowered = [q.lower() for q in executed_queries]
+        assert not any("pg_terminate_backend" in q for q in lowered)
+        assert not any("pg_signal_backend" in q for q in lowered)
+        assert not any("with (force)" in q or "with(force)" in q for q in lowered)
+    finally:
+        with contextlib.suppress(Exception):
+            holder.close()
+        drop_database(db_admin, names, "central")
+
+
+def test_drop_database_raises_sanitized_cleanup_error_on_deadline_exceeded():
+    """A connection that never closes must make cleanup fail closed --
+    DatabaseCleanupError, not an indefinite hang and not a silent
+    force-drop -- within a short bounded deadline, with a message that
+    carries only the database name and connection count, never a
+    connection string, password, or query text."""
+    db_admin = _admin_connection()
+    names = GateDatabaseNames.for_run(_run_id())
+    create_database(db_admin, names, "central")
+
+    holder = _connect(db_admin, names.central)
+    try:
+        with pytest.raises(DatabaseCleanupError) as excinfo:
+            drop_database(db_admin, names, "central", poll_interval_seconds=0.05, deadline_seconds=0.3)
+
+        message = str(excinfo.value)
+        assert names.central in message
+        assert db_admin.password not in message
+        assert db_admin.user not in message or db_admin.user in names.central
+
+        with _connect(db_admin, "postgres") as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (names.central,)
+            ).fetchone()
+        assert exists is not None, "database must NOT have been force-dropped after deadline failure"
+    finally:
+        with contextlib.suppress(Exception):
+            holder.close()
+        drop_database(db_admin, names, "central")
+
+
+def test_drop_database_returns_zero_waited_iterations_when_already_absent():
+    db_admin = _admin_connection()
+    names = GateDatabaseNames.for_run(_run_id())
+    waited_iterations = drop_database(db_admin, names, "central")
+    assert waited_iterations == 0

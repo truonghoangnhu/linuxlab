@@ -31,6 +31,7 @@ entirely via `object.__new__()`/`object.__setattr__()`.
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,9 @@ import psycopg
 from psycopg import sql
 
 from .environment import assert_valid_run_id
+
+DEFAULT_CLEANUP_POLL_INTERVAL_SECONDS = 0.2
+DEFAULT_CLEANUP_DEADLINE_SECONDS = 15.0
 
 _GATE_NAME_PATTERN_BY_PREFIX = (
     "linuxlab_gate_central_",
@@ -59,6 +63,19 @@ class DatabaseSafetyError(Exception):
     check, or when a caller attempts to operate outside the
     GateDatabaseNames + member-selector API surface. Maps to
     PRECHECK_FAILURE."""
+
+
+class DatabaseCleanupError(Exception):
+    """Raised by drop_database() when a database cannot be safely
+    dropped: either its other active connections never drain within the
+    bounded deadline, or it somehow still exists after a plain DROP
+    DATABASE. Diagnostics are sanitized -- database name and remaining
+    connection count only, never a connection string, credential, or
+    query text. Maps to CLEANUP_FAILURE. Never raised for a
+    pg_terminate_backend()-style privilege error, because drop_database()
+    never calls that function (Task 15 Tasks 7-10 final cleanup
+    corrective, following the same pattern already hardened for T15-D27
+    fresh-migration cleanup in linuxlab/learning/tests/test_fresh_migration.py)."""
 
 
 def assert_ephemeral_database_name(name: str) -> None:
@@ -164,18 +181,86 @@ def create_database(db_admin, gate_names, member: str) -> None:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
 
 
-def drop_database(db_admin, gate_names, member: str) -> None:
-    """Idempotent: dropping a name that never existed is a safe no-op,
-    since a release-gate cleanup pass may run after a partial/failed
-    create."""
-    name = _resolve_owned_name(gate_names, member)
+def _database_exists(db_admin, name: str) -> bool:
     with _connect_admin(db_admin) as conn:
-        conn.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = %s AND pid <> pg_backend_pid()",
+        row = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
+        return row is not None
+
+
+def _other_backend_count(db_admin, name: str) -> int:
+    with _connect_admin(db_admin) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
             (name,),
-        )
+        ).fetchone()
+        return row[0]
+
+
+def drop_database(
+    db_admin,
+    gate_names,
+    member: str,
+    *,
+    poll_interval_seconds: float = DEFAULT_CLEANUP_POLL_INTERVAL_SECONDS,
+    deadline_seconds: float = DEFAULT_CLEANUP_DEADLINE_SECONDS,
+    on_wait=None,
+) -> int:
+    """Idempotent, privilege-safe cleanup (Task 15 Tasks 7-10 final
+    cleanup corrective, following the same pattern already hardened for
+    T15-D27 fresh-migration cleanup): never calls pg_terminate_backend(),
+    pg_signal_backend(), or DROP DATABASE ... WITH (FORCE) -- all three
+    require privileges the ordinary `linuxlab` application role is not
+    guaranteed to hold over every connection that might transiently
+    remain (e.g. an autovacuum worker it cannot terminate). Instead
+    polls pg_stat_activity for this database's other active connections
+    and waits, bounded by `deadline_seconds`, for them to close on their
+    own -- exactly what a short-lived subprocess connection does when it
+    exits -- before issuing a plain DROP DATABASE, then verifies the
+    database is actually gone.
+
+    Dropping a name that never existed (or that disappears between poll
+    iterations) is a safe no-op, since a release-gate cleanup pass may
+    run after a partial/failed create.
+
+    Raises DatabaseCleanupError, with sanitized diagnostics (database
+    name and remaining-connection count only), if the deadline is
+    exceeded or the database still exists after DROP DATABASE.
+
+    `on_wait(remaining)`, if given, is invoked once per poll iteration
+    that observed at least one other active connection -- test-only
+    observability, never required for correctness. Returns the number of
+    such iterations, so a test can prove genuine waiting occurred rather
+    than an immediate lucky drop."""
+    name = _resolve_owned_name(gate_names, member)
+    deadline = time.monotonic() + deadline_seconds
+    waited_iterations = 0
+
+    while True:
+        if not _database_exists(db_admin, name):
+            return waited_iterations
+
+        remaining = _other_backend_count(db_admin, name)
+        if remaining == 0:
+            break
+
+        waited_iterations += 1
+        if on_wait is not None:
+            on_wait(remaining)
+
+        if time.monotonic() >= deadline:
+            raise DatabaseCleanupError(
+                f"cleanup deadline ({deadline_seconds}s) exceeded waiting for "
+                f"{remaining} active connection(s) on {name!r} to close"
+            )
+        time.sleep(poll_interval_seconds)
+
+    with _connect_admin(db_admin) as conn:
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+
+    if _database_exists(db_admin, name):
+        raise DatabaseCleanupError(f"database {name!r} still exists after DROP DATABASE")
+
+    return waited_iterations
 
 
 def run_migrations(gate_names, member: str, profile_env: dict, *, repo_root=None) -> None:
