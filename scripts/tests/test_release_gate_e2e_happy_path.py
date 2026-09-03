@@ -181,8 +181,7 @@ def test_real_dual_deployment_happy_path(tmp_path):
             deployment.central.base_url,
             "--node-id",
             deployment.node_id,
-            "--secret",
-            deployment.node_secret,
+            stdin_json={"secret": deployment.node_secret},
         )
         assert resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
         assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1

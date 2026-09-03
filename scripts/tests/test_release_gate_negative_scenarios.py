@@ -214,8 +214,7 @@ def test_n3_ack_lost_then_retry_yields_exactly_one_inbox_and_eventual_delivery(t
             deployment.central.base_url,
             "--node-id",
             deployment.node_id,
-            "--secret",
-            deployment.node_secret,
+            stdin_json={"secret": deployment.node_secret},
         )
         assert first_send["results"] == [{"event_id": event_id, "status": "accepted", "code": ""}]
         assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1

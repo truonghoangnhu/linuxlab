@@ -16,12 +16,29 @@ Exit code 0 with a JSON object on stdout on success; non-zero with a
 JSON {"error": "..."} object on stdout on any failure -- never a Python
 traceback on stdout, so a caller can always `json.loads(stdout)`
 regardless of outcome.
+
+Task 15 Tasks 7-10 corrective, Critical 2: a subcommand that needs a
+SENSITIVE input value (`author-and-publish`'s correct-answer material,
+`resend-outbox-message`'s Node bearer secret) reads it from a JSON
+object on stdin (see `_read_sensitive_stdin()`) -- never from argv.
+Every argparse argument on every subcommand is a non-sensitive
+identifier/option only.
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
+
+# Task 15 Tasks 7-10 corrective, Critical 2: subcommand names whose
+# action needs at least one SENSITIVE input value (a Node bearer
+# secret, or correct-answer/grading material) -- these values are read
+# exclusively from JSON on stdin, never accepted as an argparse
+# argument, so they can never appear on this process's own argv (and
+# therefore never in a `ps`/procfs listing, a process-table dump, or
+# any diagnostic that walks argv). CLI argv carries only non-sensitive
+# identifiers/options for every subcommand, sensitive or not.
+_SENSITIVE_STDIN_COMMANDS = frozenset({"author-and-publish", "resend-outbox-message"})
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -46,13 +63,29 @@ def _load_public_key(path):
     return load_pem_public_key(Path(path).read_bytes())
 
 
+def _read_sensitive_stdin() -> dict:
+    """The ONLY channel this process accepts sensitive action inputs
+    through -- never argv. Reads the full stdin stream once and parses
+    it as a single JSON object; called only by subcommands listed in
+    _SENSITIVE_STDIN_COMMANDS, each of which requires its own specific
+    key(s) to be present."""
+    raw = sys.stdin.read()
+    if not raw.strip():
+        raise ValueError("expected a JSON object of sensitive inputs on stdin, got none")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise TypeError("stdin JSON payload must be an object")
+    return payload
+
+
 def _cmd_author_and_publish(args):
     from scripts.release_gate import actions
 
+    sensitive = _read_sensitive_stdin()
     authored = actions.author_and_publish_single_choice_activity(
         prompt=args.prompt,
         options=json.loads(args.options_json),
-        correct_option_id=args.correct_option_id,
+        correct_option_id=sensitive["correct_option_id"],
         max_score=args.max_score,
     )
     return {
@@ -251,8 +284,9 @@ def _cmd_find_progress(args):
 def _cmd_resend_outbox_message(args):
     from scripts.release_gate import actions
 
+    sensitive = _read_sensitive_stdin()
     ack = actions.resend_outbox_message(
-        args.event_id, args.central_url, args.node_id, args.secret
+        args.event_id, args.central_url, args.node_id, sensitive["secret"]
     )
     return {
         "results": [
@@ -269,7 +303,6 @@ def _build_parser():
     author = subparsers.add_parser("author-and-publish")
     author.add_argument("--prompt", required=True)
     author.add_argument("--options-json", required=True)
-    author.add_argument("--correct-option-id", required=True)
     author.add_argument("--max-score", type=int, default=1)
     author.set_defaults(func=_cmd_author_and_publish)
 
@@ -345,7 +378,6 @@ def _build_parser():
     resend_outbox.add_argument("--event-id", required=True)
     resend_outbox.add_argument("--central-url", required=True)
     resend_outbox.add_argument("--node-id", required=True)
-    resend_outbox.add_argument("--secret", required=True)
     resend_outbox.set_defaults(func=_cmd_resend_outbox_message)
 
     return parser

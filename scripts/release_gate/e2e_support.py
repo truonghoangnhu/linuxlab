@@ -22,14 +22,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    NoEncryption,
-    PrivateFormat,
-    PublicFormat,
-)
-
 from scripts.release_gate.database import (
     GateDatabaseNames,
     create_database,
@@ -42,6 +34,10 @@ from scripts.release_gate.processes import (
     start_gunicorn,
     stop_process,
     wait_ready,
+)
+from scripts.release_gate.signing_material import (
+    create_ephemeral_signing_keypair,
+    delete_private_key,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -65,15 +61,28 @@ def db_admin_from_env():
     )
 
 
-def run_action(profile_env, *args, allow_failure=False):
+def run_action(profile_env, *args, allow_failure=False, stdin_json=None):
     """Invoke scripts/release_gate/cli.py as a real subprocess under
     `profile_env` and return its parsed JSON result. Raises ActionError
     on a non-zero exit unless `allow_failure=True` (some Task 9 negative
-    scenarios expect and assert on a failure result directly)."""
+    scenarios expect and assert on a failure result directly).
+
+    `stdin_json`, when given, is JSON-encoded and piped to the child's
+    stdin -- the ONLY channel scripts/release_gate/cli.py accepts a
+    SENSITIVE action input through (a Node bearer secret, or
+    correct-answer/grading material). It is never placed on argv, and
+    this function's own error formatting below never echoes the full
+    `args` tuple either (only the action name, exit code, and the
+    child's own stdout/stderr) -- so a sensitive value could never leak
+    into an ActionError's text even by accident (Task 15 Tasks 7-10
+    corrective, Critical 2)."""
+    action_name = args[0] if args else "<no action>"
+    stdin_text = json.dumps(stdin_json) if stdin_json is not None else None
     result = subprocess.run(
         [str(PYTHON), str(CLI_PATH), *args],
         cwd=str(REPO_ROOT),
         env={**os.environ, **profile_env},
+        input=stdin_text,
         capture_output=True,
         text=True,
         timeout=60,
@@ -83,12 +92,12 @@ def run_action(profile_env, *args, allow_failure=False):
         payload = json.loads(result.stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError) as exc:
         raise ActionError(
-            f"cli.py {args} produced non-JSON output "
+            f"cli.py action {action_name!r} produced non-JSON output "
             f"(exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r}"
         ) from exc
 
     if result.returncode != 0 and not allow_failure:
-        raise ActionError(f"cli.py {args} failed: {payload}")
+        raise ActionError(f"cli.py action {action_name!r} failed (exit {result.returncode}): {payload}")
     return payload
 
 
@@ -124,19 +133,6 @@ class DualDeployment:
     public_key_path: Path
 
 
-def _write_keypair(tmp_dir):
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
-
-    private_key_path = tmp_dir / "release-gate-signing.pem"
-    public_key_path = tmp_dir / "release-gate-trusted.pem"
-    private_key_path.write_bytes(
-        private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-    )
-    public_key_path.write_bytes(public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo))
-    return private_key_path, public_key_path
-
-
 @contextmanager
 def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     """Stand up two real ephemeral PostgreSQL databases and (unless
@@ -156,13 +152,14 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     central = None
     node = None
     deployment = None
+    private_key_path = None
     try:
         central_profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
         node_profile_env_for_migrate = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"}
         run_migrations(gate_names, "central", central_profile_env, repo_root=REPO_ROOT)
         run_migrations(gate_names, "node", node_profile_env_for_migrate, repo_root=REPO_ROOT)
 
-        private_key_path, public_key_path = _write_keypair(tmp_path)
+        private_key_path, public_key_path = create_ephemeral_signing_keypair(tmp_path)
 
         central_listener = reserve_listener()
         central_profile_env = {
@@ -215,6 +212,8 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
         )
         yield deployment
     finally:
+        # Processes are stopped BEFORE any sensitive artifact they might
+        # still be using is deleted (Critical 1: private key lifecycle).
         if deployment is not None:
             if deployment.node is not None:
                 stop_process(deployment.node)
@@ -225,6 +224,13 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
                 stop_process(node)
             if central is not None:
                 stop_process(central)
+        # Deleted unconditionally here -- success, an assertion failure
+        # propagating from the yielded block, or a partial setup failure
+        # that never reached `yield` at all -- since `private_key_path`
+        # is only ever non-None once create_ephemeral_signing_keypair()
+        # has actually run, and delete_private_key() is idempotent.
+        if private_key_path is not None:
+            delete_private_key(private_key_path)
         drop_database(db_admin, gate_names, "node")
         drop_database(db_admin, gate_names, "central")
 
@@ -241,10 +247,9 @@ def author_and_package(deployment, *, prompt, options, correct_option_id, max_sc
         prompt,
         "--options-json",
         json.dumps(options),
-        "--correct-option-id",
-        correct_option_id,
         "--max-score",
         str(max_score),
+        stdin_json={"correct_option_id": correct_option_id},
     )
 
     package_path = deployment.tmp_dir / f"package-{authored['source_public_id']}-v{authored['package_version']}.llpkg"
