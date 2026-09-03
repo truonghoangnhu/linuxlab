@@ -16,6 +16,7 @@ whether the key was ever actually created.
 """
 
 import os
+import stat
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -32,8 +33,23 @@ PUBLIC_KEY_FILENAME = "release-gate-trusted.pem"
 
 
 def _create_private_key_file_atomically(path: Path, pem_bytes: bytes) -> None:
+    """Task 15 Tasks 7-10 final cleanup corrective: the exclusive open()
+    mode alone is not sufficient to guarantee the exact final mode --
+    the kernel ANDs it against the process umask, so a sufficiently
+    restrictive umask (e.g. 0o777) can silently narrow the actual
+    created mode below 0o600. fchmod(fd, 0o600) establishes the exact
+    mode explicitly, independent of umask, and fstat(fd) verifies it
+    actually took effect -- both BEFORE a single byte of key material is
+    written. No step here ever mutates the process-global umask."""
     fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_KEY_MODE)
     try:
+        os.fchmod(fd, PRIVATE_KEY_MODE)
+        actual_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if actual_mode != PRIVATE_KEY_MODE:
+            raise OSError(
+                f"private key file {path} has mode {oct(actual_mode)} after fchmod, "
+                f"expected {oct(PRIVATE_KEY_MODE)} -- refusing to write key material"
+            )
         with os.fdopen(fd, "wb") as handle:
             handle.write(pem_bytes)
     except BaseException:
@@ -42,12 +58,18 @@ def _create_private_key_file_atomically(path: Path, pem_bytes: bytes) -> None:
 
 
 def create_ephemeral_signing_keypair(tmp_dir):
-    """Generates a fresh Ed25519 keypair. Writes ONLY the private key to
-    disk, via exclusive atomic creation at mode 0600. Returns
-    (private_key_path, public_key_path). Deletion is the caller's
-    responsibility via delete_private_key() -- this function does not
-    register any cleanup of its own beyond unwinding a failed partial
-    write."""
+    """Generates a fresh Ed25519 keypair and writes BOTH the private key
+    (exclusive atomic creation, fchmod+fstat-verified 0600 before any
+    key bytes are written) and the public key to disk. Returns
+    (private_key_path, public_key_path) only once BOTH have succeeded.
+
+    Transactional: this function owns both paths until it returns. If
+    the public key write fails after the private key was already
+    created, the already-created private key is deleted, any public
+    partial is deleted, and the exception propagates -- the caller never
+    receives ownership of a half-written keypair to clean up itself.
+    Deletion of a successfully returned private key remains the
+    caller's own responsibility via delete_private_key()."""
     tmp_dir = Path(tmp_dir)
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
@@ -59,9 +81,14 @@ def create_ephemeral_signing_keypair(tmp_dir):
         private_key_path,
         private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()),
     )
-    public_key_path.write_bytes(
-        public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-    )
+    try:
+        public_key_path.write_bytes(
+            public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        )
+    except BaseException:
+        delete_private_key(private_key_path)
+        Path(public_key_path).unlink(missing_ok=True)
+        raise
     return private_key_path, public_key_path
 
 
