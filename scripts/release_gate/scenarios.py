@@ -21,6 +21,7 @@ import io
 import re
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -91,6 +92,13 @@ def _tamper_signature(package_path):
     tampered_path = package_path.with_name(package_path.name + ".tampered")
     tampered_path.write_bytes(buffer.getvalue())
     return tampered_path
+
+
+def _public_key_fingerprint(deployment) -> str:
+    """SHA-256 of the ephemeral Ed25519 PUBLIC key -- never the private
+    key. Required release evidence content (design spec Section 17.1:
+    "ephemeral signing public-key fingerprint")."""
+    return hashlib.sha256(Path(deployment.public_key_path).read_bytes()).hexdigest()
 
 
 def _submit_a_real_attempt(deployment, authored):
@@ -253,6 +261,7 @@ def run_happy_path(deployment) -> dict:
         "score": submit_body["score"],
         "max_score": submit_body["max_score"],
         "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
+        "public_key_fingerprint": _public_key_fingerprint(deployment),
     }
 
 
@@ -343,6 +352,7 @@ def run_n1_tampered_replacement(deployment) -> dict:
         "active_package_version": authored_a["package_version"],
         "payload_sha256": payload_sha256_before,
         "rejected_replacement_version": republished_b["package_version"],
+        "public_key_fingerprint": _public_key_fingerprint(deployment),
     }
 
 

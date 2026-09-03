@@ -43,7 +43,6 @@ attempted scenarios (STARTUP_FAILURE > SCENARIO_FAILURE >
 CLEANUP_FAILURE > PASS) becomes `overall`.
 """
 
-import hashlib
 import platform
 import tempfile
 import time
@@ -350,7 +349,3 @@ def _summarize_detail(detail_value) -> dict:
     facts (event ids, package SHA-256, scores) rather than an opaque
     string."""
     return dict(detail_value) if isinstance(detail_value, dict) else {"detail": str(detail_value)}
-
-
-def compute_public_key_fingerprint(public_key_path) -> str:
-    return hashlib.sha256(Path(public_key_path).read_bytes()).hexdigest()

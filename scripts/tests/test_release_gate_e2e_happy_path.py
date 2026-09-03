@@ -18,4 +18,15 @@ from scripts.release_gate.e2e_support import dual_deployment
 
 def test_real_dual_deployment_happy_path(tmp_path):
     with dual_deployment(tmp_path) as deployment:
-        scenarios.run_happy_path(deployment)
+        detail = scenarios.run_happy_path(deployment)
+
+    # Required release evidence content (Task 15 Task 11, design spec
+    # Section 17.1): package SHA-256 and the ephemeral signing public
+    # key's fingerprint must both be present in what the scenario
+    # reports -- neither is secret material (the fingerprint is a hash
+    # of the PUBLIC key; the package SHA-256 identifies published,
+    # non-secret content).
+    assert len(detail["package_sha256"]) == 64
+    assert all(c in "0123456789abcdef" for c in detail["package_sha256"])
+    assert len(detail["public_key_fingerprint"]) == 64
+    assert all(c in "0123456789abcdef" for c in detail["public_key_fingerprint"])
