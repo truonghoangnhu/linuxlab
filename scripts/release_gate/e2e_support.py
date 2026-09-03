@@ -152,21 +152,33 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True):
     an earlier one fails (Node database cleanup failing must never skip
     Central database cleanup) -- run_cleanup_actions() collects every
     failure and raises one aggregated error only after all have been
-    attempted."""
+    attempted.
+
+    The protected cleanup scope (this function's own try/finally) begins
+    BEFORE workspace creation and BEFORE either create_database() call --
+    resource IDENTITIES (`run_id`/`gate_names`/`workspace` path) are only
+    resolved/generated first, never created yet. This closes a partial-
+    setup window where a real Central database could be created, then
+    Node database creation fails, with no `finally` ever having started
+    to protect the already-real Central database or the already-created
+    workspace directory (Task 15 Tasks 7-10 partial-setup cleanup final
+    corrective, Important). Every cleanup action below is idempotent for
+    a resource that was never actually created, so registering cleanup
+    for both database members and the workspace unconditionally is
+    always safe."""
     run_id = generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
-
     workspace = Path(tmp_path) / f"gate-workspace-{run_id}"
-    workspace.mkdir(parents=True)
-
-    create_database(db_admin, gate_names, "central")
-    create_database(db_admin, gate_names, "node")
 
     central = None
     node = None
     deployment = None
     try:
+        workspace.mkdir(parents=True)
+        create_database(db_admin, gate_names, "central")
+        create_database(db_admin, gate_names, "node")
+
         central_profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
         node_profile_env_for_migrate = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"}
         run_migrations(gate_names, "central", central_profile_env, repo_root=REPO_ROOT)
