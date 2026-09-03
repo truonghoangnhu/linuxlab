@@ -40,18 +40,35 @@ def _create_private_key_file_atomically(path: Path, pem_bytes: bytes) -> None:
     created mode below 0o600. fchmod(fd, 0o600) establishes the exact
     mode explicitly, independent of umask, and fstat(fd) verifies it
     actually took effect -- both BEFORE a single byte of key material is
-    written. No step here ever mutates the process-global umask."""
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_KEY_MODE)
+    written. No step here ever mutates the process-global umask.
+
+    Raw file descriptor ownership (Task 15 Tasks 7-10 partial-setup
+    cleanup final corrective, Minor): `os.open()` returns a raw int fd
+    that nothing owns yet. `raw_fd` tracks that ownership explicitly --
+    it is set to None the instant os.fdopen() successfully hands the
+    descriptor to a real file object, which is the only point onward
+    where closing it is that object's job (via the `with` block). If
+    fchmod(), fstat(), the mode check, or os.fdopen() itself fails
+    before that handoff, `raw_fd` is still the original int, and the
+    `finally` below closes it directly -- there is no window in which a
+    raw descriptor is leaked, and no risk of closing it twice."""
+    raw_fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_KEY_MODE)
     try:
-        os.fchmod(fd, PRIVATE_KEY_MODE)
-        actual_mode = stat.S_IMODE(os.fstat(fd).st_mode)
-        if actual_mode != PRIVATE_KEY_MODE:
-            raise OSError(
-                f"private key file {path} has mode {oct(actual_mode)} after fchmod, "
-                f"expected {oct(PRIVATE_KEY_MODE)} -- refusing to write key material"
-            )
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(pem_bytes)
+        try:
+            os.fchmod(raw_fd, PRIVATE_KEY_MODE)
+            actual_mode = stat.S_IMODE(os.fstat(raw_fd).st_mode)
+            if actual_mode != PRIVATE_KEY_MODE:
+                raise OSError(
+                    f"private key file {path} has mode {oct(actual_mode)} after fchmod, "
+                    f"expected {oct(PRIVATE_KEY_MODE)} -- refusing to write key material"
+                )
+            handle = os.fdopen(raw_fd, "wb")
+            raw_fd = None  # ownership transferred to `handle`; never close it again below
+            with handle:
+                handle.write(pem_bytes)
+        finally:
+            if raw_fd is not None:
+                os.close(raw_fd)
     except BaseException:
         delete_private_key(path)
         raise

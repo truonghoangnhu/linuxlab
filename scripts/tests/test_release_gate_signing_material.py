@@ -167,3 +167,106 @@ def test_public_key_write_failure_leaves_no_private_or_public_material(tmp_path,
 
     assert not (tmp_path / signing_material.PRIVATE_KEY_FILENAME).exists()
     assert not (tmp_path / signing_material.PUBLIC_KEY_FILENAME).exists()
+
+
+# --- Task 15 Tasks 7-10 partial-setup cleanup final corrective, Minor: raw
+# file descriptor ownership. os.open() returns a raw int fd; until it is
+# handed to os.fdopen() (which then owns closing it), a failure in
+# fchmod()/fstat()/fdopen() itself must not leak that raw descriptor --
+# proven by attempting a real operation on it afterward and expecting
+# EBADF, never merely checking that the pathname disappeared. -----------
+
+
+def _open_a_real_fd_and_capture_it(monkeypatch, target_path):
+    """Wraps the real os.open() so the exact raw fd it returns for
+    `target_path` is captured -- a targeted spy (matched by path), not a
+    blanket override, so unrelated os.open() calls elsewhere are
+    unaffected."""
+    captured = {}
+    real_open = os.open
+
+    def _spy_open(path_arg, *args, **kwargs):
+        fd = real_open(path_arg, *args, **kwargs)
+        if path_arg == str(target_path):
+            captured["fd"] = fd
+        return fd
+
+    monkeypatch.setattr(os, "open", _spy_open)
+    return captured
+
+
+def _assert_fd_is_closed(fd):
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_fchmod_failure_closes_the_raw_descriptor_and_unlinks_the_path(tmp_path, monkeypatch):
+    path = tmp_path / "descriptor-fchmod-failure.pem"
+    captured = _open_a_real_fd_and_capture_it(monkeypatch, path)
+
+    def _fail_fchmod(fd, mode):
+        raise OSError("simulated fchmod failure")
+
+    monkeypatch.setattr(os, "fchmod", _fail_fchmod)
+
+    with pytest.raises(OSError, match="simulated fchmod failure"):
+        signing_material._create_private_key_file_atomically(path, b"fake pem bytes")
+
+    assert not path.exists()
+    assert "fd" in captured, "expected os.open() to have been called for this exact path"
+    _assert_fd_is_closed(captured["fd"])
+
+
+def test_fstat_failure_closes_the_raw_descriptor_and_unlinks_the_path(tmp_path, monkeypatch):
+    path = tmp_path / "descriptor-fstat-failure.pem"
+    captured = _open_a_real_fd_and_capture_it(monkeypatch, path)
+
+    def _fail_fstat(fd):
+        raise OSError("simulated fstat failure")
+
+    monkeypatch.setattr(os, "fstat", _fail_fstat)
+
+    with pytest.raises(OSError, match="simulated fstat failure"):
+        signing_material._create_private_key_file_atomically(path, b"fake pem bytes")
+
+    fd = captured["fd"]
+    # Restore the REAL os.open/os.fstat before verifying closure below --
+    # otherwise this test's own _fail_fstat patch would still be active
+    # and intercept _assert_fd_is_closed()'s verification call too,
+    # trivially "passing" regardless of whether the real fd is closed.
+    monkeypatch.undo()
+
+    assert not path.exists()
+    _assert_fd_is_closed(fd)
+
+
+def test_fdopen_failure_closes_the_raw_descriptor_and_unlinks_the_path(tmp_path, monkeypatch):
+    path = tmp_path / "descriptor-fdopen-failure.pem"
+    captured = _open_a_real_fd_and_capture_it(monkeypatch, path)
+
+    def _fail_fdopen(fd, mode, *args, **kwargs):
+        raise OSError("simulated fdopen failure")
+
+    monkeypatch.setattr(os, "fdopen", _fail_fdopen)
+
+    with pytest.raises(OSError, match="simulated fdopen failure"):
+        signing_material._create_private_key_file_atomically(path, b"fake pem bytes")
+
+    assert not path.exists()
+    assert "fd" in captured
+    _assert_fd_is_closed(captured["fd"])
+
+
+def test_successful_creation_does_not_double_close_the_descriptor(tmp_path):
+    """The ownership-transfer point (raw_fd = None right after a
+    successful os.fdopen()) must mean the happy path never attempts to
+    close the same descriptor twice -- a double-close would raise on
+    some platforms/fd-reuse timing and is a real bug class this proves
+    absent."""
+    path = tmp_path / "descriptor-success.pem"
+    signing_material._create_private_key_file_atomically(path, b"fake pem bytes")
+    try:
+        assert path.exists()
+        assert path.read_bytes() == b"fake pem bytes"
+    finally:
+        path.unlink(missing_ok=True)
