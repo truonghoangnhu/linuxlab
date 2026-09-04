@@ -267,10 +267,17 @@ def run_happy_path(deployment) -> dict:
         # verify_package() runs inside it) -- recorded here as an
         # explicit proof fact rather than left implicit.
         "signature_verified": True,
-        # The delivered-Outbox / found-Inbox / exactly-one-Inbox-row
-        # sequence already asserted above IS the real Outbox->Inbox
-        # delivery proof for this run.
-        "outbox_to_inbox": "delivered",
+        # The delivered-Outbox / found-Inbox / exactly-one-Inbox-row /
+        # resend-is-duplicate sequence already asserted above IS the
+        # real Outbox->Inbox delivery proof for this run -- reported as
+        # a typed structure (Task 11 corrective v2, Section 7.3), never
+        # a bare "delivered" string.
+        "outbox_to_inbox": {
+            "event_uuid": event_id,
+            "inbox_count": 1,
+            "node_state": "DELIVERED",
+            "duplicate_idempotent": True,
+        },
     }
 
 
@@ -362,6 +369,17 @@ def run_n1_tampered_replacement(deployment) -> dict:
         "payload_sha256": payload_sha256_before,
         "rejected_replacement_version": republished_b["package_version"],
         "public_key_fingerprint": _public_key_fingerprint(deployment),
+        # Typed scenario assertions (Task 11 corrective v2, Section 8):
+        # each of these mirrors an assertion already made above, not a
+        # new claim -- existing ACTIVE package A was found/state=active
+        # both before and after (existing_active_preserved), its
+        # payload_sha256 was byte-identical before/after
+        # (active_package_identity_unchanged), and the tampered
+        # replacement B was rejected via a real PackageImportError
+        # (replacement_rejected).
+        "existing_active_preserved": True,
+        "active_package_identity_unchanged": True,
+        "replacement_rejected": True,
     }
 
 
@@ -437,11 +455,30 @@ def run_n3_ack_lost_real_proxy(deployment) -> dict:
     assert flush_after_retry is not None
     assert "delivered=1" in flush_after_retry.stdout
 
-    assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
+    final_inbox_count = run_action(
+        deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id
+    )["count"]
+    assert final_inbox_count == 1
     outbox_final = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", event_id)
     assert outbox_final["state"] == "delivered"
 
-    return {"event_id": event_id}
+    return {
+        "event_id": event_id,
+        # Typed scenario assertions (Task 11 corrective v2, Section 8):
+        # each mirrors an assertion already made above -- the Inbox row
+        # was durably committed (count == 1) BEFORE the dropped ACK
+        # (central_commit_before_ack_loss), the Outbox stayed pending
+        # across that loss (node_pending_before_retry), and after the
+        # retry the Inbox count is STILL exactly 1 (final_inbox_count,
+        # duplicate_idempotent -- the retry was recognized as the same
+        # idempotent event_id, not a fresh duplicate) with Node finally
+        # DELIVERED (final_node_state).
+        "central_commit_before_ack_loss": True,
+        "node_pending_before_retry": True,
+        "final_inbox_count": final_inbox_count,
+        "final_node_state": "DELIVERED",
+        "duplicate_idempotent": True,
+    }
 
 
 # --- N4: Central unavailable / Node offline operation ------------------------

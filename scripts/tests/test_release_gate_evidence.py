@@ -30,10 +30,15 @@ def _make_evidence(**overrides):
             "git_sha": "a" * 40,
             "started_at": "2026-08-31T00:00:00+00:00",
             "finished_at": "2026-08-31T00:05:00+00:00",
-            "platform": "linux",
-            "central_profile": "linuxlab.settings.central",
-            "node_profile": "linuxlab.settings.node",
+            "authority": {"authoritative": True, "platform": "linux", "reason": None},
         },
+        "environment": {
+            "platform": "linux",
+            "python_version": "3.12.0",
+            "django_version": "5.2",
+            "postgres_version": "180000",
+        },
+        "profiles": {"central": "linuxlab.settings.central", "node": "linuxlab.settings.node"},
         "validation": {
             "clean_tree": True,
             "central_check": "ok",
@@ -43,9 +48,14 @@ def _make_evidence(**overrides):
         },
         "scenarios": {},
         "proofs": {},
-        "retained_resources": {},
+        "retention": {
+            "keep_on_failure_requested": False,
+            "execution_resources_retained": False,
+            "sanitized_debug_bundle_retained": True,
+        },
         "primary_failure": None,
         "cleanup_failure": None,
+        "finalization_failure": None,
         "cleanup_status": "clean",
         "overall": "PASS",
         "exit_code": 0,
@@ -76,16 +86,20 @@ def test_evidence_to_dict_has_required_schema_v1_shape():
     assert doc["schema_version"] == 1
     assert doc["run"]["run_id"] == "rabc123456789"
     assert doc["run"]["git_sha"] == "a" * 40
-    assert doc["run"]["central_profile"] == "linuxlab.settings.central"
-    assert doc["run"]["node_profile"] == "linuxlab.settings.node"
+    assert doc["run"]["authority"]["authoritative"] is True
+    assert doc["profiles"]["central"] == "linuxlab.settings.central"
+    assert doc["profiles"]["node"] == "linuxlab.settings.node"
     assert doc["overall"] in {"PASS", "PRECHECK_FAILURE", "STARTUP_FAILURE", "SCENARIO_FAILURE", "CLEANUP_FAILURE"}
     assert doc["exit_code"] == 0
+    assert "environment" in doc
     assert "validation" in doc
     assert "scenarios" in doc
     assert "proofs" in doc
-    assert "retained_resources" in doc
+    assert "retention" in doc
+    assert doc["retention"]["execution_resources_retained"] is False
     assert "primary_failure" in doc
     assert "cleanup_failure" in doc
+    assert "finalization_failure" in doc
     assert "cleanup_status" in doc
 
 
@@ -347,9 +361,7 @@ def test_markdown_evidence_includes_every_canonical_section():
             "git_sha": "b" * 40,
             "started_at": "2026-09-04T00:00:00+00:00",
             "finished_at": "2026-09-04T00:05:00+00:00",
-            "platform": "linux",
-            "central_profile": "linuxlab.settings.central",
-            "node_profile": "linuxlab.settings.node",
+            "authority": {"authoritative": True, "platform": "linux", "reason": None},
         },
         scenarios={
             "happy_path": ScenarioResult(name="happy_path", status="PASS", duration_ms=1.0).__dict__,
@@ -358,10 +370,19 @@ def test_markdown_evidence_includes_every_canonical_section():
             "package_sha256": "f" * 64,
             "payload_sha256": "e" * 64,
             "public_key_fingerprint": "d" * 64,
-            "signature_verified": True,
-            "outbox_to_inbox": "delivered",
+            "signature": {"verified": True},
+            "outbox_to_inbox": {
+                "event_uuid": "12345678-1234-5678-1234-567812345678",
+                "inbox_count": 1,
+                "node_state": "DELIVERED",
+                "duplicate_idempotent": True,
+            },
         },
-        retained_resources={"n2_revoked_credential": {"central_database": "linuxlab_gate_central_r1", "node_database": "linuxlab_gate_node_r1", "workspace_path": "/tmp/x"}},
+        retention={
+            "keep_on_failure_requested": True,
+            "execution_resources_retained": False,
+            "sanitized_debug_bundle_retained": True,
+        },
     )
     path = _write_and_read_markdown(evidence)
 
@@ -370,10 +391,11 @@ def test_markdown_evidence_includes_every_canonical_section():
     assert "happy_path" in path
     assert "f" * 64 in path  # package_sha256
     assert "d" * 64 in path  # public_key_fingerprint
-    assert "signature_verified" in path.lower() or "true" in path.lower()
-    assert "outbox" in path.lower()
-    assert "linuxlab_gate_central_r1" in path
+    assert "true" in path.lower()  # signature.verified / duplicate_idempotent
+    assert "outbox" in path.lower() or "delivered" in path.lower()
+    assert "sanitized_debug_bundle_retained" in path.lower() or "execution_resources_retained" in path.lower()
     assert "cleanup_status" in path.lower() or "clean" in path.lower()
+    assert "authoritative" in path.lower()
 
 
 def _write_and_read_markdown(evidence, tmp_path=None):

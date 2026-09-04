@@ -1,23 +1,18 @@
-"""Task 15 Task 11 corrective, Section 13 "Keep-on-failure integration":
+"""Task 15 Task 11 corrective v2, Section 18.5 ("Keep-on-failure test"):
 a runner-level test combining the REAL gate_runner.run_release_gate()
 orchestration with the REAL dual_deployment() (not fakes) -- one
-RunContext, real owned Central/Node database identities and workspace,
-a controlled scenario failure, DB/workspace retention, unconditional
-private key deletion, retained identities recorded in evidence, and a
-full secret scan of the written evidence -- followed by explicit test
-cleanup of the deliberately-retained resources so this test does not
-itself leak them.
+RunContext, a controlled scenario failure with --keep-on-failure
+requested -- proving that execution resources (the ephemeral Central/
+Node databases and the workspace) are STILL fully destroyed, and that
+only the sanitized evidence pair persists.
 """
 
 import subprocess
-from pathlib import Path
 
 import psycopg
 import pytest
 
 from scripts.release_gate import gate_runner
-from scripts.release_gate.cleanup import remove_workspace
-from scripts.release_gate.database import GateDatabaseNames, drop_database
 from scripts.release_gate.environment import DatabaseAdminConnection
 
 _OK_VALIDATION = {
@@ -40,7 +35,7 @@ def _admin_connection():
     )
 
 
-def _database_exists(db_admin, name):
+def _any_gate_database_exists_for_run(db_admin, run_id):
     with psycopg.connect(
         host=db_admin.host,
         port=db_admin.port,
@@ -49,7 +44,9 @@ def _database_exists(db_admin, name):
         dbname="postgres",
         autocommit=True,
     ) as conn:
-        row = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname LIKE %s", (f"linuxlab_gate_%_{run_id}%",)
+        ).fetchone()
         return row is not None
 
 
@@ -59,7 +56,7 @@ def _working_tree_is_clean() -> bool:
 
 
 @pytest.mark.skipif(not _working_tree_is_clean(), reason="requires a clean working tree (real preflight)")
-def test_keep_on_failure_integration_retains_real_owned_resources_and_deletes_private_key(tmp_path):
+def test_keep_on_failure_integration_destroys_execution_resources_and_retains_only_sanitized_evidence(tmp_path):
     def _controlled_failure(deployment):
         raise AssertionError("integration test: controlled scenario failure")
 
@@ -72,37 +69,31 @@ def test_keep_on_failure_integration_retains_real_owned_resources_and_deletes_pr
         tmp_root=tmp_path,
     )
 
-    entry = result.evidence.retained_resources.get("integration_controlled_failure")
-    try:
-        assert result.overall == "SCENARIO_FAILURE"
-        assert result.exit_code == 4
-        assert entry is not None
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
 
-        db_admin = _admin_connection()
-        central_db = entry["central_database"]
-        node_db = entry["node_database"]
-        workspace_path = Path(entry["workspace_path"])
+    run_id = result.evidence.run["run_id"]
+    db_admin = _admin_connection()
 
-        # Real owned resources genuinely retained.
-        assert _database_exists(db_admin, central_db)
-        assert _database_exists(db_admin, node_db)
-        assert workspace_path.exists()
+    # Execution resources: ALWAYS fully destroyed, --keep-on-failure or not.
+    assert not _any_gate_database_exists_for_run(db_admin, run_id)
+    # The run's own outer temp root (containing every scenario's
+    # workspace) was removed unconditionally by run_release_gate() itself.
+    assert not any(tmp_path.glob(f"phase1-release-{run_id}-*"))
 
-        # Private key STILL deleted unconditionally, even though the
-        # rest of the workspace was retained.
-        assert list(workspace_path.rglob("release-gate-signing.pem")) == []
+    # Retention is recorded truthfully: the flag was requested, but
+    # execution resources were never retained -- only the sanitized
+    # evidence bundle persists.
+    retention = result.evidence.retention
+    assert retention["keep_on_failure_requested"] is True
+    assert retention["execution_resources_retained"] is False
+    assert retention["sanitized_debug_bundle_retained"] is True
 
-        # Zero plaintext secrets anywhere in the written evidence.
-        json_text = result.json_path.read_text()
-        markdown_text = result.markdown_path.read_text()
-        assert "BEGIN" not in json_text and "PRIVATE KEY" not in json_text
-        assert "BEGIN" not in markdown_text and "PRIVATE KEY" not in markdown_text
-    finally:
-        # Explicit test cleanup of the deliberately-retained resources.
-        if entry is not None:
-            db_admin = _admin_connection()
-            run_id = entry["central_database"].removeprefix("linuxlab_gate_central_")
-            gate_names = GateDatabaseNames.for_run(run_id)
-            remove_workspace(Path(entry["workspace_path"]))
-            drop_database(db_admin, gate_names, "node")
-            drop_database(db_admin, gate_names, "central")
+    assert result.json_path.exists()
+    assert result.markdown_path.exists()
+
+    # Zero plaintext secrets anywhere in the written evidence.
+    json_text = result.json_path.read_text()
+    markdown_text = result.markdown_path.read_text()
+    assert "BEGIN" not in json_text and "PRIVATE KEY" not in json_text
+    assert "BEGIN" not in markdown_text and "PRIVATE KEY" not in markdown_text

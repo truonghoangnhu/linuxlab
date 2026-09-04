@@ -1,4 +1,4 @@
-"""Task 15 Task 11 (+ corrective): release-gate orchestration -- exit-
+"""Task 15 Task 11 (+ corrective v2): release-gate orchestration -- exit-
 code mapping, failure precedence, evidence assembly/sanitization,
 tested with fast fakes (a fake `dual_deployment_factory`, fake
 scenario functions, and a fake `run_validation`) so this logic is
@@ -9,6 +9,16 @@ together correctly lives in the CLI-level tests
 (scripts/tests/test_phase1_release_gate_cli.py) and the manual
 end-to-end verification runs, which run the actual
 `scripts/phase1_release_gate.py` process / real `run_release_gate()`.
+
+Corrective v2 supersedes the prior --keep-on-failure execution-resource
+retention model entirely (Section 3: execution resources are NEVER
+retained) -- `retained_resources` no longer exists in evidence; see
+`evidence.retention` instead. It also adds typed proofs/assertions
+(Section 7/8, proven directly in test_release_gate_evidence_typed_
+proofs.py / test_release_gate_evidence_typed_assertions.py and here at
+the orchestration-boundary level only), an explicit finalization stage
+(Section 5), and authority metadata (Section 10, proven here and in
+test_release_gate_authority.py).
 """
 
 import inspect
@@ -146,23 +156,39 @@ def test_preflight_refusal_is_exit_2(tmp_path):
     result = _run(repo_root=tmp_path, environment_builder=_failing_builder)
     assert result.overall == "PRECHECK_FAILURE"
     assert result.exit_code == 2
-    assert result.evidence_dir is None, "precheck failure must not attempt to create an evidence directory"
+    assert result.evidence_dir is None, "precheck failure before environment resolution must not attempt evidence"
 
 
-def test_failed_validation_check_is_a_precheck_failure():
+def test_failed_validation_check_is_a_precheck_failure(tmp_path):
     """Design spec Section 12 / FAST CI parity: a PASS must never carry
     real validation failures silently -- Central/Node manage.py check
     or migration drift failing blocks the release the same way a dirty
     tree does."""
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp:
-        result = _run(
-            repo_root=Path(tmp),
-            run_validation=_fake_run_validation({**_OK_VALIDATION, "central_migration_drift": "detected"}),
-        )
+    result = _run(
+        repo_root=tmp_path,
+        run_validation=_fake_run_validation({**_OK_VALIDATION, "central_migration_drift": "detected"}),
+    )
     assert result.overall == "PRECHECK_FAILURE"
     assert result.exit_code == 2
+
+
+def test_precheck_failure_after_environment_resolved_still_publishes_evidence(tmp_path):
+    """Corrective v2, Section 17: a preflight failure that happens
+    AFTER the run's own identity/evidence destination is known (e.g. a
+    failed validation check, as opposed to environment_builder() itself
+    raising) must still produce a real, safe evidence pair -- it is not
+    acceptable to silently drop evidence just because the run never
+    reached a scenario."""
+    result = _run(
+        repo_root=tmp_path,
+        run_validation=_fake_run_validation({**_OK_VALIDATION, "central_migration_drift": "detected"}),
+    )
+    assert result.overall == "PRECHECK_FAILURE"
+    assert result.evidence_dir is not None
+    assert result.json_path is not None
+    assert result.json_path.exists()
+    assert result.markdown_path is not None
+    assert result.markdown_path.exists()
 
 
 def test_scenario_body_failure_is_exit_4(tmp_path):
@@ -271,15 +297,20 @@ def test_startup_failure_outranks_scenario_failure_across_the_run(tmp_path):
     assert result.evidence.primary_failure["category"] == "STARTUP_FAILURE"
 
 
-def test_keep_on_failure_flag_is_threaded_through_to_the_deployment_factory(tmp_path):
+def test_keep_on_failure_flag_is_not_threaded_to_the_deployment_factory(tmp_path):
+    """Corrective v2, Section 3: execution resources are never
+    retained, so dual_deployment() no longer needs (or accepts) a
+    keep_on_failure argument at all -- run_release_gate() must not pass
+    one through, regardless of what the caller requested."""
     observed = []
 
     def recording_factory(tmp_dir, **kwargs):
-        observed.append(kwargs.get("keep_on_failure"))
+        observed.append(kwargs)
         return _fake_deployment_cm(tmp_dir, kwargs.get("run_id"), None, None, None)
 
     _run(repo_root=tmp_path, keep_on_failure=True, dual_deployment_factory=recording_factory)
-    assert observed == [True]
+    assert len(observed) == 1
+    assert "keep_on_failure" not in observed[0]
 
 
 def test_child_run_id_is_derived_from_the_outer_run_id(tmp_path):
@@ -332,19 +363,24 @@ def test_evidence_json_has_schema_version_1_and_required_fields(tmp_path):
     assert doc["schema_version"] == 1
     assert doc["run"]["run_id"] == "rschematest01"
     assert doc["run"]["git_sha"] == "cafef00dbeefdead"
-    assert doc["run"]["central_profile"] == "linuxlab.settings.central"
-    assert doc["run"]["node_profile"] == "linuxlab.settings.node"
+    assert "authoritative" in doc["run"]["authority"]
+    assert doc["profiles"]["central"] == "linuxlab.settings.central"
+    assert doc["profiles"]["node"] == "linuxlab.settings.node"
     assert doc.get("run", {}).get("started_at")
     assert doc.get("run", {}).get("finished_at")
+    assert "environment" in doc
     assert doc["overall"] == "PASS"
     assert doc["exit_code"] == 0
     assert "fake_ok" in doc["scenarios"]
     assert doc["validation"] == _OK_VALIDATION
+    assert doc["retention"]["execution_resources_retained"] is False
+    assert doc["retention"]["sanitized_debug_bundle_retained"] is True
 
 
-def test_evidence_proofs_extracted_from_scenario_details(tmp_path):
-    """Allowlisted extraction only (Task 11 corrective Section 7):
-    specific named fields, not an arbitrary passthrough dict."""
+def test_evidence_proofs_extracted_and_typed_from_scenario_details(tmp_path):
+    """Corrective v2, Section 7: allowlisted AND typed extraction --
+    specific named fields, each validated against its own typed schema,
+    never an arbitrary passthrough dict."""
     result = _run(
         repo_root=tmp_path,
         scenario_specs=(
@@ -355,7 +391,12 @@ def test_evidence_proofs_extracted_from_scenario_details(tmp_path):
                         "package_sha256": "a" * 64,
                         "public_key_fingerprint": "b" * 64,
                         "signature_verified": True,
-                        "outbox_to_inbox": "delivered",
+                        "outbox_to_inbox": {
+                            "event_uuid": "12345678-1234-5678-1234-567812345678",
+                            "inbox_count": 1,
+                            "node_state": "DELIVERED",
+                            "duplicate_idempotent": True,
+                        },
                         "not_a_proof_field": "must not appear in proofs",
                     }
                 ),
@@ -363,11 +404,12 @@ def test_evidence_proofs_extracted_from_scenario_details(tmp_path):
             ("n1", _always_pass({"payload_sha256": "c" * 64})),
         ),
     )
+    assert result.overall == "PASS"
     proofs = result.evidence.proofs
     assert proofs["package_sha256"] == "a" * 64
     assert proofs["public_key_fingerprint"] == "b" * 64
-    assert proofs["signature_verified"] is True
-    assert proofs["outbox_to_inbox"] == "delivered"
+    assert proofs["signature"] == {"verified": True}
+    assert proofs["outbox_to_inbox"]["node_state"] == "DELIVERED"
     assert proofs["payload_sha256"] == "c" * 64
     assert "not_a_proof_field" not in proofs
 
@@ -550,84 +592,141 @@ def test_preflight_exception_never_serializes_raw_text(tmp_path):
     assert SENTINEL_ANSWER_KEY not in result.evidence.primary_failure["safe_message"]
 
 
-# --- keep-on-failure retained resources ------------------------------------
+# --- retention: execution resources never retained (corrective v2) --------
 
 
-def test_keep_on_failure_records_retained_resources_in_evidence(tmp_path):
-    fake_workspace = tmp_path / "gate-workspace-rko00000001_n2"
-    fake_workspace.mkdir()
-    fake_deployment = _FakeDeployment(
-        tmp_dir=fake_workspace, gate_names=_FakeGateNames("rko00000001_n2")
-    )
-
+def test_retention_records_the_flag_but_never_claims_execution_resources_retained(tmp_path):
     result = _run(
         repo_root=tmp_path,
         keep_on_failure=True,
-        environment_builder=_fake_environment_builder(run_id="rko00000001"),
-        dual_deployment_factory=_make_factory(deployment=fake_deployment),
-        scenario_specs=(("n2", _always_fail("simulated failure with retained state")),),
+        scenario_specs=(("n2", _always_fail("simulated failure")),),
     )
     assert result.overall == "SCENARIO_FAILURE"
-    retained = result.evidence.retained_resources
-    assert "n2" in retained
-    assert retained["n2"]["central_database"] == "linuxlab_gate_central_rko00000001_n2"
-    assert retained["n2"]["node_database"] == "linuxlab_gate_node_rko00000001_n2"
-    assert retained["n2"]["workspace_path"] == str(fake_workspace)
-    assert result.evidence.cleanup_status == "retained_for_debug"
+    retention = result.evidence.retention
+    assert retention["keep_on_failure_requested"] is True
+    assert retention["execution_resources_retained"] is False
+    assert retention["sanitized_debug_bundle_retained"] is True
 
 
-def test_no_retained_resources_when_keep_on_failure_is_false(tmp_path):
+def test_retention_reflects_false_when_not_requested(tmp_path):
     result = _run(
         repo_root=tmp_path,
         keep_on_failure=False,
         scenario_specs=(("n2", _always_fail("simulated failure")),),
     )
-    assert result.evidence.retained_resources == {}
-    assert result.evidence.cleanup_status == "clean"
+    retention = result.evidence.retention
+    assert retention["keep_on_failure_requested"] is False
+    assert retention["execution_resources_retained"] is False
 
 
-def test_successful_run_retains_nothing_even_with_keep_on_failure_true(tmp_path):
+def test_successful_run_never_claims_execution_resources_retained_even_with_flag_true(tmp_path):
     result = _run(repo_root=tmp_path, keep_on_failure=True, scenario_specs=(("fake_ok", _always_pass()),))
     assert result.overall == "PASS"
-    assert result.evidence.retained_resources == {}
-    assert result.evidence.cleanup_status == "clean"
+    assert result.evidence.retention["execution_resources_retained"] is False
 
 
-def test_retained_workspace_nested_under_the_run_own_temp_root_survives(tmp_path):
-    """Regression for a real bug caught by the real-infra integration
-    test: run_release_gate() creates its OWN per-run temp root
-    (tmp_root_path) and hands each scenario a subdirectory of it as
-    `scenario_tmp_dir` -- the exact directory the REAL dual_deployment()
-    creates its "gate-workspace-*" inside. If that outer temp root were
-    ever auto-cleaned (e.g. via tempfile.TemporaryDirectory()) as soon
-    as the scenario loop finishes, a workspace dual_deployment() itself
-    decided to retain would be deleted anyway by the OUTER cleanup,
-    regardless of the inner retention decision. This fake creates its
-    workspace AS A CHILD of the `tmp_dir` the factory receives -- like
-    the real dual_deployment() does -- so this is a faithful,
-    fast-running regression proof, not just the slower real-infra one."""
+def test_evidence_never_carries_a_retained_resources_field_any_more(tmp_path):
+    result = _run(repo_root=tmp_path)
+    doc = json.loads(result.json_path.read_text())
+    assert "retained_resources" not in doc
 
-    def factory(tmp_dir, **kwargs):
-        @contextmanager
-        def _cm():
-            workspace = Path(tmp_dir) / "gate-workspace-nested-probe"
-            workspace.mkdir(parents=True)
-            try:
-                yield _FakeDeployment(tmp_dir=workspace, gate_names=_FakeGateNames("nested-probe"))
-            finally:
-                pass  # deliberately does NOT remove `workspace` -- simulates a real keep-on-failure retention
 
-        return _cm()
+# --- explicit stage classification (corrective v2, Section 16) ------------
 
+
+def test_finalization_failure_from_malformed_proof_is_cleanup_failure_exit_5(tmp_path):
+    """Section 18.1/18.2: a scenario returning a malformed proof value
+    (here, an uppercase/wrong-format sha256) must never be silently
+    admitted into evidence -- it becomes a finalization failure, and the
+    run cannot PASS."""
     result = _run(
         repo_root=tmp_path,
-        keep_on_failure=True,
-        dual_deployment_factory=factory,
-        scenario_specs=(("n2", _always_fail("simulated failure with retained state")),),
+        scenario_specs=(("fake_ok", _always_pass({"package_sha256": "NOT-A-VALID-SHA256"})),),
+    )
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "InvalidProofError"
+    json_text = result.json_path.read_text()
+    assert "NOT-A-VALID-SHA256" not in json_text
+
+
+def test_finalization_failure_never_overrides_an_existing_worse_primary_failure(tmp_path):
+    """A malformed proof from one scenario must not silently replace a
+    genuine scenario failure's own exit code -- the scenario failure
+    stays primary; the finalization failure is still recorded."""
+    result = _run(
+        repo_root=tmp_path,
+        scenario_specs=(
+            ("fake_fail", _always_fail("simulated body failure")),
+            ("fake_bad_proof", _always_pass({"package_sha256": "NOT-A-VALID-SHA256"})),
+        ),
     )
     assert result.overall == "SCENARIO_FAILURE"
-    workspace_path = Path(result.evidence.retained_resources["n2"]["workspace_path"])
-    assert workspace_path.exists(), "the retained workspace must survive the run's own outer temp-root cleanup"
+    assert result.exit_code == 4
+    assert result.evidence.primary_failure["category"] == "SCENARIO_FAILURE"
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "InvalidProofError"
+
+
+def test_malformed_assertion_value_fails_the_owning_scenario(tmp_path):
+    """Section 8: an owning scenario that returns a malformed typed
+    assertion value (here, a non-bool for a bool-typed assertion key)
+    must itself be treated as a scenario failure -- never silently
+    coerced or dropped."""
+    result = _run(
+        repo_root=tmp_path,
+        scenario_specs=(("n1", _always_pass({"existing_active_preserved": "not-a-bool"})),),
+    )
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
+    assert result.evidence.primary_failure["code"] == "InvalidProofError"
+
+
+def test_scenario_result_carries_typed_assertions(tmp_path):
+    result = _run(
+        repo_root=tmp_path,
+        scenario_specs=(
+            (
+                "n1",
+                _always_pass(
+                    {
+                        "existing_active_preserved": True,
+                        "active_package_identity_unchanged": True,
+                        "replacement_rejected": True,
+                        "event_id": "not-an-assertion-field",
+                    }
+                ),
+            ),
+        ),
+    )
+    assert result.overall == "PASS"
+    assertions = result.evidence.scenarios["n1"]["assertions"]
+    assert assertions == {
+        "existing_active_preserved": True,
+        "active_package_identity_unchanged": True,
+        "replacement_rejected": True,
+    }
+
+
+# --- authority metadata (corrective v2, Section 10) ------------------------
+
+
+def test_authority_is_authoritative_when_platform_is_linux(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate_runner.platform, "system", lambda: "Linux")
+    result = _run(repo_root=tmp_path)
+    assert result.evidence.run["authority"]["authoritative"] is True
+    assert result.evidence.run["authority"]["platform"] == "linux"
+    assert result.evidence.run["authority"]["reason"] is None
+
+
+def test_authority_is_non_authoritative_on_darwin_even_when_functionally_passing(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate_runner.platform, "system", lambda: "Darwin")
+    result = _run(repo_root=tmp_path)
+    assert result.overall == "PASS"
+    assert result.evidence.run["authority"]["authoritative"] is False
+    assert result.evidence.run["authority"]["platform"] == "darwin"
+    assert result.evidence.run["authority"]["reason"] == "development_only_platform"
 
 
 # --- no auto-tag / auto-commit / auto-push --------------------------------

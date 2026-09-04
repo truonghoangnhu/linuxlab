@@ -37,5 +37,15 @@ def test_real_dual_deployment_happy_path(tmp_path):
     # placeholders (a successful import_and_activate() IS the real
     # signature-verification proof; the delivered/inbox-found sequence
     # already asserted above IS the real Outbox->Inbox proof).
+    #
+    # Task 15 Task 11 corrective v2, Section 7.3: outbox_to_inbox is a
+    # TYPED structure (event_uuid, inbox_count, node_state,
+    # duplicate_idempotent), never a bare "delivered" string -- built
+    # from the exact same already-asserted facts above (event_id,
+    # count-inbox-messages == 1, the resend-is-duplicate check).
     assert detail["signature_verified"] is True
-    assert detail["outbox_to_inbox"] == "delivered"
+    outbox_to_inbox = detail["outbox_to_inbox"]
+    assert outbox_to_inbox["event_uuid"] == detail["event_id"]
+    assert outbox_to_inbox["inbox_count"] == 1
+    assert outbox_to_inbox["node_state"] == "DELIVERED"
+    assert outbox_to_inbox["duplicate_idempotent"] is True

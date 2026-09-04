@@ -18,7 +18,6 @@ in-process multi-database Django configuration.
 import json
 import os
 import subprocess
-import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,10 +36,7 @@ from scripts.release_gate.processes import (
     stop_process,
     wait_ready,
 )
-from scripts.release_gate.signing_material import (
-    create_ephemeral_signing_keypair,
-    delete_private_key,
-)
+from scripts.release_gate.signing_material import create_ephemeral_signing_keypair
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "scripts" / "release_gate" / "cli.py"
@@ -136,7 +132,7 @@ class DualDeployment:
 
 
 @contextmanager
-def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_failure=False, run_id=None):
+def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
@@ -149,14 +145,25 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_fai
     the caller-supplied `tmp_path` itself (which this function never
     deletes; it is the pytest fixture's own, not ours to remove).
 
-    Tears everything down in `finally`, regardless of what the caller's
-    `with` block does or how far setup got: stop processes -> remove
-    the whole workspace recursively -> drop the Node database -> drop
-    the Central database. Every one of those steps is attempted even if
-    an earlier one fails (Node database cleanup failing must never skip
-    Central database cleanup) -- run_cleanup_actions() collects every
-    failure and raises one aggregated error only after all have been
-    attempted.
+    Tears everything down in `finally`, UNCONDITIONALLY -- regardless of
+    what the caller's `with` block does, how far setup got, or whether
+    it succeeded or failed: stop processes -> remove the whole workspace
+    recursively -> drop the Node database -> drop the Central database.
+    Every one of those steps is attempted even if an earlier one fails
+    (Node database cleanup failing must never skip Central database
+    cleanup) -- run_cleanup_actions() collects every failure and raises
+    one aggregated error only after all have been attempted.
+
+    Task 15 Task 11 corrective v2, Section 3 ("execution resources are
+    never retained"): there is deliberately no retention branch and no
+    `keep_on_failure` parameter here any more. Ephemeral Central/Node
+    databases, the workspace directory (`.llpkg`, logs, dumps, keys),
+    and the private signing key are ALL destroyed on every exit path,
+    success or failure alike. The only place a failed run's diagnostic
+    content may persist is the sanitized evidence pair gate_runner
+    itself writes -- never raw execution state such as a real database
+    or a workspace that could contain answer-bearing package content or
+    server-side grading state.
 
     The protected cleanup scope (this function's own try/finally) begins
     BEFORE workspace creation and BEFORE either create_database() call --
@@ -171,28 +178,14 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_fai
     for both database members and the workspace unconditionally is
     always safe.
 
-    `keep_on_failure` (Task 15 Task 11, local-development-only debugging
-    feature): when True AND the caller's `with` block actually raised
-    (checked via `sys.exc_info()` at teardown time, not merely a flag
-    the caller passed), the ephemeral Central/Node databases and the
-    workspace directory are retained instead of dropped/removed, for
-    local inspection. This NEVER applies on a successful run (the flag
-    alone changes nothing unless the body actually failed), and it NEVER
-    extends to the private signing key -- that is still deleted
-    unconditionally in every case, exactly as already closed. Default
-    (`keep_on_failure=False`) preserves the exact prior unconditional-
-    cleanup behavior.
-
     `run_id` (Task 15 Task 11 corrective): a caller that already owns a
     run identity (gate_runner's RunContext) may supply a deterministic
     CHILD run_id here instead of letting this function mint a
-    completely unrelated random one -- so the evidence directory and
-    every one of this scenario's own ephemeral resources are traceably
-    derived from the SAME outer run, which matters most for keep-on-
-    failure (the retained database names are otherwise the only clue a
-    local developer has for finding what a failed run left behind).
-    Defaults to a freshly generated run_id, preserving the exact prior
-    behavior when omitted."""
+    completely unrelated random one -- so every one of this scenario's
+    own ephemeral resources is traceably derived from the SAME outer
+    run for the duration it exists, even though none of it survives
+    past this function's own `finally`. Defaults to a freshly generated
+    run_id, preserving the exact prior behavior when omitted."""
     run_id = run_id if run_id is not None else generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
@@ -267,40 +260,22 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_fai
     finally:
         current_node = deployment.node if deployment is not None else node
         current_central = deployment.central if deployment is not None else central
-        # Reflects whether the caller's `with` block is currently
-        # unwinding because of an exception -- never a caller-supplied
-        # flag -- so a SUCCESSFUL run is always fully cleaned up even
-        # when keep_on_failure=True was passed.
-        body_failed = sys.exc_info()[0] is not None
 
         cleanup_actions = []
         if current_node is not None:
             cleanup_actions.append(("stop_node_process", lambda p=current_node: stop_process(p)))
         if current_central is not None:
             cleanup_actions.append(("stop_central_process", lambda p=current_central: stop_process(p)))
-
-        if keep_on_failure and body_failed:
-            # Local-debug-only: the ephemeral databases and the
-            # workspace directory (the .llpkg, logs, etc.) are retained
-            # for inspection. The private signing key is STILL deleted
-            # unconditionally -- keep-on-failure never permits retaining
-            # it, regardless of where inside the workspace it lives.
-            if private_key_path is not None:
-                cleanup_actions.append(
-                    ("delete_private_key_only", lambda p=private_key_path: delete_private_key(p))
-                )
-        else:
-            # Processes are stopped (and therefore their log file
-            # handles closed) BEFORE the workspace those logs live in
-            # is removed.
-            cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
-            # The hard invariant: Node database cleanup failing must
-            # never skip Central database cleanup. Both are always
-            # attempted.
-            cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
-            cleanup_actions.append(
-                ("drop_central_database", lambda: drop_database(db_admin, gate_names, "central"))
-            )
+        # Processes are stopped (and therefore their log file handles
+        # closed) BEFORE the workspace those logs live in is removed.
+        # Every execution resource -- workspace, both ephemeral
+        # databases -- is destroyed unconditionally, success or
+        # failure alike (Task 15 Task 11 corrective v2, Section 3).
+        cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
+        # The hard invariant: Node database cleanup failing must never
+        # skip Central database cleanup. Both are always attempted.
+        cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
+        cleanup_actions.append(("drop_central_database", lambda: drop_database(db_admin, gate_names, "central")))
         run_cleanup_actions(cleanup_actions)
 
 

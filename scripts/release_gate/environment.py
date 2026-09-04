@@ -127,6 +127,29 @@ class DatabaseAdminConnection:
 
 
 @dataclass(frozen=True)
+class Authority:
+    """Task 15 Task 11 corrective v2, Section 10: functional success and
+    release authority are distinct. `authoritative` is true only for a
+    genuinely supported Linux run; a macOS development run may still
+    PASS functionally (via `run_release_gate(check_platform=False)`)
+    but its evidence must always self-identify as non-authoritative, so
+    it can never be mistaken for a real release gate result."""
+
+    authoritative: bool
+    platform: str
+    reason: str | None
+
+
+def compute_authority(*, platform_name: str) -> Authority:
+    is_linux = platform_name == "Linux"
+    return Authority(
+        authoritative=is_linux,
+        platform=platform_name.lower(),
+        reason=None if is_linux else "development_only_platform",
+    )
+
+
+@dataclass(frozen=True)
 class GateEnvironment:
     run_id: str
     git_sha: str

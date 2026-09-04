@@ -1,15 +1,13 @@
-"""Task 15 Task 11: dual_deployment(keep_on_failure=...) -- local-
-debug-only retention of ephemeral resources on a FAILED run.
-
-Approved semantics:
-- default (keep_on_failure=False, or a successful run regardless of
-  the flag): full cleanup, exactly as already closed in Tasks 7-10 --
-  workspace, private key, and both ephemeral databases all gone.
-- keep_on_failure=True AND the scenario body raised: the ephemeral
-  Central/Node databases and the workspace directory (containing the
-  .llpkg, logs, etc.) are retained for inspection, but the private
-  signing key is STILL deleted unconditionally -- keep-on-failure
-  never permits retaining it.
+"""Task 15 Task 11 corrective v2, Section 3 ("Security decision:
+execution resources are never retained"): dual_deployment() always
+performs full cleanup -- ephemeral Central/Node databases, the
+workspace directory, and the private signing key -- regardless of
+whether the scenario body succeeded or failed. There is no
+`keep_on_failure` retention branch any more: the ONLY place a failed
+run's diagnostic content may persist is the sanitized evidence pair
+gate_runner itself writes, never raw execution state. See
+scripts/tests/test_release_gate_execution_resources_never_retained.py
+for the runner-level real-infra proof of this same invariant.
 """
 
 import psycopg
@@ -31,8 +29,8 @@ def _database_exists(db_admin, name):
         return row is not None
 
 
-def test_keep_on_failure_true_on_success_still_cleans_everything(tmp_path):
-    with e2e_support.dual_deployment(tmp_path, start_node=False, keep_on_failure=True) as deployment:
+def test_dual_deployment_cleans_everything_on_success(tmp_path):
+    with e2e_support.dual_deployment(tmp_path, start_node=False) as deployment:
         workspace = deployment.tmp_dir
         gate_names = deployment.gate_names
         db_admin = deployment.db_admin
@@ -45,68 +43,30 @@ def test_keep_on_failure_true_on_success_still_cleans_everything(tmp_path):
     assert not _database_exists(db_admin, gate_names.node)
 
 
-def test_keep_on_failure_true_on_failure_retains_workspace_and_dbs_but_deletes_private_key(tmp_path):
-    captured = {}
-    with (
-        pytest.raises(AssertionError, match="simulated scenario failure"),
-        e2e_support.dual_deployment(tmp_path, start_node=False, keep_on_failure=True) as deployment,
-    ):
-        captured["workspace"] = deployment.tmp_dir
-        captured["gate_names"] = deployment.gate_names
-        captured["db_admin"] = deployment.db_admin
-        captured["private_key_path"] = deployment.private_key_path
-        captured["public_key_path"] = deployment.public_key_path
-        raise AssertionError("simulated scenario failure")
-
-    try:
-        # Retained for local debugging:
-        assert captured["workspace"].exists()
-        assert captured["public_key_path"].exists()
-        assert _database_exists(captured["db_admin"], captured["gate_names"].central)
-        assert _database_exists(captured["db_admin"], captured["gate_names"].node)
-
-        # Never retained, even under keep-on-failure:
-        assert not captured["private_key_path"].exists()
-    finally:
-        # Test-side cleanup so this test doesn't itself leak the
-        # deliberately-retained resources it just proved were kept.
-        from scripts.release_gate.cleanup import remove_workspace
-        from scripts.release_gate.database import drop_database
-
-        remove_workspace(captured["workspace"])
-        drop_database(captured["db_admin"], captured["gate_names"], "node")
-        drop_database(captured["db_admin"], captured["gate_names"], "central")
-
-
-def test_keep_on_failure_false_on_failure_cleans_everything_as_before(tmp_path):
-    """Regression: explicit False on a failed run behaves exactly like
-    the already-closed Tasks 7-10 default -- nothing is retained."""
-    captured = {}
-    with (
-        pytest.raises(AssertionError, match="simulated scenario failure"),
-        e2e_support.dual_deployment(tmp_path, start_node=False, keep_on_failure=False) as deployment,
-    ):
-        captured["workspace"] = deployment.tmp_dir
-        captured["gate_names"] = deployment.gate_names
-        captured["db_admin"] = deployment.db_admin
-        raise AssertionError("simulated scenario failure")
-
-    assert not captured["workspace"].exists()
-    assert not _database_exists(captured["db_admin"], captured["gate_names"].central)
-    assert not _database_exists(captured["db_admin"], captured["gate_names"].node)
-
-
-def test_keep_on_failure_defaults_to_false(tmp_path):
-    """dual_deployment() with no explicit keep_on_failure argument at
-    all must behave exactly like Tasks 7-10's already-closed default --
-    proven independently of the explicit-False test above, in case a
-    future default-value change ever diverges the two."""
+def test_dual_deployment_cleans_everything_on_failure_no_retention_branch_exists(tmp_path):
+    """Task 15 Task 11 corrective v2, Section 3.1: on a FAILED run, the
+    ephemeral databases, workspace, and private key are ALL still
+    destroyed -- there is no flag that changes this."""
     captured = {}
     with (
         pytest.raises(AssertionError, match="simulated scenario failure"),
         e2e_support.dual_deployment(tmp_path, start_node=False) as deployment,
     ):
         captured["workspace"] = deployment.tmp_dir
+        captured["gate_names"] = deployment.gate_names
+        captured["db_admin"] = deployment.db_admin
+        captured["private_key_path"] = deployment.private_key_path
         raise AssertionError("simulated scenario failure")
 
     assert not captured["workspace"].exists()
+    assert not captured["private_key_path"].exists()
+    assert not _database_exists(captured["db_admin"], captured["gate_names"].central)
+    assert not _database_exists(captured["db_admin"], captured["gate_names"].node)
+
+
+def test_dual_deployment_no_longer_accepts_a_keep_on_failure_argument(tmp_path):
+    """Structural proof: retention is not merely defaulted off, the
+    parameter itself does not exist any more -- there is no way for a
+    caller to even request execution-resource retention."""
+    with pytest.raises(TypeError):
+        e2e_support.dual_deployment(tmp_path, start_node=False, keep_on_failure=True)

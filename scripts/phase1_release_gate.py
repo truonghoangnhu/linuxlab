@@ -73,13 +73,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-on-failure",
         action="store_true",
         help=(
-            "Local-development-only debugging aid: on a FAILED scenario, "
-            "keep that scenario's ephemeral Central/Node databases and "
-            "workspace directory (the .llpkg, logs, etc.) instead of "
-            "dropping/removing them, for inspection. Never applies to a "
-            "successful scenario. Never permits retaining the ephemeral "
-            "signing private key or any plaintext credential -- those are "
-            "still deleted unconditionally. Rejected when CI=true."
+            "Local-development-only debugging aid: keep the sanitized "
+            "diagnostic/evidence bundle (the same JSON+Markdown evidence "
+            "pair always written under artifacts/phase1-release/<run_id>/) "
+            "for a failed run. Execution resources -- ephemeral Central/"
+            "Node databases, the workspace directory, the .llpkg, the "
+            "ephemeral signing private key, pg_dump files, raw logs -- "
+            "are ALWAYS destroyed regardless of this flag; it never "
+            "retains raw execution state, only the already-sanitized "
+            "evidence. Rejected when CI=true."
         ),
     )
     return parser
@@ -112,8 +114,13 @@ def main(argv=None) -> int:
         )
     if result.evidence is not None and result.evidence.cleanup_failure:
         print(f"cleanup issue: {result.evidence.cleanup_failure['safe_message']}", file=sys.stderr)
-    if result.evidence is not None and result.evidence.retained_resources:
-        print(f"retained for debugging: {list(result.evidence.retained_resources.keys())}", file=sys.stderr)
+    if result.evidence is not None and result.evidence.finalization_failure:
+        print(f"finalization issue: {result.evidence.finalization_failure['safe_message']}", file=sys.stderr)
+    if result.evidence is not None and not result.evidence.run["authority"]["authoritative"]:
+        print(
+            f"non-authoritative run: {result.evidence.run['authority']['reason']}",
+            file=sys.stderr,
+        )
 
     return result.exit_code
 
