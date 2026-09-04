@@ -278,6 +278,18 @@ def run_happy_path(deployment) -> dict:
             "node_state": "DELIVERED",
             "duplicate_idempotent": True,
         },
+        # Typed scenario assertions (Task 11 corrective v3, Section 13):
+        # each mirrors an assertion already made above -- import_and_
+        # activate() returning state="active" IS package_installed_and_
+        # activated; the found/matching attempt+result+progress checks
+        # above ARE result_matches_installed_artifact; outbox_before's
+        # event_type="activity.completed" IS completion_event_created;
+        # the delivered-Outbox/found-Inbox sequence IS event_delivered_
+        # to_central.
+        "package_installed_and_activated": True,
+        "result_matches_installed_artifact": True,
+        "completion_event_created": True,
+        "event_delivered_to_central": True,
     }
 
 
@@ -413,7 +425,22 @@ def run_n2_revoked_credential(deployment) -> dict:
     )
     assert outbox_after["state"] == "pending"
 
-    return {"event_id": outbox_before["event_id"]}
+    central_inbox_count = run_action(
+        deployment.central_profile_env, "count-inbox-messages", "--event-id", outbox_before["event_id"]
+    )["count"]
+    assert central_inbox_count == 0
+
+    return {
+        "event_id": outbox_before["event_id"],
+        # Typed scenario assertions (Task 11 corrective v3, Section 13):
+        # each mirrors an assertion already made above -- auth_fault=True
+        # with delivered=0 IS request_rejected AND revoked_credential_
+        # not_accepted; the just-verified zero-row central Inbox count
+        # IS central_inbox_mutated=False.
+        "request_rejected": True,
+        "central_inbox_mutated": False,
+        "revoked_credential_not_accepted": True,
+    }
 
 
 # --- N3: ACK lost after durable Central Inbox --------------------------------
@@ -537,7 +564,21 @@ def run_n4_central_unavailable(deployment) -> dict:
     outbox_final = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", outbox["event_id"])
     assert outbox_final["state"] == "delivered"
 
-    return {"event_id": outbox["event_id"]}
+    return {
+        "event_id": outbox["event_id"],
+        # Typed scenario assertions (Task 11 corrective v3, Section 13):
+        # each mirrors an assertion already made above -- the real
+        # learner HTTP flow (grading included) succeeding while Central
+        # was down IS local_runtime_available; the outbox staying
+        # pending through the transient-release flush IS outbox_
+        # remained_durable; the SAME event_id eventually reaching
+        # delivered=1 (never re-created, never abandoned) IS no_event_
+        # loss AND recovery_delivery_success.
+        "local_runtime_available": True,
+        "outbox_remained_durable": True,
+        "no_event_loss": True,
+        "recovery_delivery_success": True,
+    }
 
 
 # --- N5: process restart ------------------------------------------------------
@@ -589,7 +630,20 @@ def run_n5_node_restart(deployment) -> dict:
     )
     assert outbox_final["state"] == "delivered"
 
-    return {"event_id": outbox_before["event_id"]}
+    return {
+        "event_id": outbox_before["event_id"],
+        # Typed scenario assertions (Task 11 corrective v3, Section 13):
+        # each mirrors an assertion already made above -- the restarted
+        # Node's landing page serving the same activity IS active_
+        # package_survived_restart AND runtime_recovered; the pending
+        # Outbox row still being found after restart IS pending_outbox_
+        # survived_restart; the subsequent flush reaching delivered=1
+        # IS delivery_resumed.
+        "active_package_survived_restart": True,
+        "pending_outbox_survived_restart": True,
+        "runtime_recovered": True,
+        "delivery_resumed": True,
+    }
 
 
 # --- Backup/restore smoke (Task 10) -------------------------------------------
@@ -736,6 +790,23 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
         if restored_central is not None:
             stop_process(restored_central)
 
+    # Typed scenario assertions (Task 11 corrective v3, Section 13):
+    # each mirrors an assertion already made above -- the found
+    # publication snapshot/node registration/first-Inbox-row on the
+    # RESTORED Central database IS central_business_state_restored; the
+    # found active package + both restored attempts with correct scores
+    # on the RESTORED Node database IS node_business_state_restored;
+    # the still-pending second Outbox row surviving the restore IS
+    # pending_outbox_restored; the real restored Gunicorn pair
+    # completing a real sync flush to delivered/found-in-Inbox IS
+    # restored_sync_can_resume.
+    return {
+        "central_business_state_restored": True,
+        "node_business_state_restored": True,
+        "pending_outbox_restored": True,
+        "restored_sync_can_resume": True,
+    }
+
 
 def run_backup_restore_smoke(deployment) -> dict:
     authored, package_path = author_and_package(
@@ -775,7 +846,7 @@ def run_backup_restore_smoke(deployment) -> dict:
     create_database(deployment.db_admin, deployment.gate_names, "restore_central")
     create_database(deployment.db_admin, deployment.gate_names, "restore_node")
     try:
-        _restore_and_verify(
+        restore_assertions = _restore_and_verify(
             deployment,
             authored,
             deployment.tmp_dir,
@@ -792,4 +863,5 @@ def run_backup_restore_smoke(deployment) -> dict:
         "second_attempt_public_id": second_attempt_public_id,
         "central_dump_bytes": central_dump_path.stat().st_size,
         "node_dump_bytes": node_dump_path.stat().st_size,
+        **restore_assertions,
     }

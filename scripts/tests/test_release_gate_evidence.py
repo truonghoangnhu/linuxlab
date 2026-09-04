@@ -398,6 +398,33 @@ def test_markdown_evidence_includes_every_canonical_section():
     assert "authoritative" in path.lower()
 
 
+def test_markdown_evidence_renders_nested_scenario_assertions():
+    """Task 15 Task 11 corrective v3, Section 25: Markdown must render
+    the DECISION-BEARING nested typed assertions per scenario, not just
+    its status/duration -- otherwise a human reviewer reading only the
+    Markdown could never see WHY a scenario counted as proof of a
+    release invariant."""
+    evidence = _make_evidence(
+        scenarios={
+            "n1_tampered_replacement": ScenarioResult(
+                name="n1_tampered_replacement",
+                status="PASS",
+                assertions={
+                    "existing_active_preserved": True,
+                    "active_package_identity_unchanged": True,
+                    "replacement_rejected": True,
+                },
+                duration_ms=1.0,
+            ).__dict__,
+        }
+    )
+    path = _write_and_read_markdown(evidence)
+
+    assert "existing_active_preserved" in path
+    assert "active_package_identity_unchanged" in path
+    assert "replacement_rejected" in path
+
+
 def _write_and_read_markdown(evidence, tmp_path=None):
     import tempfile
     from pathlib import Path

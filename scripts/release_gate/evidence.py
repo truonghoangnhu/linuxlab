@@ -24,6 +24,7 @@ SCHEMA_VERSION = 1
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _VALID_DELIVERY_STATES = ("PENDING", "DELIVERED")
+_OUTBOX_TO_INBOX_REQUIRED_KEYS = frozenset({"event_uuid", "inbox_count", "node_state", "duplicate_idempotent"})
 
 
 class InvalidProofError(Exception):
@@ -99,6 +100,35 @@ class OutboxInboxProof:
         }
 
 
+def _validate_outbox_mapping_shape(value) -> dict:
+    """Task 15 Task 11 corrective v3, Section 11.1 / Critical finding
+    #2: the EXACT key set is validated BEFORE the mapping is ever
+    unpacked into OutboxInboxProof(**value). Passing an arbitrary
+    mapping straight into `**value` lets Python's own TypeError (for a
+    missing or unexpected keyword) escape with the offending key NAME
+    embedded verbatim in its message -- an uncontrolled leak channel
+    completely outside the safe-FailureRecord boundary, regardless of
+    how safely everything else is handled. Every shape mismatch
+    (missing key, extra key, sentinel-looking key such as
+    "Authorization") normalizes to InvalidProofError here instead, with
+    a message built ONLY from key COUNTS, never the actual key names or
+    values."""
+    if not isinstance(value, dict):
+        raise InvalidProofError(
+            "outbox_to_inbox must be a typed {event_uuid, inbox_count, node_state, "
+            "duplicate_idempotent} mapping, not a bare string"
+        )
+    keys = set(value.keys())
+    if keys != _OUTBOX_TO_INBOX_REQUIRED_KEYS:
+        missing = len(_OUTBOX_TO_INBOX_REQUIRED_KEYS - keys)
+        extra = len(keys - _OUTBOX_TO_INBOX_REQUIRED_KEYS)
+        raise InvalidProofError(
+            f"outbox_to_inbox mapping does not have exactly the required key set "
+            f"({missing} missing, {extra} unexpected)"
+        )
+    return value
+
+
 def _validate_bool_assertion(value, key: str) -> bool:
     if not isinstance(value, bool):
         raise InvalidProofError(f"assertion {key!r} must be a bool")
@@ -117,21 +147,150 @@ def _validate_delivery_state_assertion(value, key: str) -> str:
     return value
 
 
-# Section 8's closed assertion-key registry, covering the N1/N3 example
-# sets given in the corrective spec. A key absent here is simply not
-# release-evidence content (silently dropped, same as an unrecognized
-# proof field); a key present here with a value that fails its own
-# validator raises InvalidProofError rather than admitting an
-# unconstrained arbitrary value.
+# Section 8's closed assertion-key registry, covering EVERY scenario's
+# mandatory assertion set (corrective v3, Section 13). A key absent
+# here is simply not release-evidence content (silently dropped, same
+# as an unrecognized proof field); a key present here with a value
+# that fails its own TYPE validator raises InvalidProofError rather
+# than admitting an unconstrained arbitrary value -- this is syntax
+# validation only. Whether a syntactically valid value is the
+# semantically SUCCESSFUL one (Section 14) is checked separately by
+# validate_for_pass() via _ASSERTION_EXPECTED_VALUE below.
 _ASSERTION_VALIDATORS = {
+    # happy_path
+    "package_installed_and_activated": _validate_bool_assertion,
+    "result_matches_installed_artifact": _validate_bool_assertion,
+    "completion_event_created": _validate_bool_assertion,
+    "event_delivered_to_central": _validate_bool_assertion,
+    # n1
     "existing_active_preserved": _validate_bool_assertion,
     "active_package_identity_unchanged": _validate_bool_assertion,
     "replacement_rejected": _validate_bool_assertion,
+    # n2
+    "request_rejected": _validate_bool_assertion,
+    "central_inbox_mutated": _validate_bool_assertion,
+    "revoked_credential_not_accepted": _validate_bool_assertion,
+    # n3
     "central_commit_before_ack_loss": _validate_bool_assertion,
     "node_pending_before_retry": _validate_bool_assertion,
     "final_inbox_count": _validate_nonneg_int_assertion,
     "final_node_state": _validate_delivery_state_assertion,
     "duplicate_idempotent": _validate_bool_assertion,
+    # n4
+    "local_runtime_available": _validate_bool_assertion,
+    "outbox_remained_durable": _validate_bool_assertion,
+    "no_event_loss": _validate_bool_assertion,
+    "recovery_delivery_success": _validate_bool_assertion,
+    # n5
+    "active_package_survived_restart": _validate_bool_assertion,
+    "pending_outbox_survived_restart": _validate_bool_assertion,
+    "runtime_recovered": _validate_bool_assertion,
+    "delivery_resumed": _validate_bool_assertion,
+    # backup_restore
+    "central_business_state_restored": _validate_bool_assertion,
+    "node_business_state_restored": _validate_bool_assertion,
+    "pending_outbox_restored": _validate_bool_assertion,
+    "restored_sync_can_resume": _validate_bool_assertion,
+}
+
+# Task 15 Task 11 corrective v3, Section 16 "Scenarios": the exact
+# required scenario set -- a PASS candidate must have exactly these,
+# no more, no fewer. Names match scripts.release_gate.gate_runner.
+# DEFAULT_SCENARIO_SPECS (the spec's own short names -- happy_path, n1,
+# n2... -- are illustrative; the actual scenario identity in this
+# codebase already carries a more descriptive name, and renaming it
+# would be an unrelated, purely cosmetic refactor).
+REQUIRED_SCENARIOS = (
+    "happy_path",
+    "n1_tampered_replacement",
+    "n2_revoked_credential",
+    "n3_ack_lost_real_proxy",
+    "n4_central_unavailable",
+    "n5_node_restart",
+    "backup_restore_smoke",
+)
+
+# Section 13: each required scenario's EXACT mandatory assertion-key
+# set. validate_for_pass() requires a PASS-eligible scenario's
+# `assertions` dict to match one of these sets exactly -- neither
+# missing a required key nor carrying an extra/wrong-scenario one.
+REQUIRED_SCENARIO_ASSERTIONS = {
+    "happy_path": frozenset(
+        {
+            "package_installed_and_activated",
+            "result_matches_installed_artifact",
+            "completion_event_created",
+            "event_delivered_to_central",
+        }
+    ),
+    "n1_tampered_replacement": frozenset(
+        {"existing_active_preserved", "active_package_identity_unchanged", "replacement_rejected"}
+    ),
+    "n2_revoked_credential": frozenset(
+        {"request_rejected", "central_inbox_mutated", "revoked_credential_not_accepted"}
+    ),
+    "n3_ack_lost_real_proxy": frozenset(
+        {
+            "central_commit_before_ack_loss",
+            "node_pending_before_retry",
+            "final_inbox_count",
+            "final_node_state",
+            "duplicate_idempotent",
+        }
+    ),
+    "n4_central_unavailable": frozenset(
+        {"local_runtime_available", "outbox_remained_durable", "no_event_loss", "recovery_delivery_success"}
+    ),
+    "n5_node_restart": frozenset(
+        {
+            "active_package_survived_restart",
+            "pending_outbox_survived_restart",
+            "runtime_recovered",
+            "delivery_resumed",
+        }
+    ),
+    "backup_restore_smoke": frozenset(
+        {
+            "central_business_state_restored",
+            "node_business_state_restored",
+            "pending_outbox_restored",
+            "restored_sync_can_resume",
+        }
+    ),
+}
+
+# Section 14: the semantically SUCCESSFUL value for each mandatory
+# assertion key -- most are "true", but a few (central_inbox_mutated)
+# are successful precisely when FALSE, and final_inbox_count/
+# final_node_state have a specific required value, not a bool at all.
+_ASSERTION_EXPECTED_VALUE = {
+    "package_installed_and_activated": True,
+    "result_matches_installed_artifact": True,
+    "completion_event_created": True,
+    "event_delivered_to_central": True,
+    "existing_active_preserved": True,
+    "active_package_identity_unchanged": True,
+    "replacement_rejected": True,
+    "request_rejected": True,
+    "central_inbox_mutated": False,
+    "revoked_credential_not_accepted": True,
+    "central_commit_before_ack_loss": True,
+    "node_pending_before_retry": True,
+    "final_inbox_count": 1,
+    "final_node_state": "DELIVERED",
+    "duplicate_idempotent": True,
+    "local_runtime_available": True,
+    "outbox_remained_durable": True,
+    "no_event_loss": True,
+    "recovery_delivery_success": True,
+    "active_package_survived_restart": True,
+    "pending_outbox_survived_restart": True,
+    "runtime_recovered": True,
+    "delivery_resumed": True,
+    "central_business_state_restored": True,
+    "node_business_state_restored": True,
+    "pending_outbox_restored": True,
+    "restored_sync_can_resume": True,
 }
 
 
@@ -175,13 +334,8 @@ def build_typed_proofs(*raw_detail_dicts: dict) -> dict:
         if "signature_verified" in detail and "signature" not in proofs:
             proofs["signature"] = SignatureProof(verified=detail["signature_verified"]).to_dict()
         if "outbox_to_inbox" in detail and "outbox_to_inbox" not in proofs:
-            value = detail["outbox_to_inbox"]
-            if not isinstance(value, dict):
-                raise InvalidProofError(
-                    "outbox_to_inbox must be a typed {event_uuid, inbox_count, node_state, "
-                    "duplicate_idempotent} mapping, not a bare string"
-                )
-            proofs["outbox_to_inbox"] = OutboxInboxProof(**value).to_dict()
+            shape_checked = _validate_outbox_mapping_shape(detail["outbox_to_inbox"])
+            proofs["outbox_to_inbox"] = OutboxInboxProof(**shape_checked).to_dict()
     return proofs
 
 EXIT_CODE = {
@@ -360,6 +514,163 @@ class ReleaseEvidence:
         }
 
 
+class InvalidAssertionError(Exception):
+    """Task 15 Task 11 corrective v3, Section 17: a scenario's typed
+    assertions dict does not match its own EXACT required key set
+    (REQUIRED_SCENARIO_ASSERTIONS) -- missing, extra, or belonging to a
+    different scenario entirely. Never reflects the actual keys."""
+
+
+class IncompleteEvidenceError(Exception):
+    """Task 15 Task 11 corrective v3, Section 17: required EvidenceV1
+    metadata (run identity, environment versions, profiles, the exact
+    required scenario set) is missing or unresolved (e.g. still
+    "unknown"). Never reflects the actual candidate content."""
+
+
+class EvidenceInvariantError(Exception):
+    """Task 15 Task 11 corrective v3, Section 17: a syntactically valid
+    EvidenceV1 candidate fails a mandatory SEMANTIC release invariant
+    (e.g. a proof reports verified=False, cleanup_status is not clean).
+    Never reflects the actual candidate content -- see PassDecision.reasons
+    for the closed set of safe, fixed reason codes."""
+
+
+@dataclass(frozen=True)
+class PassDecision:
+    """Task 15 Task 11 corrective v3, Section 3/15: the ONLY kind of
+    value that may certify an EvidenceV1 candidate as PASS-worthy.
+    `reasons` is a tuple of fixed, safe, short reason codes (never raw
+    candidate content) describing every mandatory invariant that was
+    NOT satisfied; empty iff `eligible` is True."""
+
+    eligible: bool
+    reasons: tuple
+
+
+def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> None:
+    if candidate.schema_version != SCHEMA_VERSION:
+        reasons.append("schema_version_mismatch")
+    run = candidate.run or {}
+    if not run.get("run_id") or run.get("run_id") == "unknown":
+        reasons.append("run_id_missing")
+    if not run.get("git_sha") or run.get("git_sha") == "unknown":
+        reasons.append("git_sha_missing")
+    if not run.get("started_at") or not run.get("finished_at"):
+        reasons.append("timestamps_missing")
+
+    authority = run.get("authority")
+    if not isinstance(authority, dict) or "authoritative" not in authority or "platform" not in authority:
+        reasons.append("authority_missing")
+    elif authority.get("authoritative") is True:
+        if authority.get("platform") != "linux" or authority.get("reason") is not None:
+            reasons.append("authority_inconsistent")
+    elif authority.get("authoritative") is False:
+        if authority.get("reason") != "development_only_platform":
+            reasons.append("authority_inconsistent")
+    else:
+        reasons.append("authority_missing")
+
+    environment = candidate.environment or {}
+    for key in ("python_version", "django_version", "postgres_version"):
+        if not environment.get(key) or environment.get(key) == "unknown":
+            reasons.append(f"environment_{key}_unknown")
+
+    profiles = candidate.profiles or {}
+    if not profiles.get("central") or not profiles.get("node"):
+        reasons.append("profiles_missing")
+
+
+def _validate_for_pass_validation_checks(candidate: ReleaseEvidence, reasons: list) -> None:
+    validation = candidate.validation or {}
+    if validation.get("clean_tree") is not True:
+        reasons.append("clean_tree_not_true")
+    if validation.get("central_check") != "ok":
+        reasons.append("central_check_not_ok")
+    if validation.get("node_check") != "ok":
+        reasons.append("node_check_not_ok")
+    if validation.get("central_migration_drift") != "none":
+        reasons.append("central_migration_drift_detected")
+    if validation.get("node_migration_drift") != "none":
+        reasons.append("node_migration_drift_detected")
+
+
+def _validate_for_pass_scenarios(candidate: ReleaseEvidence, reasons: list) -> None:
+    scenarios = candidate.scenarios or {}
+    if set(scenarios.keys()) != set(REQUIRED_SCENARIOS):
+        reasons.append("required_scenario_set_mismatch")
+        return
+    for name in REQUIRED_SCENARIOS:
+        result = scenarios[name]
+        if not isinstance(result, dict) or result.get("status") != "PASS":
+            reasons.append(f"scenario_{name}_not_pass")
+            continue
+        required_keys = REQUIRED_SCENARIO_ASSERTIONS[name]
+        assertions = result.get("assertions")
+        if not isinstance(assertions, dict) or set(assertions.keys()) != required_keys:
+            reasons.append(f"scenario_{name}_assertion_set_mismatch")
+            continue
+        for key in required_keys:
+            if assertions.get(key) != _ASSERTION_EXPECTED_VALUE[key]:
+                reasons.append(f"scenario_{name}_assertion_{key}_not_successful")
+
+
+def _validate_for_pass_proofs(candidate: ReleaseEvidence, reasons: list) -> None:
+    proofs = candidate.proofs or {}
+    for key in ("package_sha256", "payload_sha256", "public_key_fingerprint"):
+        if key not in proofs:
+            reasons.append(f"proof_{key}_missing")
+
+    signature = proofs.get("signature")
+    if not isinstance(signature, dict) or signature.get("verified") is not True:
+        reasons.append("proof_signature_not_verified")
+
+    outbox = proofs.get("outbox_to_inbox")
+    if not isinstance(outbox, dict):
+        reasons.append("proof_outbox_to_inbox_missing")
+    else:
+        if outbox.get("inbox_count") != 1:
+            reasons.append("proof_outbox_inbox_count_not_1")
+        if outbox.get("node_state") != "DELIVERED":
+            reasons.append("proof_outbox_node_state_not_delivered")
+        if outbox.get("duplicate_idempotent") is not True:
+            reasons.append("proof_outbox_not_duplicate_idempotent")
+
+
+def _validate_for_pass_cleanup(candidate: ReleaseEvidence, reasons: list) -> None:
+    retention = candidate.retention or {}
+    if retention.get("execution_resources_retained") is not False:
+        reasons.append("execution_resources_retained")
+    if candidate.cleanup_status != "clean":
+        reasons.append("cleanup_status_not_clean")
+    if candidate.primary_failure is not None:
+        reasons.append("primary_failure_present")
+    if candidate.cleanup_failure is not None:
+        reasons.append("cleanup_failure_present")
+    if candidate.finalization_failure is not None:
+        reasons.append("finalization_failure_present")
+
+
+def validate_for_pass(candidate: ReleaseEvidence) -> PassDecision:
+    """Task 15 Task 11 corrective v3, Section 3/16: the ONE function
+    allowed to certify an EvidenceV1 candidate as PASS-worthy. No other
+    code path may set `overall="PASS"`/`exit_code=0` without this
+    succeeding first (see gate_runner._finish()). Checks every
+    mandatory release invariant from Section 16 -- metadata,
+    validation, the exact required scenario/assertion sets with
+    semantically successful values, the exact required proofs with
+    semantically successful values, and a clean cleanup/retention
+    state -- and returns a PassDecision whose `reasons` are fixed safe
+    codes, never raw candidate content."""
+    reasons: list = []
+    _validate_for_pass_metadata(candidate, reasons)
+    _validate_for_pass_validation_checks(candidate, reasons)
+    _validate_for_pass_scenarios(candidate, reasons)
+    _validate_for_pass_proofs(candidate, reasons)
+    _validate_for_pass_cleanup(candidate, reasons)
+    return PassDecision(eligible=not reasons, reasons=tuple(reasons))
+
+
 def _atomic_write_text(path, text: str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,25 +723,45 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
         _atomic_write_text(markdown_path, markdown_text)
         os.rename(str(staging_dir), str(evidence_dir))
     except BaseException:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        # Task 15 Task 11 corrective v3, Section 21: staging cleanup on
+        # a failed publication is itself a release-owned cleanup step,
+        # not best-effort -- if it ALSO fails, that must still surface
+        # to the caller rather than being silently swallowed. Raised
+        # from inside this `except` block, so Python's own implicit
+        # exception chaining preserves the ORIGINAL publication failure
+        # as `__context__` even when the staging cleanup failure is
+        # what ultimately propagates.
+        try:
+            shutil.rmtree(staging_dir)
+        except FileNotFoundError:
+            pass
         raise
 
     return evidence_dir / "release-evidence.json", evidence_dir / "release-evidence.md"
 
 
+def _scenario_field(result, key: str, default=None):
+    if isinstance(result, dict):
+        return result.get(key, default)
+    return getattr(result, key, default)
+
+
 def _scenario_lines(scenarios: dict) -> list:
+    """Task 15 Task 11 corrective v3, Section 25: renders every
+    scenario's DECISION-BEARING typed assertions, not just its status/
+    duration -- a human reading only the Markdown must be able to see
+    WHY a scenario counted as proof of its release invariant."""
     lines = ["## Scenarios", ""]
     if not scenarios:
         lines.append("_none recorded_")
     for name, result in scenarios.items():
-        status = result.get("status", "?") if isinstance(result, dict) else getattr(
-            result, "status", "?"
-        )
-        duration_ms = result.get("duration_ms") if isinstance(result, dict) else getattr(
-            result, "duration_ms", None
-        )
+        status = _scenario_field(result, "status", "?")
+        duration_ms = _scenario_field(result, "duration_ms")
         suffix = f" ({duration_ms:.0f} ms)" if isinstance(duration_ms, (int, float)) else ""
         lines.append(f"- **{name}**: {status}{suffix}")
+        assertions = _scenario_field(result, "assertions") or {}
+        for key, value in assertions.items():
+            lines.append(f"  - {key}: {value}")
     lines.append("")
     return lines
 

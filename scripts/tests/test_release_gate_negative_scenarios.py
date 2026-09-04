@@ -33,7 +33,13 @@ def test_n2_revoked_credential_never_falsely_delivers_and_leaks_no_secret(tmp_pa
     retryable. Forbidden invariant: the Outbox row becomes DELIVERED, or
     the Node's bearer secret appears in the worker's own stdout/stderr."""
     with dual_deployment(tmp_path) as deployment:
-        scenarios.run_n2_revoked_credential(deployment)
+        detail = scenarios.run_n2_revoked_credential(deployment)
+
+    # Task 15 Task 11 corrective v3, Section 13: n2's mandatory typed
+    # assertion set.
+    assert detail["request_rejected"] is True
+    assert detail["central_inbox_mutated"] is False
+    assert detail["revoked_credential_not_accepted"] is True
 
 
 def test_n3_ack_lost_then_retry_yields_exactly_one_inbox_and_eventual_delivery(tmp_path):
@@ -58,7 +64,14 @@ def test_n4_central_unavailable_node_keeps_learning_and_syncs_after_recovery(tmp
     delivers it. Forbidden invariant: any learner-facing failure while
     Central is down, or a lost/dropped event once Central returns."""
     with dual_deployment(tmp_path) as deployment:
-        scenarios.run_n4_central_unavailable(deployment)
+        detail = scenarios.run_n4_central_unavailable(deployment)
+
+    # Task 15 Task 11 corrective v3, Section 13: n4's mandatory typed
+    # assertion set.
+    assert detail["local_runtime_available"] is True
+    assert detail["outbox_remained_durable"] is True
+    assert detail["no_event_loss"] is True
+    assert detail["recovery_delivery_success"] is True
 
 
 def test_n5_node_restart_preserves_active_package_and_pending_outbox(tmp_path):
@@ -68,4 +81,11 @@ def test_n5_node_restart_preserves_active_package_and_pending_outbox(tmp_path):
     Forbidden invariant: the active package or the pending Outbox row is
     lost/reset by the restart."""
     with dual_deployment(tmp_path) as deployment:
-        scenarios.run_n5_node_restart(deployment)
+        detail = scenarios.run_n5_node_restart(deployment)
+
+    # Task 15 Task 11 corrective v3, Section 13: n5's mandatory typed
+    # assertion set.
+    assert detail["active_package_survived_restart"] is True
+    assert detail["pending_outbox_survived_restart"] is True
+    assert detail["runtime_recovered"] is True
+    assert detail["delivery_resumed"] is True

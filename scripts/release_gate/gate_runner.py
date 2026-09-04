@@ -102,6 +102,7 @@ from scripts.release_gate.evidence import (
     build_typed_assertions,
     build_typed_proofs,
     publish_evidence,
+    validate_for_pass,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -374,19 +375,28 @@ def _finish(
     secrets,
     evidence_dir,
     keep_on_failure,
+    pass_validator=validate_for_pass,
     db_admin=None,
 ) -> GateRunResult:
-    """Task 11 corrective v2, Section 13: the FINALIZE stage. Typed
-    proof/assertion construction happens here for proofs (assertions
-    are already built per-scenario in _run_one_scenario -- see that
-    function's docstring for why); then the canonical EvidenceV1 is
-    built and published as an all-or-nothing pair via publish_evidence().
-    A failure in EITHER step becomes `finalization_failure`: if `overall`
-    was still PASS, it is upgraded to CLEANUP_FAILURE/exit 5 (Section
-    5.1 -- FINALIZE has no exit code of its own); if a worse primary
-    failure already exists, that primary's category/exit code is left
-    untouched (Section 5.2) and the finalization failure is only ever
-    additional information, never a replacement."""
+    """Task 11 corrective v2/v3, Section 13/16: the FINALIZE stage.
+    Typed proof/assertion construction happens here for proofs
+    (assertions are already built per-scenario in _run_one_scenario --
+    see that function's docstring for why); the canonical EvidenceV1
+    candidate is built; then, ONLY if nothing has failed it so far
+    (`overall == "PASS"`), `pass_validator` is consulted as the single
+    gate a candidate must clear to be minted PASS (Section 3: "PASS is
+    not a default state") -- if it says the candidate is not eligible,
+    `overall` is downgraded to CLEANUP_FAILURE/exit 5 with a
+    `finalization_failure` built from the validator's own safe reason
+    codes, never from raw candidate content. Only after that gate does
+    publish_evidence() attempt the all-or-nothing publish, so the
+    persisted JSON/Markdown pair always agrees with the decision. A
+    failure in ANY of these steps becomes `finalization_failure`: if
+    `overall` was still PASS, it is upgraded to CLEANUP_FAILURE/exit 5
+    (Section 5.1 -- FINALIZE has no exit code of its own); if a worse
+    primary failure already exists, that primary's category/exit code
+    is left untouched (Section 5.2) and the finalization failure is
+    only ever additional information, never a replacement."""
     finished_at = _utc_now_iso()
 
     finalization_failure = None
@@ -434,6 +444,25 @@ def _finish(
         exit_code=EXIT_CODE[overall],
     )
 
+    # Section 3: PASS is not a default state -- the ONLY way `overall`
+    # may remain "PASS" past this point is if `pass_validator` (the
+    # real evidence.validate_for_pass by default) actually certifies
+    # this exact candidate. Only consulted when nothing else has
+    # already failed the run, so it can only ever GATE a would-be PASS,
+    # never override an already-worse primary/cleanup failure.
+    if evidence.overall == "PASS":
+        decision = pass_validator(evidence)
+        if not decision.eligible:
+            safe_message = secrets.redact_text("; ".join(decision.reasons))
+            evidence.finalization_failure = FailureRecord(
+                category="CLEANUP_FAILURE",
+                stage="finalize_pass_validation",
+                code="EvidenceInvariantError",
+                safe_message=safe_message,
+            ).to_dict()
+            evidence.overall = "CLEANUP_FAILURE"
+            evidence.exit_code = EXIT_CODE["CLEANUP_FAILURE"]
+
     json_path = None
     markdown_path = None
     if evidence_dir is not None:
@@ -467,6 +496,7 @@ def run_release_gate(
     dual_deployment_factory=real_dual_deployment,
     environment_builder=build_gate_environment,
     run_validation=_run_validation_checks,
+    pass_validator=validate_for_pass,
     tmp_root=None,
 ) -> GateRunResult:
     """Runs the full release gate: preflight -> validation checks ->
@@ -517,6 +547,7 @@ def run_release_gate(
             secrets=secrets,
             evidence_dir=None,
             keep_on_failure=keep_on_failure,
+            pass_validator=pass_validator,
         )
 
     secrets.register(env.db_admin.password)
@@ -548,6 +579,7 @@ def run_release_gate(
             secrets=secrets,
             evidence_dir=env.artifact_dir,
             keep_on_failure=keep_on_failure,
+            pass_validator=pass_validator,
         )
 
     scenario_results: list = []
@@ -590,7 +622,19 @@ def run_release_gate(
         # Nothing is ever retained under the run's own outer temp root
         # any more (execution resources are never retained -- Section
         # 3), so it is always safe to remove it unconditionally here.
-        shutil.rmtree(tmp_root_path, ignore_errors=True)
+        # Corrective v3, Section 20: cleanup is a release invariant, not
+        # best-effort -- a failure here is recorded as a genuine
+        # cleanup failure (making cleanup_status != clean and PASS
+        # impossible) rather than silently ignored via
+        # ignore_errors=True.
+        try:
+            shutil.rmtree(tmp_root_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            cleanup_records.append(
+                _sanitize_exception(exc, "outer_temp_root_cleanup", "CLEANUP_FAILURE", secrets)
+            )
 
     # The primary_failure is the recorded FailureRecord whose OWN
     # category matches `overall` -- the worst one observed -- never an
@@ -625,5 +669,6 @@ def run_release_gate(
         secrets=secrets,
         evidence_dir=env.artifact_dir,
         keep_on_failure=keep_on_failure,
+        pass_validator=pass_validator,
         db_admin=env.db_admin,
     )

@@ -49,3 +49,14 @@ def test_real_dual_deployment_happy_path(tmp_path):
     assert outbox_to_inbox["inbox_count"] == 1
     assert outbox_to_inbox["node_state"] == "DELIVERED"
     assert outbox_to_inbox["duplicate_idempotent"] is True
+
+    # Task 15 Task 11 corrective v3, Section 13: happy_path's mandatory
+    # typed assertion set -- each mirrors a fact already asserted
+    # inside run_happy_path() itself (activation succeeded, the
+    # installed attempt/result matched the exact installed artifact,
+    # the activity.completed event was created, and it was delivered
+    # Central-bound).
+    assert detail["package_installed_and_activated"] is True
+    assert detail["result_matches_installed_artifact"] is True
+    assert detail["completion_event_created"] is True
+    assert detail["event_delivered_to_central"] is True

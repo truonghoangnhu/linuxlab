@@ -166,6 +166,93 @@ def test_build_typed_proofs_rejects_malformed_values(field_name, bad_value):
         build_typed_proofs({field_name: bad_value})
 
 
+# --- Task 15 Task 11 corrective v3, Section 11.1 / 28.2: outbox_to_inbox
+# exact-mapping-shape validation. A malformed nested mapping must never
+# reach OutboxInboxProof(**value) directly -- an unexpected/missing
+# keyword there raises a raw TypeError whose message echoes the actual
+# dict's repr (arbitrary attacker/scenario-controlled key names and
+# values), which could leak sensitive content structurally, bypassing
+# the safe-FailureRecord boundary entirely. Every shape mismatch must
+# normalize to InvalidProofError instead, with a message built only
+# from key COUNTS, never the actual keys/values.
+
+
+def test_build_typed_proofs_rejects_outbox_mapping_with_extra_key_safely():
+    sentinel = "sentinel-extra-key-payload-should-never-appear"
+    with pytest.raises(InvalidProofError) as exc_info:
+        build_typed_proofs(
+            {
+                "outbox_to_inbox": {
+                    "event_uuid": "12345678-1234-5678-1234-567812345678",
+                    "inbox_count": 1,
+                    "node_state": "DELIVERED",
+                    "duplicate_idempotent": True,
+                    "unexpected_extra_field": sentinel,
+                }
+            }
+        )
+    assert sentinel not in str(exc_info.value)
+    assert "unexpected_extra_field" not in str(exc_info.value)
+
+
+def test_build_typed_proofs_rejects_outbox_mapping_with_missing_key_safely():
+    with pytest.raises(InvalidProofError):
+        build_typed_proofs(
+            {
+                "outbox_to_inbox": {
+                    "event_uuid": "12345678-1234-5678-1234-567812345678",
+                    "inbox_count": 1,
+                    "node_state": "DELIVERED",
+                    # duplicate_idempotent missing
+                }
+            }
+        )
+
+
+def test_build_typed_proofs_rejects_outbox_mapping_with_sentinel_key_name_safely():
+    sentinel_key = "Authorization"
+    sentinel_value = "Bearer sentinel-token-should-never-leak"
+    with pytest.raises(InvalidProofError) as exc_info:
+        build_typed_proofs(
+            {
+                "outbox_to_inbox": {
+                    "event_uuid": "12345678-1234-5678-1234-567812345678",
+                    "inbox_count": 1,
+                    "node_state": "DELIVERED",
+                    sentinel_key: sentinel_value,
+                }
+            }
+        )
+    assert sentinel_value not in str(exc_info.value)
+    assert sentinel_key not in str(exc_info.value)
+
+
+def test_build_typed_proofs_rejects_outbox_mapping_with_nested_unexpected_structure_safely():
+    with pytest.raises(InvalidProofError):
+        build_typed_proofs(
+            {
+                "outbox_to_inbox": {
+                    "event_uuid": {"nested": "not-a-string-uuid"},
+                    "inbox_count": 1,
+                    "node_state": "DELIVERED",
+                    "duplicate_idempotent": True,
+                }
+            }
+        )
+
+
+def test_build_typed_proofs_never_raises_a_raw_type_error_for_malformed_outbox_shape():
+    """The exact Critical-finding regression proof: a malformed mapping
+    must never propagate a bare TypeError up through
+    OutboxInboxProof(**value) -- only the normalized InvalidProofError."""
+    try:
+        build_typed_proofs({"outbox_to_inbox": {"only_one_key": "value"}})
+    except InvalidProofError:
+        pass
+    else:
+        raise AssertionError("expected InvalidProofError")
+
+
 def test_build_typed_proofs_merges_across_multiple_scenario_detail_dicts_first_wins():
     proofs = build_typed_proofs(
         {"package_sha256": VALID_SHA256},

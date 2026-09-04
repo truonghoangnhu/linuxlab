@@ -16,4 +16,11 @@ from scripts.release_gate.e2e_support import dual_deployment
 
 def test_central_and_node_backup_restore_smoke(tmp_path):
     with dual_deployment(tmp_path) as deployment:
-        scenarios.run_backup_restore_smoke(deployment)
+        detail = scenarios.run_backup_restore_smoke(deployment)
+
+    # Task 15 Task 11 corrective v3, Section 13: backup_restore's
+    # mandatory typed assertion set.
+    assert detail["central_business_state_restored"] is True
+    assert detail["node_business_state_restored"] is True
+    assert detail["pending_outbox_restored"] is True
+    assert detail["restored_sync_can_resume"] is True

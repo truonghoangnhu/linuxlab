@@ -30,6 +30,7 @@ from pathlib import Path
 from scripts.release_gate import gate_runner
 from scripts.release_gate.cleanup import CleanupAggregateError
 from scripts.release_gate.environment import GateEnvironment, PreflightError
+from scripts.release_gate.evidence import PassDecision
 from scripts.release_gate.processes import StartupError
 
 SENTINEL_NODE_SECRET = "sentinel-node-secret-9f3d2c1a"
@@ -123,6 +124,32 @@ def _always_fail(message="simulated scenario failure"):
     return scenario
 
 
+def _fake_pass_validator(candidate) -> PassDecision:
+    """Task 15 Task 11 corrective v3: the REAL validate_for_pass()
+    requires the exact seven real scenario names with their exact
+    typed assertion sets -- meaningless for THIS file's fast fakes,
+    which use synthetic scenario names/details to isolate ORCHESTRATION
+    correctness (exit codes, precedence, sanitization) from real
+    scenario content. This lightweight stand-in checks only the
+    structural invariants orchestration tests actually care about
+    (no recorded failure, clean cleanup, no retained execution
+    resources) -- exhaustive real-invariant coverage lives in
+    test_release_gate_evidence_pass_validator.py and the real-infra
+    CLI verification, not here."""
+    reasons = []
+    if candidate.primary_failure is not None:
+        reasons.append("primary_failure_present")
+    if candidate.cleanup_failure is not None:
+        reasons.append("cleanup_failure_present")
+    if candidate.finalization_failure is not None:
+        reasons.append("finalization_failure_present")
+    if candidate.cleanup_status != "clean":
+        reasons.append("cleanup_status_not_clean")
+    if candidate.retention.get("execution_resources_retained") is not False:
+        reasons.append("execution_resources_retained")
+    return PassDecision(eligible=not reasons, reasons=tuple(reasons))
+
+
 def _run(**overrides):
     kwargs = {
         "repo_root": overrides.pop("repo_root"),
@@ -131,6 +158,7 @@ def _run(**overrides):
         "dual_deployment_factory": _make_factory(),
         "scenario_specs": (("fake_ok", _always_pass()),),
         "run_validation": _fake_run_validation(),
+        "pass_validator": _fake_pass_validator,
         "tmp_root": None,
     }
     kwargs.update(overrides)
@@ -727,6 +755,139 @@ def test_authority_is_non_authoritative_on_darwin_even_when_functionally_passing
     assert result.evidence.run["authority"]["authoritative"] is False
     assert result.evidence.run["authority"]["platform"] == "darwin"
     assert result.evidence.run["authority"]["reason"] == "development_only_platform"
+
+
+# --- fail-closed cleanup (corrective v3, Section 20/21/28.5) --------------
+
+
+def test_outer_temp_root_cleanup_failure_prevents_pass_and_clean_status(tmp_path, monkeypatch):
+    """Section 20: cleanup is a release invariant, not best-effort --
+    a failure removing the run's own outer temp root must be recorded,
+    must make cleanup_status != clean, and must make PASS impossible,
+    never silently ignored via ignore_errors=True."""
+    import scripts.release_gate.gate_runner as gate_runner_module
+
+    original_rmtree = gate_runner_module.shutil.rmtree
+    calls = {"n": 0}
+
+    def _flaky_rmtree(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated outer temp root cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(gate_runner_module.shutil, "rmtree", _flaky_rmtree)
+
+    result = _run(repo_root=tmp_path)
+
+    assert result.overall != "PASS"
+    assert result.exit_code == 5
+    assert result.evidence.cleanup_status != "clean"
+    assert result.evidence.cleanup_failure is not None
+
+
+def test_outer_temp_root_cleanup_failure_does_not_override_a_worse_primary_failure(tmp_path, monkeypatch):
+    import scripts.release_gate.gate_runner as gate_runner_module
+
+    original_rmtree = gate_runner_module.shutil.rmtree
+    calls = {"n": 0}
+
+    def _flaky_rmtree(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated outer temp root cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(gate_runner_module.shutil, "rmtree", _flaky_rmtree)
+
+    result = _run(repo_root=tmp_path, scenario_specs=(("fake_fail", _always_fail()),))
+
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
+    assert result.evidence.cleanup_status != "clean"
+    assert result.evidence.cleanup_failure is not None
+
+
+def test_publish_evidence_staging_cleanup_failure_is_never_silently_ignored(tmp_path):
+    """Section 21: if publication fails before the atomic publish AND
+    the subsequent staging-directory cleanup also fails, that must
+    still surface as a non-zero, non-clean result -- never silently
+    swallowed via ignore_errors=True."""
+    import scripts.release_gate.evidence as evidence_module
+
+    source = inspect.getsource(evidence_module.publish_evidence)
+    assert "ignore_errors=True" not in source
+
+
+# --- validate_for_pass() integration (corrective v3, Section 3) -----------
+
+
+def test_pass_validator_ineligible_downgrades_would_be_pass_to_cleanup_failure(tmp_path):
+    """Section 3: PASS is not a default state -- a run where every
+    scenario/cleanup step succeeded structurally must still be refused
+    if the injected pass_validator says the candidate is not eligible."""
+
+    def _always_ineligible(candidate):
+        return PassDecision(eligible=False, reasons=("simulated_ineligible_reason",))
+
+    result = _run(repo_root=tmp_path, pass_validator=_always_ineligible)
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "EvidenceInvariantError"
+    assert "simulated_ineligible_reason" in result.evidence.finalization_failure["safe_message"]
+
+
+def test_pass_validator_eligible_allows_pass(tmp_path):
+    def _always_eligible(candidate):
+        return PassDecision(eligible=True, reasons=())
+
+    result = _run(repo_root=tmp_path, pass_validator=_always_eligible)
+    assert result.overall == "PASS"
+    assert result.exit_code == 0
+
+
+def test_pass_validator_is_never_consulted_when_a_scenario_already_failed(tmp_path):
+    """The pass_validator only GATES a would-be PASS -- it is not
+    consulted at all once a worse primary failure already exists, so it
+    can never override that failure's own category/exit code (Section
+    5: 'no secondary failure may replace an existing primary failure')."""
+    calls = []
+
+    def _recording_validator(candidate):
+        calls.append(candidate.overall)
+        return PassDecision(eligible=False, reasons=("irrelevant",))
+
+    result = _run(
+        repo_root=tmp_path,
+        pass_validator=_recording_validator,
+        scenario_specs=(("fake_fail", _always_fail()),),
+    )
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
+    assert calls == []
+
+
+def test_real_validate_for_pass_rejects_a_fake_scenario_set_end_to_end(tmp_path):
+    """Real orchestration + the REAL evidence.validate_for_pass():
+    proves the default wiring actually enforces the exact required
+    scenario set, using the fake infra to avoid real Postgres/Gunicorn."""
+    from scripts.release_gate.evidence import validate_for_pass
+
+    result = _run(repo_root=tmp_path, pass_validator=validate_for_pass)
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert "required_scenario_set_mismatch" in result.evidence.finalization_failure["safe_message"]
+
+
+def test_default_pass_validator_is_the_real_validate_for_pass():
+    import inspect
+
+    default = inspect.signature(gate_runner.run_release_gate).parameters["pass_validator"].default
+    from scripts.release_gate.evidence import validate_for_pass
+
+    assert default is validate_for_pass
 
 
 # --- no auto-tag / auto-commit / auto-push --------------------------------
