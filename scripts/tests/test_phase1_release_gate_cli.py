@@ -24,6 +24,25 @@ CLI_PATH = REPO_ROOT / "scripts" / "phase1_release_gate.py"
 PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 
+def test_cli_never_exposes_a_platform_check_bypass():
+    """Task 11 corrective Section 13: the shipped CLI stays Linux-
+    authoritative -- `check_platform=False` is a test/dev API
+    parameter on run_release_gate() only, never reachable through
+    argv. Structural proof: the CLI's own source never mentions it and
+    its argument parser has no such option."""
+    source = CLI_PATH.read_text()
+    assert "check_platform" not in source
+
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from scripts.phase1_release_gate import _build_parser
+
+    parser = _build_parser()
+    option_strings = {opt for action in parser._actions for opt in action.option_strings}
+    assert not any("platform" in opt for opt in option_strings)
+
+
 def test_cli_help_exits_0():
     result = subprocess.run(
         [str(PYTHON), str(CLI_PATH), "--help"],

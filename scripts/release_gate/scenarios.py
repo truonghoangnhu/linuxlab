@@ -262,6 +262,15 @@ def run_happy_path(deployment) -> dict:
         "max_score": submit_body["max_score"],
         "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
         "public_key_fingerprint": _public_key_fingerprint(deployment),
+        # A successful import_and_activate() call above already IS the
+        # real Ed25519 signature verification (Task 11/12's
+        # verify_package() runs inside it) -- recorded here as an
+        # explicit proof fact rather than left implicit.
+        "signature_verified": True,
+        # The delivered-Outbox / found-Inbox / exactly-one-Inbox-row
+        # sequence already asserted above IS the real Outbox->Inbox
+        # delivery proof for this run.
+        "outbox_to_inbox": "delivered",
     }
 
 

@@ -136,7 +136,7 @@ class DualDeployment:
 
 
 @contextmanager
-def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_failure=False):
+def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_failure=False, run_id=None):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
@@ -181,8 +181,19 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, keep_on_fai
     extends to the private signing key -- that is still deleted
     unconditionally in every case, exactly as already closed. Default
     (`keep_on_failure=False`) preserves the exact prior unconditional-
-    cleanup behavior."""
-    run_id = generate_run_id()
+    cleanup behavior.
+
+    `run_id` (Task 15 Task 11 corrective): a caller that already owns a
+    run identity (gate_runner's RunContext) may supply a deterministic
+    CHILD run_id here instead of letting this function mint a
+    completely unrelated random one -- so the evidence directory and
+    every one of this scenario's own ephemeral resources are traceably
+    derived from the SAME outer run, which matters most for keep-on-
+    failure (the retained database names are otherwise the only clue a
+    local developer has for finding what a failed run left behind).
+    Defaults to a freshly generated run_id, preserving the exact prior
+    behavior when omitted."""
+    run_id = run_id if run_id is not None else generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
     workspace = Path(tmp_path) / f"gate-workspace-{run_id}"

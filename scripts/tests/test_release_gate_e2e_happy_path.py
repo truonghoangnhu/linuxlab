@@ -30,3 +30,12 @@ def test_real_dual_deployment_happy_path(tmp_path):
     assert all(c in "0123456789abcdef" for c in detail["package_sha256"])
     assert len(detail["public_key_fingerprint"]) == 64
     assert all(c in "0123456789abcdef" for c in detail["public_key_fingerprint"])
+
+    # Task 15 Task 11 corrective, Evidence v1 Section 7 "proofs":
+    # signature verification result and the Outbox->Inbox delivery
+    # proof must also be present -- both real facts of THIS run, not
+    # placeholders (a successful import_and_activate() IS the real
+    # signature-verification proof; the delivered/inbox-found sequence
+    # already asserted above IS the real Outbox->Inbox proof).
+    assert detail["signature_verified"] is True
+    assert detail["outbox_to_inbox"] == "delivered"

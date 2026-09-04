@@ -95,14 +95,25 @@ def main(argv=None) -> int:
 
     print(f"phase1_release_gate: {result.overall} (exit {result.exit_code})")
     if result.evidence is not None:
-        print(f"run_id: {result.evidence.run_id}")
-        print(f"git_sha: {result.evidence.git_sha}")
+        print(f"run_id: {result.evidence.run.get('run_id')}")
+        print(f"git_sha: {result.evidence.run.get('git_sha')}")
     if result.json_path is not None:
         print(f"evidence (json): {result.json_path}")
     if result.markdown_path is not None:
         print(f"evidence (markdown): {result.markdown_path}")
+    # Console output never carries raw exception text or a traceback --
+    # only the already-sanitized FailureRecord fields (Task 15 Task 11
+    # corrective Section 9: "no raw traceback from shipped CLI").
+    if result.evidence is not None and result.evidence.primary_failure:
+        failure = result.evidence.primary_failure
+        print(
+            f"primary failure: {failure['category']} at {failure['stage']} ({failure['code']})",
+            file=sys.stderr,
+        )
     if result.evidence is not None and result.evidence.cleanup_failure:
-        print(f"cleanup issue: {result.evidence.cleanup_failure}", file=sys.stderr)
+        print(f"cleanup issue: {result.evidence.cleanup_failure['safe_message']}", file=sys.stderr)
+    if result.evidence is not None and result.evidence.retained_resources:
+        print(f"retained for debugging: {list(result.evidence.retained_resources.keys())}", file=sys.stderr)
 
     return result.exit_code
 

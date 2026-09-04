@@ -1,5 +1,6 @@
 """Task 15 release-gate evidence schema, redaction, and failure model
-(T15-D07). Pure-Python, database-free.
+(T15-D07; Task 11 corrective: canonical EvidenceV1, FailureRecord).
+Pure-Python, database-free.
 """
 
 import json
@@ -10,6 +11,7 @@ import pytest
 from scripts.release_gate.evidence import (
     EXIT_CODE,
     SCHEMA_VERSION,
+    FailureRecord,
     RedactionKeyCollisionError,
     ReleaseEvidence,
     ScenarioResult,
@@ -23,15 +25,30 @@ from scripts.release_gate.evidence import (
 def _make_evidence(**overrides):
     fields = {
         "schema_version": SCHEMA_VERSION,
-        "run_id": "rabc123456789",
-        "git_sha": "a" * 40,
-        "started_at": "2026-08-31T00:00:00+00:00",
-        "finished_at": "2026-08-31T00:05:00+00:00",
-        "environment": {"python": "3.12", "postgresql": "18", "platform": "linux"},
-        "checks": {},
+        "run": {
+            "run_id": "rabc123456789",
+            "git_sha": "a" * 40,
+            "started_at": "2026-08-31T00:00:00+00:00",
+            "finished_at": "2026-08-31T00:05:00+00:00",
+            "platform": "linux",
+            "central_profile": "linuxlab.settings.central",
+            "node_profile": "linuxlab.settings.node",
+        },
+        "validation": {
+            "clean_tree": True,
+            "central_check": "ok",
+            "node_check": "ok",
+            "central_migration_drift": "none",
+            "node_migration_drift": "none",
+        },
         "scenarios": {},
-        "artifacts": {},
+        "proofs": {},
+        "retained_resources": {},
+        "primary_failure": None,
+        "cleanup_failure": None,
+        "cleanup_status": "clean",
         "overall": "PASS",
+        "exit_code": 0,
     }
     fields.update(overrides)
     return ReleaseEvidence(**fields)
@@ -57,13 +74,37 @@ def test_evidence_to_dict_has_required_schema_v1_shape():
     doc = evidence.to_dict()
 
     assert doc["schema_version"] == 1
-    assert doc["run_id"] == "rabc123456789"
-    assert doc["git_sha"] == "a" * 40
-    assert doc["overall"] in {"PASS", "FAIL"}
-    assert "environment" in doc
-    assert "checks" in doc
+    assert doc["run"]["run_id"] == "rabc123456789"
+    assert doc["run"]["git_sha"] == "a" * 40
+    assert doc["run"]["central_profile"] == "linuxlab.settings.central"
+    assert doc["run"]["node_profile"] == "linuxlab.settings.node"
+    assert doc["overall"] in {"PASS", "PRECHECK_FAILURE", "STARTUP_FAILURE", "SCENARIO_FAILURE", "CLEANUP_FAILURE"}
+    assert doc["exit_code"] == 0
+    assert "validation" in doc
     assert "scenarios" in doc
-    assert "artifacts" in doc
+    assert "proofs" in doc
+    assert "retained_resources" in doc
+    assert "primary_failure" in doc
+    assert "cleanup_failure" in doc
+    assert "cleanup_status" in doc
+
+
+def test_evidence_validation_section_carries_real_check_status():
+    evidence = _make_evidence(
+        validation={
+            "clean_tree": True,
+            "central_check": "ok",
+            "node_check": "ok",
+            "central_migration_drift": "none",
+            "node_migration_drift": "none",
+        }
+    )
+    doc = evidence.to_dict()
+    assert doc["validation"]["clean_tree"] is True
+    assert doc["validation"]["central_check"] == "ok"
+    assert doc["validation"]["node_check"] == "ok"
+    assert doc["validation"]["central_migration_drift"] == "none"
+    assert doc["validation"]["node_migration_drift"] == "none"
 
 
 def test_scenario_result_carries_status_assertions_and_duration():
@@ -78,6 +119,46 @@ def test_scenario_result_carries_status_assertions_and_duration():
     assert result.status == "PASS"
     assert result.assertions["rejected"] is True
     assert result.duration_ms == 42.5
+
+
+# --- FailureRecord: the evidence security boundary ------------------------
+
+
+def test_failure_record_carries_category_stage_code_and_safe_message():
+    record = FailureRecord(
+        category="SCENARIO_FAILURE",
+        stage="n2_revoked_credential",
+        code="AssertionError",
+        safe_message="AssertionError raised during n2_revoked_credential",
+    )
+    assert record.category == "SCENARIO_FAILURE"
+    assert record.stage == "n2_revoked_credential"
+    assert record.code == "AssertionError"
+    doc = record.to_dict()
+    assert doc == {
+        "category": "SCENARIO_FAILURE",
+        "stage": "n2_revoked_credential",
+        "code": "AssertionError",
+        "safe_message": "AssertionError raised during n2_revoked_credential",
+    }
+
+
+def test_evidence_primary_and_cleanup_failure_are_failure_record_dicts():
+    primary = FailureRecord(
+        category="STARTUP_FAILURE", stage="n4_central_unavailable", code="StartupError", safe_message="x"
+    )
+    cleanup = FailureRecord(
+        category="CLEANUP_FAILURE", stage="n4_central_unavailable", code="CleanupAggregateError", safe_message="y"
+    )
+    evidence = _make_evidence(
+        overall="STARTUP_FAILURE",
+        exit_code=3,
+        primary_failure=primary.to_dict(),
+        cleanup_failure=cleanup.to_dict(),
+    )
+    doc = evidence.to_dict()
+    assert doc["primary_failure"]["category"] == "STARTUP_FAILURE"
+    assert doc["cleanup_failure"]["category"] == "CLEANUP_FAILURE"
 
 
 # --- secret redaction -------------------------------------------------------
@@ -118,8 +199,8 @@ def test_write_json_evidence_redacts_secret_sentinels(tmp_path):
     secrets.register("NODE_SECRET_DO_NOT_LEAK")
     secrets.register("PRIVATE_KEY_DO_NOT_LEAK")
     evidence = _make_evidence(
-        checks={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"},
-        artifacts={"signing_key_pem": "PRIVATE_KEY_DO_NOT_LEAK"},
+        validation={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"},
+        proofs={"signing_key_pem": "PRIVATE_KEY_DO_NOT_LEAK"},
     )
     path = tmp_path / "release-evidence.json"
 
@@ -198,7 +279,7 @@ def test_secret_registry_does_not_raise_when_redaction_removes_a_would_be_duplic
 def test_write_json_evidence_redacts_a_secret_embedded_in_a_dict_key(tmp_path):
     secrets = SecretRegistry()
     secrets.register("KEY_EMBEDDED_SECRET")
-    evidence = _make_evidence(checks={"node-KEY_EMBEDDED_SECRET-credential": "issued"})
+    evidence = _make_evidence(validation={"node-KEY_EMBEDDED_SECRET-credential": "issued"})
     path = tmp_path / "release-evidence.json"
 
     write_json_evidence(path, evidence, secrets)
@@ -228,7 +309,7 @@ def test_write_json_evidence_aborts_and_leaves_no_artifact_if_a_secret_would_lea
 
     secrets = SecretRegistry()
     secrets.register("UNREDACTABLE_SECRET")
-    evidence = _make_evidence(checks={"leak": "UNREDACTABLE_SECRET"})
+    evidence = _make_evidence(validation={"leak": "UNREDACTABLE_SECRET"})
     path = tmp_path / "release-evidence.json"
 
     # Simulate a redaction bug: value passes through untouched.
@@ -243,7 +324,7 @@ def test_write_json_evidence_aborts_and_leaves_no_artifact_if_a_secret_would_lea
 def test_write_markdown_evidence_redacts_secret_sentinels(tmp_path):
     secrets = SecretRegistry()
     secrets.register("NODE_SECRET_DO_NOT_LEAK")
-    evidence = _make_evidence(checks={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"})
+    evidence = _make_evidence(validation={"node_credential_issued": "NODE_SECRET_DO_NOT_LEAK"})
     path = tmp_path / "release-evidence.md"
 
     write_markdown_evidence(path, evidence, secrets)
@@ -251,6 +332,58 @@ def test_write_markdown_evidence_redacts_secret_sentinels(tmp_path):
     text = path.read_text()
     assert "NODE_SECRET_DO_NOT_LEAK" not in text
     assert "# " in text  # some heading exists -- human-readable projection
+
+
+# --- JSON / Markdown parity (Task 11 corrective, Important finding #3) -----
+
+
+def test_markdown_evidence_includes_every_canonical_section():
+    """Markdown is a projection of the SAME canonical EvidenceV1, not a
+    separate partial schema -- it must surface every top-level section,
+    not just scenarios/checks."""
+    evidence = _make_evidence(
+        run={
+            "run_id": "rmdparity0001",
+            "git_sha": "b" * 40,
+            "started_at": "2026-09-04T00:00:00+00:00",
+            "finished_at": "2026-09-04T00:05:00+00:00",
+            "platform": "linux",
+            "central_profile": "linuxlab.settings.central",
+            "node_profile": "linuxlab.settings.node",
+        },
+        scenarios={
+            "happy_path": ScenarioResult(name="happy_path", status="PASS", duration_ms=1.0).__dict__,
+        },
+        proofs={
+            "package_sha256": "f" * 64,
+            "payload_sha256": "e" * 64,
+            "public_key_fingerprint": "d" * 64,
+            "signature_verified": True,
+            "outbox_to_inbox": "delivered",
+        },
+        retained_resources={"n2_revoked_credential": {"central_database": "linuxlab_gate_central_r1", "node_database": "linuxlab_gate_node_r1", "workspace_path": "/tmp/x"}},
+    )
+    path = _write_and_read_markdown(evidence)
+
+    assert "rmdparity0001" in path
+    assert "b" * 40 in path
+    assert "happy_path" in path
+    assert "f" * 64 in path  # package_sha256
+    assert "d" * 64 in path  # public_key_fingerprint
+    assert "signature_verified" in path.lower() or "true" in path.lower()
+    assert "outbox" in path.lower()
+    assert "linuxlab_gate_central_r1" in path
+    assert "cleanup_status" in path.lower() or "clean" in path.lower()
+
+
+def _write_and_read_markdown(evidence, tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    directory = Path(tmp_path) if tmp_path is not None else Path(tempfile.mkdtemp())
+    path = directory / "release-evidence.md"
+    write_markdown_evidence(path, evidence, SecretRegistry())
+    return path.read_text()
 
 
 # --- atomic writes -----------------------------------------------------
@@ -290,6 +423,6 @@ def test_write_json_evidence_overwrites_existing_file_atomically(tmp_path):
     path = tmp_path / "release-evidence.json"
     path.write_text("stale content")
 
-    write_json_evidence(path, _make_evidence(overall="FAIL"), SecretRegistry())
+    write_json_evidence(path, _make_evidence(overall="SCENARIO_FAILURE", exit_code=4), SecretRegistry())
 
-    assert json.loads(path.read_text())["overall"] == "FAIL"
+    assert json.loads(path.read_text())["overall"] == "SCENARIO_FAILURE"
