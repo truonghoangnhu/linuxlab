@@ -26,11 +26,14 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from scripts.release_gate import gate_runner
 from scripts.release_gate.cleanup import CleanupAggregateError
 from scripts.release_gate.environment import GateEnvironment, PreflightError
-from scripts.release_gate.evidence import PassDecision
+from scripts.release_gate.evidence import REQUIRED_SCENARIO_ASSERTIONS, REQUIRED_SCENARIOS
 from scripts.release_gate.processes import StartupError
 
 SENTINEL_NODE_SECRET = "sentinel-node-secret-9f3d2c1a"
@@ -94,8 +97,17 @@ def _make_factory(raise_on_enter=None, raise_on_exit=None, deployment=None):
     return factory
 
 
-def _fake_environment_builder(*, run_id="rfaketest0001", git_sha="deadbeefcafefeed", artifact_dir=None):
+# A syntactically valid (40 lowercase hex chars) git SHA -- corrective
+# v4, Section 10 requires validate_for_pass() to reject anything else,
+# so a fake test fixture that wants to reach genuine PASS eligibility
+# must use one, exactly like a real `git rev-parse HEAD` would produce.
+_FAKE_VALID_GIT_SHA = "deadbeefcafefeeddeadbeefcafefeeddeadbeef"
+
+
+def _fake_environment_builder(*, run_id="rfaketest0001", git_sha=_FAKE_VALID_GIT_SHA, artifact_dir=None):
     def builder(*, repo_root, keep_on_failure=False):
+        import os
+
         from scripts.release_gate.environment import DatabaseAdminConnection
 
         return GateEnvironment(
@@ -103,7 +115,19 @@ def _fake_environment_builder(*, run_id="rfaketest0001", git_sha="deadbeefcafefe
             git_sha=git_sha,
             repo_root=Path(repo_root),
             artifact_dir=artifact_dir if artifact_dir is not None else Path(repo_root) / "artifacts" / "phase1-release" / run_id,
-            db_admin=DatabaseAdminConnection(host="127.0.0.1", port="5432", user="linuxlab", password="fake-admin-pw"),
+            # Real, working local-dev credentials (not a fake password):
+            # _finish() genuinely connects to resolve environment.
+            # postgres_version, and validate_for_pass() (corrective v4,
+            # Section 10) refuses PASS when that comes back "unknown" --
+            # a fake/wrong password would make every PASS-path test in
+            # this file fail that check for a reason unrelated to what
+            # it's actually testing.
+            db_admin=DatabaseAdminConnection(
+                host=os.environ.get("POSTGRES_HOST", "127.0.0.1"),
+                port=os.environ.get("POSTGRES_PORT", "5432"),
+                user=os.environ.get("POSTGRES_USER", "linuxlab"),
+                password=os.environ.get("POSTGRES_PASSWORD", ""),
+            ),
             keep_on_failure=keep_on_failure,
         )
 
@@ -124,30 +148,61 @@ def _always_fail(message="simulated scenario failure"):
     return scenario
 
 
-def _fake_pass_validator(candidate) -> PassDecision:
-    """Task 15 Task 11 corrective v3: the REAL validate_for_pass()
-    requires the exact seven real scenario names with their exact
-    typed assertion sets -- meaningless for THIS file's fast fakes,
-    which use synthetic scenario names/details to isolate ORCHESTRATION
-    correctness (exit codes, precedence, sanitization) from real
-    scenario content. This lightweight stand-in checks only the
-    structural invariants orchestration tests actually care about
-    (no recorded failure, clean cleanup, no retained execution
-    resources) -- exhaustive real-invariant coverage lives in
-    test_release_gate_evidence_pass_validator.py and the real-infra
-    CLI verification, not here."""
-    reasons = []
-    if candidate.primary_failure is not None:
-        reasons.append("primary_failure_present")
-    if candidate.cleanup_failure is not None:
-        reasons.append("cleanup_failure_present")
-    if candidate.finalization_failure is not None:
-        reasons.append("finalization_failure_present")
-    if candidate.cleanup_status != "clean":
-        reasons.append("cleanup_status_not_clean")
-    if candidate.retention.get("execution_resources_retained") is not False:
-        reasons.append("execution_resources_retained")
-    return PassDecision(eligible=not reasons, reasons=tuple(reasons))
+def _pass_worthy_assertions_for(name):
+    """Every value REQUIRED_SCENARIO_ASSERTIONS[name] expects, set to
+    its own semantically SUCCESSFUL value (per evidence._ASSERTION_
+    EXPECTED_VALUE) -- most are True, but a few (final_inbox_count,
+    final_node_state, central_inbox_mutated) are not bare True."""
+    assertions = {}
+    for key in REQUIRED_SCENARIO_ASSERTIONS[name]:
+        if key == "final_inbox_count":
+            assertions[key] = 1
+        elif key == "final_node_state":
+            assertions[key] = "DELIVERED"
+        elif key == "central_inbox_mutated":
+            assertions[key] = False
+        else:
+            assertions[key] = True
+    return assertions
+
+
+_PASS_WORTHY_PROOFS_DETAIL = {
+    "package_sha256": "a" * 64,
+    "payload_sha256": "b" * 64,
+    "public_key_fingerprint": "c" * 64,
+    "signature_verified": True,
+    "outbox_to_inbox": {
+        "event_uuid": "12345678-1234-5678-1234-567812345678",
+        "inbox_count": 1,
+        "node_state": "DELIVERED",
+        "duplicate_idempotent": True,
+    },
+}
+
+
+def _pass_worthy_scenario(name, *, carries_proofs=False):
+    def scenario(deployment):
+        detail = dict(_pass_worthy_assertions_for(name))
+        if carries_proofs:
+            detail.update(_PASS_WORTHY_PROOFS_DETAIL)
+        return detail
+
+    return scenario
+
+
+# Task 15 Task 11 corrective v4, Section 3.1: production run_release_
+# gate() no longer accepts an injectable pass_validator -- it always
+# calls the REAL evidence.validate_for_pass() directly. The only way
+# this file's fast fakes (no real Postgres/Gunicorn) can still exercise
+# a genuine successful PASS end-to-end is to give the REAL validator a
+# candidate it actually accepts: a full, real-shaped 7-scenario spec
+# set whose fake bodies return exactly the mandatory typed assertions/
+# proofs it requires. Individual FAILURE-path tests below still use a
+# single synthetic scenario (_always_pass()/_always_fail()) since they
+# never reach the point where scenario-set completeness matters.
+PASS_WORTHY_SCENARIO_SPECS = tuple(
+    (name, _pass_worthy_scenario(name, carries_proofs=(name == "happy_path"))) for name in REQUIRED_SCENARIOS
+)
 
 
 def _run(**overrides):
@@ -156,9 +211,8 @@ def _run(**overrides):
         "check_platform": False,
         "environment_builder": _fake_environment_builder(),
         "dual_deployment_factory": _make_factory(),
-        "scenario_specs": (("fake_ok", _always_pass()),),
+        "scenario_specs": PASS_WORTHY_SCENARIO_SPECS,
         "run_validation": _fake_run_validation(),
-        "pass_validator": _fake_pass_validator,
         "tmp_root": None,
     }
     kwargs.update(overrides)
@@ -337,8 +391,8 @@ def test_keep_on_failure_flag_is_not_threaded_to_the_deployment_factory(tmp_path
         return _fake_deployment_cm(tmp_dir, kwargs.get("run_id"), None, None, None)
 
     _run(repo_root=tmp_path, keep_on_failure=True, dual_deployment_factory=recording_factory)
-    assert len(observed) == 1
-    assert "keep_on_failure" not in observed[0]
+    assert len(observed) == len(REQUIRED_SCENARIOS)
+    assert all("keep_on_failure" not in kwargs for kwargs in observed)
 
 
 def test_child_run_id_is_derived_from_the_outer_run_id(tmp_path):
@@ -384,13 +438,12 @@ def test_all_scenarios_in_spec_are_attempted_and_recorded(tmp_path):
 def test_evidence_json_has_schema_version_1_and_required_fields(tmp_path):
     result = _run(
         repo_root=tmp_path,
-        environment_builder=_fake_environment_builder(run_id="rschematest01", git_sha="cafef00dbeefdead"),
-        scenario_specs=(("fake_ok", _always_pass({"event_id": "abc-123"})),),
+        environment_builder=_fake_environment_builder(run_id="rschematest01"),
     )
     doc = json.loads(result.json_path.read_text())
     assert doc["schema_version"] == 1
     assert doc["run"]["run_id"] == "rschematest01"
-    assert doc["run"]["git_sha"] == "cafef00dbeefdead"
+    assert doc["run"]["git_sha"] == _FAKE_VALID_GIT_SHA
     assert "authoritative" in doc["run"]["authority"]
     assert doc["profiles"]["central"] == "linuxlab.settings.central"
     assert doc["profiles"]["node"] == "linuxlab.settings.node"
@@ -399,7 +452,7 @@ def test_evidence_json_has_schema_version_1_and_required_fields(tmp_path):
     assert "environment" in doc
     assert doc["overall"] == "PASS"
     assert doc["exit_code"] == 0
-    assert "fake_ok" in doc["scenarios"]
+    assert "happy_path" in doc["scenarios"]
     assert doc["validation"] == _OK_VALIDATION
     assert doc["retention"]["execution_resources_retained"] is False
     assert doc["retention"]["sanitized_debug_bundle_retained"] is True
@@ -408,7 +461,10 @@ def test_evidence_json_has_schema_version_1_and_required_fields(tmp_path):
 def test_evidence_proofs_extracted_and_typed_from_scenario_details(tmp_path):
     """Corrective v2, Section 7: allowlisted AND typed extraction --
     specific named fields, each validated against its own typed schema,
-    never an arbitrary passthrough dict."""
+    never an arbitrary passthrough dict. Uses only 2 of the 7 required
+    scenarios, so this candidate cannot reach real PASS -- proof
+    extraction itself happens unconditionally in FINALIZE regardless of
+    `overall`, which is exactly what this test isolates."""
     result = _run(
         repo_root=tmp_path,
         scenario_specs=(
@@ -432,7 +488,6 @@ def test_evidence_proofs_extracted_and_typed_from_scenario_details(tmp_path):
             ("n1", _always_pass({"payload_sha256": "c" * 64})),
         ),
     )
-    assert result.overall == "PASS"
     proofs = result.evidence.proofs
     assert proofs["package_sha256"] == "a" * 64
     assert proofs["public_key_fingerprint"] == "b" * 64
@@ -446,7 +501,7 @@ def test_evidence_markdown_is_generated(tmp_path):
     result = _run(repo_root=tmp_path)
     assert result.markdown_path.exists()
     text = result.markdown_path.read_text()
-    assert "fake_ok" in text
+    assert "happy_path" in text
     assert "PASS" in text
     assert "Validation" in text
     assert "Proofs" in text
@@ -648,7 +703,7 @@ def test_retention_reflects_false_when_not_requested(tmp_path):
 
 
 def test_successful_run_never_claims_execution_resources_retained_even_with_flag_true(tmp_path):
-    result = _run(repo_root=tmp_path, keep_on_failure=True, scenario_specs=(("fake_ok", _always_pass()),))
+    result = _run(repo_root=tmp_path, keep_on_failure=True)
     assert result.overall == "PASS"
     assert result.evidence.retention["execution_resources_retained"] is False
 
@@ -712,6 +767,9 @@ def test_malformed_assertion_value_fails_the_owning_scenario(tmp_path):
 
 
 def test_scenario_result_carries_typed_assertions(tmp_path):
+    """A single fake scenario cannot reach real PASS (only 1 of 7
+    required), which is irrelevant here -- ScenarioResult.assertions is
+    populated per-scenario regardless of the run's overall outcome."""
     result = _run(
         repo_root=tmp_path,
         scenario_specs=(
@@ -728,7 +786,6 @@ def test_scenario_result_carries_typed_assertions(tmp_path):
             ),
         ),
     )
-    assert result.overall == "PASS"
     assertions = result.evidence.scenarios["n1"]["assertions"]
     assert assertions == {
         "existing_active_preserved": True,
@@ -755,6 +812,45 @@ def test_authority_is_non_authoritative_on_darwin_even_when_functionally_passing
     assert result.evidence.run["authority"]["authoritative"] is False
     assert result.evidence.run["authority"]["platform"] == "darwin"
     assert result.evidence.run["authority"]["reason"] == "development_only_platform"
+
+
+def test_staging_cleanup_double_failure_splits_into_cleanup_and_finalization_failure(tmp_path):
+    """Task 15 Task 11 corrective v4, Section 28: a publication failure
+    PLUS a staging-cleanup failure must be recorded as BOTH a
+    finalization_failure (the original publish problem) AND a separate
+    cleanup_failure (the residue) -- with cleanup_status genuinely
+    reflecting failure, never coexisting with a claim of clean."""
+    import shutil
+
+    import scripts.release_gate.evidence as evidence_module
+
+    original_rmtree = shutil.rmtree
+
+    def _fail_only_for_staging_dir(path, *args, **kwargs):
+        # Distinguish the evidence staging directory (named
+        # ".<run>.staging-...", per publish_evidence()) from the run's
+        # own outer gate temp root, so this test exercises ONLY the
+        # staging-cleanup double-failure path, not an unrelated failure
+        # of the outer-temp-root cleanup this same patch would otherwise
+        # also intercept (both call through the same shared `shutil`
+        # module object).
+        if ".staging-" in Path(path).name:
+            raise OSError("simulated staging cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    with (
+        patch.object(evidence_module, "_atomic_write_text", side_effect=RuntimeError("simulated write failure")),
+        patch.object(evidence_module.shutil, "rmtree", side_effect=_fail_only_for_staging_dir),
+    ):
+        result = _run(repo_root=tmp_path)
+
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.cleanup_status == "failed"
+    assert result.evidence.cleanup_failure is not None
+    assert result.evidence.cleanup_failure["code"] == "StagingCleanupError"
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "RuntimeError"
 
 
 # --- fail-closed cleanup (corrective v3, Section 20/21/28.5) --------------
@@ -819,75 +915,41 @@ def test_publish_evidence_staging_cleanup_failure_is_never_silently_ignored(tmp_
     assert "ignore_errors=True" not in source
 
 
-# --- validate_for_pass() integration (corrective v3, Section 3) -----------
+# --- validate_for_pass() integration (corrective v4, Section 3) -----------
 
 
-def test_pass_validator_ineligible_downgrades_would_be_pass_to_cleanup_failure(tmp_path):
-    """Section 3: PASS is not a default state -- a run where every
-    scenario/cleanup step succeeded structurally must still be refused
-    if the injected pass_validator says the candidate is not eligible."""
+def test_run_release_gate_does_not_accept_a_pass_validator_argument(tmp_path):
+    """Task 15 Task 11 corrective v4, Section 3.1: production code must
+    not accept a pass_validator/validator/callback/hook capable of
+    deciding PASS eligibility -- the authoritative validate_for_pass()
+    is the only path, called directly, never injectable."""
+    parameters = inspect.signature(gate_runner.run_release_gate).parameters
+    for forbidden in ("pass_validator", "validator", "validate_for_pass", "pass_check", "pass_hook"):
+        assert forbidden not in parameters
 
-    def _always_ineligible(candidate):
-        return PassDecision(eligible=False, reasons=("simulated_ineligible_reason",))
-
-    result = _run(repo_root=tmp_path, pass_validator=_always_ineligible)
-    assert result.overall == "CLEANUP_FAILURE"
-    assert result.exit_code == 5
-    assert result.evidence.finalization_failure is not None
-    assert result.evidence.finalization_failure["code"] == "EvidenceInvariantError"
-    assert "simulated_ineligible_reason" in result.evidence.finalization_failure["safe_message"]
+    with pytest.raises(TypeError):
+        gate_runner.run_release_gate(repo_root=tmp_path, pass_validator=lambda candidate: None)
 
 
-def test_pass_validator_eligible_allows_pass(tmp_path):
-    def _always_eligible(candidate):
-        return PassDecision(eligible=True, reasons=())
-
-    result = _run(repo_root=tmp_path, pass_validator=_always_eligible)
-    assert result.overall == "PASS"
-    assert result.exit_code == 0
-
-
-def test_pass_validator_is_never_consulted_when_a_scenario_already_failed(tmp_path):
-    """The pass_validator only GATES a would-be PASS -- it is not
-    consulted at all once a worse primary failure already exists, so it
-    can never override that failure's own category/exit code (Section
-    5: 'no secondary failure may replace an existing primary failure')."""
-    calls = []
-
-    def _recording_validator(candidate):
-        calls.append(candidate.overall)
-        return PassDecision(eligible=False, reasons=("irrelevant",))
-
-    result = _run(
-        repo_root=tmp_path,
-        pass_validator=_recording_validator,
-        scenario_specs=(("fake_fail", _always_fail()),),
-    )
-    assert result.overall == "SCENARIO_FAILURE"
-    assert result.exit_code == 4
-    assert calls == []
-
-
-def test_real_validate_for_pass_rejects_a_fake_scenario_set_end_to_end(tmp_path):
-    """Real orchestration + the REAL evidence.validate_for_pass():
-    proves the default wiring actually enforces the exact required
-    scenario set, using the fake infra to avoid real Postgres/Gunicorn."""
-    from scripts.release_gate.evidence import validate_for_pass
-
-    result = _run(repo_root=tmp_path, pass_validator=validate_for_pass)
+def test_gate_runner_calls_the_real_validate_for_pass_directly(tmp_path):
+    """An incomplete/failed candidate cannot be forced to PASS by any
+    test seam -- only by actually satisfying the real, unconditional
+    validate_for_pass(). A fake single-scenario spec (never satisfying
+    the exact required 7-scenario set) must be refused."""
+    result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
     assert result.overall == "CLEANUP_FAILURE"
     assert result.exit_code == 5
     assert result.evidence.finalization_failure is not None
     assert "required_scenario_set_mismatch" in result.evidence.finalization_failure["safe_message"]
 
 
-def test_default_pass_validator_is_the_real_validate_for_pass():
-    import inspect
-
-    default = inspect.signature(gate_runner.run_release_gate).parameters["pass_validator"].default
-    from scripts.release_gate.evidence import validate_for_pass
-
-    assert default is validate_for_pass
+def test_gate_runner_reaches_real_pass_when_the_real_validator_is_genuinely_satisfied(tmp_path):
+    """The converse: a fake scenario spec set that DOES supply exactly
+    what the real validate_for_pass() requires reaches genuine PASS --
+    proving the production path is the real function, not a stub."""
+    result = _run(repo_root=tmp_path)
+    assert result.overall == "PASS"
+    assert result.exit_code == 0
 
 
 # --- no auto-tag / auto-commit / auto-push --------------------------------

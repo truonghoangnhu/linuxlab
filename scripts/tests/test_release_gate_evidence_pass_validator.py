@@ -293,10 +293,124 @@ def test_reasons_never_reflect_raw_scenario_or_proof_values():
     that failed validation."""
     proofs = dict(_GOOD_PROOFS)
     proofs["package_sha256"] = "sentinel-answer-key-like-value"
-    # This candidate is malformed at the syntax layer, which normally
-    # would already have been rejected by build_typed_proofs() upstream
-    # -- but validate_for_pass() must still never reflect a raw stored
-    # value even if one somehow reached it.
     candidate = _make_candidate(proofs=proofs)
     decision = validate_for_pass(candidate)
-    assert decision.eligible is True or "sentinel-answer-key-like-value" not in " ".join(decision.reasons)
+    assert decision.eligible is False
+    assert "sentinel-answer-key-like-value" not in " ".join(decision.reasons)
+
+
+# --- Task 15 Task 11 corrective v4, Section 8/12: validate_for_pass() is
+# the AUTHORITATIVE validation boundary -- it must independently
+# re-validate proof/assertion format and type, never merely trust that
+# an already-present value was constructed through build_typed_proofs()/
+# build_typed_assertions() upstream. These tests bypass those builders
+# entirely, constructing a candidate directly with a malformed value
+# already sitting in `proofs`/`scenarios[...]["assertions"]`, exactly as
+# a bug elsewhere (or a hand-built candidate) might.
+
+
+def test_rejects_a_directly_constructed_candidate_with_malformed_package_sha256():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["package_sha256"] = "sentinel-answer-key-like-value"
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_uppercase_hash():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["payload_sha256"] = "B" * 64
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_short_hash():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["public_key_fingerprint"] = "c" * 63
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_non_string_hash():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["package_sha256"] = 12345
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_integer_1_as_signature_verified():
+    """Section 18: 1 == True in Python -- a strict type check must
+    reject the integer 1 as a substitute for the boolean True, even
+    though a naive equality check would accept it."""
+    proofs = dict(_GOOD_PROOFS)
+    proofs["signature"] = {"verified": 1}
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_string_true_as_signature_verified():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["signature"] = {"verified": "true"}
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_bool_as_inbox_count():
+    """Section 14.2: bool is an int subclass in Python -- True/False
+    must never satisfy a strict int field."""
+    proofs = dict(_GOOD_PROOFS)
+    proofs["outbox_to_inbox"] = {**_GOOD_PROOFS["outbox_to_inbox"], "inbox_count": True}
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_extra_outbox_key():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["outbox_to_inbox"] = {**_GOOD_PROOFS["outbox_to_inbox"], "extra_field": "x"}
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_invalid_event_uuid():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["outbox_to_inbox"] = {**_GOOD_PROOFS["outbox_to_inbox"], "event_uuid": "not-a-uuid"}
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_git_sha_wrong_length():
+    run = dict(_make_candidate().run)
+    run["git_sha"] = "abc123"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_a_directly_constructed_candidate_with_git_sha_uppercase():
+    run = dict(_make_candidate().run)
+    run["git_sha"] = "A" * 40
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_scenario_assertion_integer_1_in_place_of_bool_true():
+    """Section 18/21: an assertion value of literal int 1 must not
+    satisfy a required bool-True assertion, even though 1 == True."""
+    scenarios = _good_scenarios()
+    name = REQUIRED_SCENARIOS[1]
+    assertions = dict(scenarios[name]["assertions"])
+    first_key = next(iter(assertions))
+    assertions[first_key] = 1
+    scenarios[name] = {**scenarios[name], "assertions": assertions}
+    decision = validate_for_pass(_make_candidate(scenarios=scenarios))
+    assert decision.eligible is False
+
+
+def test_rejects_scenario_assertion_integer_0_in_place_of_bool_false():
+    """For an expected-False assertion (central_inbox_mutated), integer
+    0 must not satisfy it even though 0 == False."""
+    scenarios = _good_scenarios()
+    name = "n2_revoked_credential"
+    assertions = dict(scenarios[name]["assertions"])
+    assertions["central_inbox_mutated"] = 0
+    scenarios[name] = {**scenarios[name], "assertions": assertions}
+    decision = validate_for_pass(_make_candidate(scenarios=scenarios))
+    assert decision.eligible is False

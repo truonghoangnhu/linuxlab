@@ -129,6 +129,30 @@ def test_publish_evidence_leaves_no_partial_pair_when_markdown_write_fails(tmp_p
     assert list(tmp_path.iterdir()) == []
 
 
+def test_publish_evidence_raises_staging_cleanup_error_when_both_publication_and_cleanup_fail(tmp_path):
+    """Task 15 Task 11 corrective v4, Section 28: publication failure
+    PLUS a subsequent staging-directory removal failure must be
+    distinguishable from a plain publication failure -- the original
+    publication failure must not be lost, and the caller must be able
+    to tell that residue was left on disk."""
+    evidence_dir = tmp_path / "rpub00000001"
+
+    import scripts.release_gate.evidence as evidence_module
+
+    with (
+        patch.object(evidence_module, "_atomic_write_text", side_effect=RuntimeError("simulated write failure")),
+        patch.object(evidence_module.shutil, "rmtree", side_effect=OSError("simulated staging cleanup failure")),
+        pytest.raises(evidence_module.StagingCleanupError) as exc_info,
+    ):
+        publish_evidence(evidence_dir, _make_evidence(), SecretRegistry())
+
+    # The ORIGINAL publication failure is preserved as __cause__, never
+    # overwritten by the cleanup failure that is what actually
+    # propagates.
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert not evidence_dir.exists()
+
+
 def test_publish_evidence_leaves_no_partial_pair_when_atomic_rename_fails(tmp_path):
     evidence_dir = tmp_path / "rpub00000001"
 

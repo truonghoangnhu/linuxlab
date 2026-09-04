@@ -255,6 +255,34 @@ def run_happy_path(deployment) -> dict:
     assert resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
     assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above, never a hard-coded
+    # literal that would stay falsely successful under Python's -O mode,
+    # where `assert` disappears entirely).
+    package_installed_and_activated = (
+        activated["state"] == "active"
+        and activated["source_public_id"] == authored["source_public_id"]
+        and activated["package_version"] == authored["package_version"]
+    )
+    assert package_installed_and_activated
+
+    result_matches_installed_artifact = (
+        attempt["found"] is True
+        and attempt["installed_activity_public_id"] == authored["activity_public_id"]
+        and attempt["installed_package_source_public_id"] == authored["source_public_id"]
+        and attempt["installed_package_version"] == authored["package_version"]
+        and attempt["result_score"] == 1
+    )
+    assert result_matches_installed_artifact
+
+    completion_event_created = (
+        outbox_before["found"] is True and outbox_before["event_type"] == "activity.completed"
+    )
+    assert completion_event_created
+
+    event_delivered_to_central = outbox_after["state"] == "delivered" and inbox["found"] is True
+    assert event_delivered_to_central
+
     return {
         "event_id": event_id,
         "attempt_public_id": attempt_public_id,
@@ -278,18 +306,10 @@ def run_happy_path(deployment) -> dict:
             "node_state": "DELIVERED",
             "duplicate_idempotent": True,
         },
-        # Typed scenario assertions (Task 11 corrective v3, Section 13):
-        # each mirrors an assertion already made above -- import_and_
-        # activate() returning state="active" IS package_installed_and_
-        # activated; the found/matching attempt+result+progress checks
-        # above ARE result_matches_installed_artifact; outbox_before's
-        # event_type="activity.completed" IS completion_event_created;
-        # the delivered-Outbox/found-Inbox sequence IS event_delivered_
-        # to_central.
-        "package_installed_and_activated": True,
-        "result_matches_installed_artifact": True,
-        "completion_event_created": True,
-        "event_delivered_to_central": True,
+        "package_installed_and_activated": package_installed_and_activated,
+        "result_matches_installed_artifact": result_matches_installed_artifact,
+        "completion_event_created": completion_event_created,
+        "event_delivered_to_central": event_delivered_to_central,
     }
 
 
@@ -360,8 +380,10 @@ def run_n1_tampered_replacement(deployment) -> dict:
     )
     tampered_b_path = _tamper_signature(package_b_path)
 
-    with pytest.raises(ActionError, match="PackageImportError"):
+    with pytest.raises(ActionError, match="PackageImportError") as exc_info:
         import_and_activate(deployment, tampered_b_path)
+    replacement_rejected = "PackageImportError" in str(exc_info.value)
+    assert replacement_rejected
 
     active_after = _active_a()
     assert active_after["found"] is True
@@ -376,22 +398,25 @@ def run_n1_tampered_replacement(deployment) -> dict:
     assert landing_status_after == 200
     assert _CONTENT["prompt"] in landing_body_after
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above).
+    existing_active_preserved = active_after["found"] is True and active_after["state"] == "active"
+    assert existing_active_preserved
+
+    active_package_identity_unchanged = (
+        active_after["package_version"] == authored_a["package_version"]
+        and active_after["payload_sha256"] == payload_sha256_before
+    )
+    assert active_package_identity_unchanged
+
     return {
         "active_package_version": authored_a["package_version"],
         "payload_sha256": payload_sha256_before,
         "rejected_replacement_version": republished_b["package_version"],
         "public_key_fingerprint": _public_key_fingerprint(deployment),
-        # Typed scenario assertions (Task 11 corrective v2, Section 8):
-        # each of these mirrors an assertion already made above, not a
-        # new claim -- existing ACTIVE package A was found/state=active
-        # both before and after (existing_active_preserved), its
-        # payload_sha256 was byte-identical before/after
-        # (active_package_identity_unchanged), and the tampered
-        # replacement B was rejected via a real PackageImportError
-        # (replacement_rejected).
-        "existing_active_preserved": True,
-        "active_package_identity_unchanged": True,
-        "replacement_rejected": True,
+        "existing_active_preserved": existing_active_preserved,
+        "active_package_identity_unchanged": active_package_identity_unchanged,
+        "replacement_rejected": replacement_rejected,
     }
 
 
@@ -430,16 +455,22 @@ def run_n2_revoked_credential(deployment) -> dict:
     )["count"]
     assert central_inbox_count == 0
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above).
+    request_rejected = "auth_fault=True" in flush_result.stdout and "delivered=0" in flush_result.stdout
+    assert request_rejected
+
+    central_inbox_mutated = central_inbox_count != 0
+    assert not central_inbox_mutated
+
+    revoked_credential_not_accepted = outbox_after["state"] == "pending"
+    assert revoked_credential_not_accepted
+
     return {
         "event_id": outbox_before["event_id"],
-        # Typed scenario assertions (Task 11 corrective v3, Section 13):
-        # each mirrors an assertion already made above -- auth_fault=True
-        # with delivered=0 IS request_rejected AND revoked_credential_
-        # not_accepted; the just-verified zero-row central Inbox count
-        # IS central_inbox_mutated=False.
-        "request_rejected": True,
-        "central_inbox_mutated": False,
-        "revoked_credential_not_accepted": True,
+        "request_rejected": request_rejected,
+        "central_inbox_mutated": central_inbox_mutated,
+        "revoked_credential_not_accepted": revoked_credential_not_accepted,
     }
 
 
@@ -473,7 +504,10 @@ def run_n3_ack_lost_real_proxy(deployment) -> dict:
     finally:
         proxy.stop()
 
-    assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
+    inbox_count_before_retry = run_action(
+        deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id
+    )["count"]
+    assert inbox_count_before_retry == 1
 
     outbox_still_pending = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", event_id)
     assert outbox_still_pending["state"] == "pending"
@@ -489,22 +523,31 @@ def run_n3_ack_lost_real_proxy(deployment) -> dict:
     outbox_final = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", event_id)
     assert outbox_final["state"] == "delivered"
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above).
+    central_commit_before_ack_loss = inbox_count_before_retry == 1
+    assert central_commit_before_ack_loss
+
+    node_pending_before_retry = outbox_still_pending["state"] == "pending"
+    assert node_pending_before_retry
+
+    final_node_state = "DELIVERED" if outbox_final["state"] == "delivered" else outbox_final["state"].upper()
+    assert final_node_state == "DELIVERED"
+
+    # The retry-driven redelivery landed on the SAME Inbox count (1,
+    # not 2) as before the retry -- that IS the idempotence proof: the
+    # retry was recognized as the same event_id, not treated as a fresh
+    # duplicate event.
+    duplicate_idempotent = final_inbox_count == inbox_count_before_retry == 1
+    assert duplicate_idempotent
+
     return {
         "event_id": event_id,
-        # Typed scenario assertions (Task 11 corrective v2, Section 8):
-        # each mirrors an assertion already made above -- the Inbox row
-        # was durably committed (count == 1) BEFORE the dropped ACK
-        # (central_commit_before_ack_loss), the Outbox stayed pending
-        # across that loss (node_pending_before_retry), and after the
-        # retry the Inbox count is STILL exactly 1 (final_inbox_count,
-        # duplicate_idempotent -- the retry was recognized as the same
-        # idempotent event_id, not a fresh duplicate) with Node finally
-        # DELIVERED (final_node_state).
-        "central_commit_before_ack_loss": True,
-        "node_pending_before_retry": True,
+        "central_commit_before_ack_loss": central_commit_before_ack_loss,
+        "node_pending_before_retry": node_pending_before_retry,
         "final_inbox_count": final_inbox_count,
-        "final_node_state": "DELIVERED",
-        "duplicate_idempotent": True,
+        "final_node_state": final_node_state,
+        "duplicate_idempotent": duplicate_idempotent,
     }
 
 
@@ -564,20 +607,29 @@ def run_n4_central_unavailable(deployment) -> dict:
     outbox_final = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", outbox["event_id"])
     assert outbox_final["state"] == "delivered"
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above).
+    local_runtime_available = submit_body["score"] == 1 and outbox["found"] is True
+    assert local_runtime_available
+
+    outbox_remained_durable = outbox_still_pending["state"] == "pending"
+    assert outbox_remained_durable
+
+    recovery_delivery_success = outbox_final["state"] == "delivered"
+    assert recovery_delivery_success
+
+    # The SAME event_id (never a freshly created one) is what was
+    # queried throughout, and it is this exact query that just
+    # confirmed "delivered" above -- that IS the no-loss proof.
+    no_event_loss = outbox_final["state"] == "delivered"
+    assert no_event_loss
+
     return {
         "event_id": outbox["event_id"],
-        # Typed scenario assertions (Task 11 corrective v3, Section 13):
-        # each mirrors an assertion already made above -- the real
-        # learner HTTP flow (grading included) succeeding while Central
-        # was down IS local_runtime_available; the outbox staying
-        # pending through the transient-release flush IS outbox_
-        # remained_durable; the SAME event_id eventually reaching
-        # delivered=1 (never re-created, never abandoned) IS no_event_
-        # loss AND recovery_delivery_success.
-        "local_runtime_available": True,
-        "outbox_remained_durable": True,
-        "no_event_loss": True,
-        "recovery_delivery_success": True,
+        "local_runtime_available": local_runtime_available,
+        "outbox_remained_durable": outbox_remained_durable,
+        "no_event_loss": no_event_loss,
+        "recovery_delivery_success": recovery_delivery_success,
     }
 
 
@@ -630,19 +682,28 @@ def run_n5_node_restart(deployment) -> dict:
     )
     assert outbox_final["state"] == "delivered"
 
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above).
+    active_package_survived_restart = landing_status == 200 and _CONTENT["prompt"] in landing_body
+    assert active_package_survived_restart
+
+    pending_outbox_survived_restart = (
+        outbox_after_restart["found"] is True and outbox_after_restart["state"] == "pending"
+    )
+    assert pending_outbox_survived_restart
+
+    runtime_recovered = landing_status == 200
+    assert runtime_recovered
+
+    delivery_resumed = outbox_final["state"] == "delivered"
+    assert delivery_resumed
+
     return {
         "event_id": outbox_before["event_id"],
-        # Typed scenario assertions (Task 11 corrective v3, Section 13):
-        # each mirrors an assertion already made above -- the restarted
-        # Node's landing page serving the same activity IS active_
-        # package_survived_restart AND runtime_recovered; the pending
-        # Outbox row still being found after restart IS pending_outbox_
-        # survived_restart; the subsequent flush reaching delivered=1
-        # IS delivery_resumed.
-        "active_package_survived_restart": True,
-        "pending_outbox_survived_restart": True,
-        "runtime_recovered": True,
-        "delivery_resumed": True,
+        "active_package_survived_restart": active_package_survived_restart,
+        "pending_outbox_survived_restart": pending_outbox_survived_restart,
+        "runtime_recovered": runtime_recovered,
+        "delivery_resumed": delivery_resumed,
     }
 
 
@@ -790,21 +851,41 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
         if restored_central is not None:
             stop_process(restored_central)
 
-    # Typed scenario assertions (Task 11 corrective v3, Section 13):
-    # each mirrors an assertion already made above -- the found
-    # publication snapshot/node registration/first-Inbox-row on the
-    # RESTORED Central database IS central_business_state_restored; the
-    # found active package + both restored attempts with correct scores
-    # on the RESTORED Node database IS node_business_state_restored;
-    # the still-pending second Outbox row surviving the restore IS
-    # pending_outbox_restored; the real restored Gunicorn pair
-    # completing a real sync flush to delivered/found-in-Inbox IS
-    # restored_sync_can_resume.
+    # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
+    # from the same already-fetched real facts above, never a hard-coded
+    # literal).
+    central_business_state_restored = (
+        snapshot["found"] is True
+        and snapshot["source_public_id"] == authored["source_public_id"]
+        and registration["found"] is True
+        and registration["enabled"] is True
+        and inbox["found"] is True
+    )
+    assert central_business_state_restored
+
+    node_business_state_restored = (
+        active_package["found"] is True
+        and active_package["state"] == "active"
+        and restored_first_attempt["found"] is True
+        and restored_first_attempt["result_score"] == 1
+        and restored_second_attempt["found"] is True
+        and restored_second_attempt["result_score"] == 1
+    )
+    assert node_business_state_restored
+
+    pending_outbox_restored = restored_pending_outbox["found"] is True and restored_pending_outbox["state"] == "pending"
+    assert pending_outbox_restored
+
+    restored_sync_can_resume = (
+        outbox_after_restore_sync["state"] == "delivered" and inbox_after_restore_sync["found"] is True
+    )
+    assert restored_sync_can_resume
+
     return {
-        "central_business_state_restored": True,
-        "node_business_state_restored": True,
-        "pending_outbox_restored": True,
-        "restored_sync_can_resume": True,
+        "central_business_state_restored": central_business_state_restored,
+        "node_business_state_restored": node_business_state_restored,
+        "pending_outbox_restored": pending_outbox_restored,
+        "restored_sync_can_resume": restored_sync_can_resume,
     }
 
 

@@ -363,6 +363,18 @@ class EvidencePublicationError(Exception):
     an overwrite) or when publication otherwise cannot proceed."""
 
 
+class StagingCleanupError(Exception):
+    """Task 15 Task 11 corrective v4, Section 28: raised when evidence
+    publication fails AND the subsequent removal of the private staging
+    directory ALSO fails, leaving residue on disk -- distinct from a
+    plain publication failure (where staging is cleanly removed) so the
+    caller can tell genuine residue was left behind. The ORIGINAL
+    publication failure is always available as `__cause__` (explicit
+    `raise ... from original_exc`, not relied on via implicit
+    `__context__` tracking, which would instead follow the innermost
+    -- cleanup's own -- exception at this point)."""
+
+
 class SecretLeakError(Exception):
     """Raised when a final full-text scan of serialized evidence output
     still contains a registered secret. Checkpoint corrective (finding
@@ -554,8 +566,14 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
     run = candidate.run or {}
     if not run.get("run_id") or run.get("run_id") == "unknown":
         reasons.append("run_id_missing")
-    if not run.get("git_sha") or run.get("git_sha") == "unknown":
-        reasons.append("git_sha_missing")
+    git_sha = run.get("git_sha")
+    # Task 15 Task 11 corrective v4, Section 10: "exact valid git SHA
+    # representation used by this codebase" -- not merely non-empty.
+    # environment.resolve_git_sha() always returns exactly 40 lowercase
+    # hex characters (a real `git rev-parse HEAD`); anything else is
+    # not a valid SHA this codebase could have actually produced.
+    if type(git_sha) is not str or not re.match(r"^[0-9a-f]{40}$", git_sha):
+        reasons.append("git_sha_missing_or_malformed")
     if not run.get("started_at") or not run.get("finished_at"):
         reasons.append("timestamps_missing")
 
@@ -595,6 +613,17 @@ def _validate_for_pass_validation_checks(candidate: ReleaseEvidence, reasons: li
         reasons.append("node_migration_drift_detected")
 
 
+def _value_matches_expected(value, expected) -> bool:
+    """Task 15 Task 11 corrective v4, Section 18/21: a STRICT typed
+    comparison, never bare equality -- `1 == True` and `0 == False` in
+    Python, so a naive `value != expected` would wrongly accept an
+    integer substitute for a required bool. `type(value) is type(
+    expected)` rejects that (and, since `type(True) is bool`, also
+    correctly rejects bool where an int like `final_inbox_count` is
+    expected -- bool is an int subclass, but never `type() is int`)."""
+    return type(value) is type(expected) and value == expected
+
+
 def _validate_for_pass_scenarios(candidate: ReleaseEvidence, reasons: list) -> None:
     scenarios = candidate.scenarios or {}
     if set(scenarios.keys()) != set(REQUIRED_SCENARIOS):
@@ -611,29 +640,50 @@ def _validate_for_pass_scenarios(candidate: ReleaseEvidence, reasons: list) -> N
             reasons.append(f"scenario_{name}_assertion_set_mismatch")
             continue
         for key in required_keys:
-            if assertions.get(key) != _ASSERTION_EXPECTED_VALUE[key]:
+            if not _value_matches_expected(assertions.get(key), _ASSERTION_EXPECTED_VALUE[key]):
                 reasons.append(f"scenario_{name}_assertion_{key}_not_successful")
 
 
 def _validate_for_pass_proofs(candidate: ReleaseEvidence, reasons: list) -> None:
+    """Task 15 Task 11 corrective v4, Section 8/12: validate_for_pass()
+    is the AUTHORITATIVE validation boundary -- every proof field is
+    re-validated for format/type here independently, never merely
+    trusted because it is already present in `candidate.proofs`. A
+    candidate built by some other path than build_typed_proofs() (a
+    bug, a hand-built object, a future code path) must still be caught
+    here rather than silently admitted."""
     proofs = candidate.proofs or {}
     for key in ("package_sha256", "payload_sha256", "public_key_fingerprint"):
-        if key not in proofs:
-            reasons.append(f"proof_{key}_missing")
+        value = proofs.get(key)
+        if type(value) is not str or not _SHA256_HEX_RE.match(value):
+            reasons.append(f"proof_{key}_missing_or_malformed")
 
     signature = proofs.get("signature")
-    if not isinstance(signature, dict) or signature.get("verified") is not True:
+    if (
+        not isinstance(signature, dict)
+        or set(signature.keys()) != {"verified"}
+        or type(signature.get("verified")) is not bool
+    ):
+        reasons.append("proof_signature_malformed")
+    elif signature["verified"] is not True:
         reasons.append("proof_signature_not_verified")
 
     outbox = proofs.get("outbox_to_inbox")
-    if not isinstance(outbox, dict):
-        reasons.append("proof_outbox_to_inbox_missing")
+    if not isinstance(outbox, dict) or set(outbox.keys()) != _OUTBOX_TO_INBOX_REQUIRED_KEYS:
+        reasons.append("proof_outbox_to_inbox_malformed")
     else:
-        if outbox.get("inbox_count") != 1:
+        try:
+            uuid_module.UUID(str(outbox.get("event_uuid")))
+            event_uuid_valid = True
+        except (ValueError, AttributeError, TypeError):
+            event_uuid_valid = False
+        if not event_uuid_valid:
+            reasons.append("proof_outbox_event_uuid_invalid")
+        if type(outbox.get("inbox_count")) is not int or outbox.get("inbox_count") != 1:
             reasons.append("proof_outbox_inbox_count_not_1")
-        if outbox.get("node_state") != "DELIVERED":
+        if type(outbox.get("node_state")) is not str or outbox.get("node_state") != "DELIVERED":
             reasons.append("proof_outbox_node_state_not_delivered")
-        if outbox.get("duplicate_idempotent") is not True:
+        if type(outbox.get("duplicate_idempotent")) is not bool or outbox.get("duplicate_idempotent") is not True:
             reasons.append("proof_outbox_not_duplicate_idempotent")
 
 
@@ -722,19 +772,28 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
         _atomic_write_text(json_path, json_text)
         _atomic_write_text(markdown_path, markdown_text)
         os.rename(str(staging_dir), str(evidence_dir))
-    except BaseException:
-        # Task 15 Task 11 corrective v3, Section 21: staging cleanup on
-        # a failed publication is itself a release-owned cleanup step,
-        # not best-effort -- if it ALSO fails, that must still surface
-        # to the caller rather than being silently swallowed. Raised
-        # from inside this `except` block, so Python's own implicit
-        # exception chaining preserves the ORIGINAL publication failure
-        # as `__context__` even when the staging cleanup failure is
-        # what ultimately propagates.
+    except BaseException as original_exc:
+        # Task 15 Task 11 corrective v3, Section 21 (hardened by v4,
+        # Section 28): staging cleanup on a failed publication is
+        # itself a release-owned cleanup step, not best-effort -- if it
+        # ALSO fails, that must still surface to the caller rather than
+        # being silently swallowed, and distinguishably from a plain
+        # publication failure (residue was left on disk). `original_exc`
+        # is bound explicitly and chained via `from` -- Python's
+        # automatic `__context__` tracking follows whichever exception
+        # is innermost-active, which by this point would be the
+        # cleanup's own OSError, not the original publication failure,
+        # so relying on implicit chaining alone would lose it. Setting
+        # `__cause__` to `original_exc` explicitly is what actually
+        # preserves it here.
         try:
             shutil.rmtree(staging_dir)
         except FileNotFoundError:
             pass
+        except OSError:
+            raise StagingCleanupError(
+                "evidence staging directory cleanup failed after a publication failure"
+            ) from original_exc
         raise
 
     return evidence_dir / "release-evidence.json", evidence_dir / "release-evidence.md"

@@ -82,7 +82,6 @@ import django
 import psycopg
 
 from scripts.release_gate import scenarios as scenario_module
-from scripts.release_gate.cleanup import CleanupAggregateError
 from scripts.release_gate.e2e_support import dual_deployment as real_dual_deployment
 from scripts.release_gate.environment import (
     GateEnvironment,
@@ -99,6 +98,7 @@ from scripts.release_gate.evidence import (
     ReleaseEvidence,
     ScenarioResult,
     SecretRegistry,
+    StagingCleanupError,
     build_typed_assertions,
     build_typed_proofs,
     publish_evidence,
@@ -206,16 +206,23 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
     None on success, else one of "STARTUP_FAILURE"/"SCENARIO_FAILURE"/
     "CLEANUP_FAILURE".
 
-    Explicit stage tracking (Section 5/16): `stage` starts at
-    Stage.STARTUP and is advanced to Stage.SCENARIO only once
-    dual_deployment_factory(...) has actually yielded a deployment --
-    an exception before that point is a startup failure by construction,
-    never inferred from exception type. Typed assertion construction
-    (Section 8) happens INSIDE the protected block, immediately after
-    the scenario body returns: a malformed assertion value therefore
-    fails the scenario itself, using the exact same precedence handling
-    below as any other body failure, rather than a separate code path
-    that could diverge from it.
+    Explicit stage tracking (Section 5/16, hardened by corrective v4
+    Section 6.4): `stage` starts at Stage.STARTUP and is advanced to
+    Stage.SCENARIO only once dual_deployment_factory(...) has actually
+    yielded a deployment -- an exception before that point is a startup
+    failure by construction, never inferred from exception type. Once
+    the scenario body (and typed assertion construction, Section 8)
+    fully completes, `stage` is advanced ONE FURTHER to Stage.CLEANUP
+    before the `with` block's own suite ends -- the only code that can
+    still run after that point is `__exit__` (teardown). This means
+    that IF `outcome_exception` is set below, checking `stage ==
+    Stage.CLEANUP` alone proves it came from teardown, for ANY
+    exception class whatsoever -- never by checking whether it happens
+    to be a `CleanupAggregateError` specifically (Section 6.4: "do not
+    depend on CleanupAggregateError specifically to recognize cleanup
+    stage"). A malformed assertion value fails the scenario itself
+    (never reaches Stage.CLEANUP), using the exact same precedence
+    handling as any other body failure.
 
     The scenario body's own exception is deliberately let propagate
     NATURALLY through `dual_deployment_factory(...)`'s own `finally`
@@ -223,8 +230,9 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
     dual_deployment() correctly observe via `sys.exc_info()` that the
     run failed, and if cleanup ALSO then raises, Python's own implicit
     exception chaining sets the new exception's `__context__` to the
-    original body/setup exception for free -- the signal used below to
-    prove BOTH failures occurred without losing either one."""
+    original body/setup exception for free -- checked generically here
+    (`__context__ is not None`), again never by testing the new
+    exception's class."""
     child_run_id = _child_run_id(outer_run_id, name)
     start = time.monotonic()
     stage = Stage.STARTUP
@@ -238,6 +246,7 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
             _register_deployment_secrets(deployment, secrets)
             detail_value = scenario_func(deployment)
             assertions = build_typed_assertions(detail_value)
+            stage = Stage.CLEANUP
     except Exception as exc:  # noqa: BLE001 -- classified below, never silently dropped
         outcome_exception = exc
 
@@ -252,27 +261,25 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
             detail_value,
         )
 
-    cleanup_record = None
-    if isinstance(outcome_exception, CleanupAggregateError):
+    if stage == Stage.CLEANUP:
+        # Setup and the scenario body both fully succeeded -- whatever
+        # this exception's actual class is, it can only have come from
+        # __exit__ (teardown).
         cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
+        category = "CLEANUP_FAILURE"
+        record = cleanup_record
+    else:
+        # Setup or the scenario body itself failed. If teardown ALSO
+        # then failed while that original exception was unwinding,
+        # Python's own implicit chaining set `__context__` to it.
         original_exception = outcome_exception.__context__
+        category = "SCENARIO_FAILURE" if stage == Stage.SCENARIO else "STARTUP_FAILURE"
         if original_exception is not None:
-            # Both the scenario's own setup/body AND its cleanup failed
-            # -- the ORIGINAL failure's classification remains primary
-            # regardless of whether it happened before (STARTUP) or
-            # after (SCENARIO) the body started; the cleanup failure is
-            # still surfaced via `cleanup_record`, never dropped.
-            category = "SCENARIO_FAILURE" if stage == Stage.SCENARIO else "STARTUP_FAILURE"
+            cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
             record = _sanitize_exception(original_exception, name, category, secrets)
         else:
-            category = "CLEANUP_FAILURE"
-            record = cleanup_record
-    elif stage == Stage.SCENARIO:
-        category = "SCENARIO_FAILURE"
-        record = _sanitize_exception(outcome_exception, name, category, secrets)
-    else:
-        category = "STARTUP_FAILURE"
-        record = _sanitize_exception(outcome_exception, name, category, secrets)
+            cleanup_record = None
+            record = _sanitize_exception(outcome_exception, name, category, secrets)
 
     return (
         ScenarioResult(name=name, status="FAIL", duration_ms=duration_ms, detail=record.safe_message),
@@ -375,17 +382,21 @@ def _finish(
     secrets,
     evidence_dir,
     keep_on_failure,
-    pass_validator=validate_for_pass,
     db_admin=None,
 ) -> GateRunResult:
-    """Task 11 corrective v2/v3, Section 13/16: the FINALIZE stage.
+    """Task 11 corrective v2/v3/v4, Section 13/16: the FINALIZE stage.
     Typed proof/assertion construction happens here for proofs
     (assertions are already built per-scenario in _run_one_scenario --
     see that function's docstring for why); the canonical EvidenceV1
     candidate is built; then, ONLY if nothing has failed it so far
-    (`overall == "PASS"`), `pass_validator` is consulted as the single
-    gate a candidate must clear to be minted PASS (Section 3: "PASS is
-    not a default state") -- if it says the candidate is not eligible,
+    (`overall == "PASS"`), the AUTHORITATIVE `evidence.validate_for_
+    pass()` is consulted as the single gate a candidate must clear to
+    be minted PASS (Section 3: "PASS is not a default state"). This is
+    a direct, hardcoded call -- corrective v4, Section 3.1: production
+    `run_release_gate()`/`_finish()` accept no injectable validator/
+    callback/hook capable of deciding PASS eligibility; tests that need
+    to exercise a genuine PASS path must satisfy this exact function,
+    never substitute for it. If it says the candidate is not eligible,
     `overall` is downgraded to CLEANUP_FAILURE/exit 5 with a
     `finalization_failure` built from the validator's own safe reason
     codes, never from raw candidate content. Only after that gate does
@@ -445,13 +456,13 @@ def _finish(
     )
 
     # Section 3: PASS is not a default state -- the ONLY way `overall`
-    # may remain "PASS" past this point is if `pass_validator` (the
-    # real evidence.validate_for_pass by default) actually certifies
-    # this exact candidate. Only consulted when nothing else has
-    # already failed the run, so it can only ever GATE a would-be PASS,
-    # never override an already-worse primary/cleanup failure.
+    # may remain "PASS" past this point is if the real, hardcoded
+    # evidence.validate_for_pass() actually certifies this exact
+    # candidate. Only consulted when nothing else has already failed
+    # the run, so it can only ever GATE a would-be PASS, never override
+    # an already-worse primary/cleanup failure.
     if evidence.overall == "PASS":
-        decision = pass_validator(evidence)
+        decision = validate_for_pass(evidence)
         if not decision.eligible:
             safe_message = secrets.redact_text("; ".join(decision.reasons))
             evidence.finalization_failure = FailureRecord(
@@ -470,9 +481,29 @@ def _finish(
             json_path, markdown_path = publish_evidence(evidence_dir, evidence, secrets)
         except Exception as exc:  # noqa: BLE001 -- publication must never crash the gate itself
             evidence.retention["sanitized_debug_bundle_retained"] = False
-            publish_record = _sanitize_exception(exc, "finalize_publish", "CLEANUP_FAILURE", secrets)
-            if evidence.finalization_failure is None:
-                evidence.finalization_failure = publish_record.to_dict()
+            if isinstance(exc, StagingCleanupError):
+                # Corrective v4, Section 28: publication AND the
+                # subsequent staging-directory cleanup BOTH failed --
+                # genuine residue was left on disk. Split into two
+                # distinct records: the staging-cleanup failure itself
+                # (cleanup_failure, and cleanup_status genuinely
+                # reflects it) and the ORIGINAL publication failure
+                # (preserved as `__cause__`, never overwritten) as
+                # finalization_failure.
+                if evidence.cleanup_failure is None:
+                    evidence.cleanup_failure = _sanitize_exception(
+                        exc, "finalize_publish_staging_cleanup", "CLEANUP_FAILURE", secrets
+                    ).to_dict()
+                evidence.cleanup_status = "failed"
+                original_exc = exc.__cause__
+                if original_exc is not None and evidence.finalization_failure is None:
+                    evidence.finalization_failure = _sanitize_exception(
+                        original_exc, "finalize_publish", "CLEANUP_FAILURE", secrets
+                    ).to_dict()
+            elif evidence.finalization_failure is None:
+                evidence.finalization_failure = _sanitize_exception(
+                    exc, "finalize_publish", "CLEANUP_FAILURE", secrets
+                ).to_dict()
             if evidence.overall == "PASS":
                 evidence.overall = "CLEANUP_FAILURE"
                 evidence.exit_code = EXIT_CODE["CLEANUP_FAILURE"]
@@ -496,7 +527,6 @@ def run_release_gate(
     dual_deployment_factory=real_dual_deployment,
     environment_builder=build_gate_environment,
     run_validation=_run_validation_checks,
-    pass_validator=validate_for_pass,
     tmp_root=None,
 ) -> GateRunResult:
     """Runs the full release gate: preflight -> validation checks ->
@@ -547,7 +577,6 @@ def run_release_gate(
             secrets=secrets,
             evidence_dir=None,
             keep_on_failure=keep_on_failure,
-            pass_validator=pass_validator,
         )
 
     secrets.register(env.db_admin.password)
@@ -579,7 +608,6 @@ def run_release_gate(
             secrets=secrets,
             evidence_dir=env.artifact_dir,
             keep_on_failure=keep_on_failure,
-            pass_validator=pass_validator,
         )
 
     scenario_results: list = []
@@ -669,6 +697,5 @@ def run_release_gate(
         secrets=secrets,
         evidence_dir=env.artifact_dir,
         keep_on_failure=keep_on_failure,
-        pass_validator=pass_validator,
         db_admin=env.db_admin,
     )
