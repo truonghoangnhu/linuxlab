@@ -56,6 +56,7 @@ validation status, etc).
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -507,36 +508,52 @@ def run_release_gate(
     failure_records: list = []
     overall = "PASS"
 
+    # A plain mkdtemp(), NOT tempfile.TemporaryDirectory() -- the latter's
+    # own auto-cleanup would delete this ENTIRE tree (including any
+    # scenario's real "gate-workspace-*" nested inside it) the instant
+    # the scenario loop finishes, regardless of whether dual_deployment()
+    # itself decided to retain that workspace under --keep-on-failure.
+    # This directory is removed manually below, and ONLY when nothing
+    # inside it was actually retained (Task 11 corrective, Important
+    # finding #5: keep-on-failure must genuinely retain the promised
+    # workspace, not have it silently swept up by an unrelated outer
+    # cleanup).
+    tmp_root_path = Path(
+        tempfile.mkdtemp(prefix=f"phase1-release-{env.run_id}-", dir=str(tmp_root) if tmp_root is not None else None)
+    )
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=f"phase1-release-{env.run_id}-", dir=str(tmp_root) if tmp_root is not None else None
-        ) as tmp_root_str:
-            tmp_root_path = Path(tmp_root_str)
-            for name, scenario_func in scenario_specs:
-                stage = name
-                scenario_tmp_dir = tmp_root_path / name
-                scenario_tmp_dir.mkdir(parents=True, exist_ok=True)
-                result, category, primary_record, cleanup_record, detail_value, retained = _run_one_scenario(
-                    env.run_id, name, scenario_func, scenario_tmp_dir, dual_deployment_factory, secrets,
-                    keep_on_failure,
-                )
-                scenario_results.append(result)
-                if detail_value:
-                    detail_values[name] = detail_value
-                if category is not None:
-                    failure_records.append(primary_record)
-                    if _SEVERITY[category] > _SEVERITY[overall]:
-                        overall = category
-                if cleanup_record is not None:
-                    cleanup_records.append(cleanup_record)
-                if retained is not None:
-                    retained_resources[name] = retained
+        for name, scenario_func in scenario_specs:
+            stage = name
+            scenario_tmp_dir = tmp_root_path / name
+            scenario_tmp_dir.mkdir(parents=True, exist_ok=True)
+            result, category, primary_record, cleanup_record, detail_value, retained = _run_one_scenario(
+                env.run_id, name, scenario_func, scenario_tmp_dir, dual_deployment_factory, secrets,
+                keep_on_failure,
+            )
+            scenario_results.append(result)
+            if detail_value:
+                detail_values[name] = detail_value
+            if category is not None:
+                failure_records.append(primary_record)
+                if _SEVERITY[category] > _SEVERITY[overall]:
+                    overall = category
+            if cleanup_record is not None:
+                cleanup_records.append(cleanup_record)
+            if retained is not None:
+                retained_resources[name] = retained
     except Exception as exc:  # noqa: BLE001 -- unexpected failure OUTSIDE any single scenario's own handling
         record = _sanitize_exception(exc, stage, "STARTUP_FAILURE", secrets)
         failure_records.append(record)
         if _SEVERITY["STARTUP_FAILURE"] > _SEVERITY[overall]:
             overall = "STARTUP_FAILURE"
         scenario_results.append(ScenarioResult(name=stage, status="FAIL", detail=record.safe_message))
+    finally:
+        if not retained_resources:
+            shutil.rmtree(tmp_root_path, ignore_errors=True)
+        # else: at least one scenario's workspace was genuinely retained
+        # under --keep-on-failure -- leave this whole temp root in place
+        # rather than selectively pruning it, since the retained
+        # workspace lives nested inside it.
 
     # The primary_failure is the recorded FailureRecord whose OWN
     # category matches `overall` -- the worst one observed -- never an

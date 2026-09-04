@@ -593,6 +593,43 @@ def test_successful_run_retains_nothing_even_with_keep_on_failure_true(tmp_path)
     assert result.evidence.cleanup_status == "clean"
 
 
+def test_retained_workspace_nested_under_the_run_own_temp_root_survives(tmp_path):
+    """Regression for a real bug caught by the real-infra integration
+    test: run_release_gate() creates its OWN per-run temp root
+    (tmp_root_path) and hands each scenario a subdirectory of it as
+    `scenario_tmp_dir` -- the exact directory the REAL dual_deployment()
+    creates its "gate-workspace-*" inside. If that outer temp root were
+    ever auto-cleaned (e.g. via tempfile.TemporaryDirectory()) as soon
+    as the scenario loop finishes, a workspace dual_deployment() itself
+    decided to retain would be deleted anyway by the OUTER cleanup,
+    regardless of the inner retention decision. This fake creates its
+    workspace AS A CHILD of the `tmp_dir` the factory receives -- like
+    the real dual_deployment() does -- so this is a faithful,
+    fast-running regression proof, not just the slower real-infra one."""
+
+    def factory(tmp_dir, **kwargs):
+        @contextmanager
+        def _cm():
+            workspace = Path(tmp_dir) / "gate-workspace-nested-probe"
+            workspace.mkdir(parents=True)
+            try:
+                yield _FakeDeployment(tmp_dir=workspace, gate_names=_FakeGateNames("nested-probe"))
+            finally:
+                pass  # deliberately does NOT remove `workspace` -- simulates a real keep-on-failure retention
+
+        return _cm()
+
+    result = _run(
+        repo_root=tmp_path,
+        keep_on_failure=True,
+        dual_deployment_factory=factory,
+        scenario_specs=(("n2", _always_fail("simulated failure with retained state")),),
+    )
+    assert result.overall == "SCENARIO_FAILURE"
+    workspace_path = Path(result.evidence.retained_resources["n2"]["workspace_path"])
+    assert workspace_path.exists(), "the retained workspace must survive the run's own outer temp-root cleanup"
+
+
 # --- no auto-tag / auto-commit / auto-push --------------------------------
 
 
