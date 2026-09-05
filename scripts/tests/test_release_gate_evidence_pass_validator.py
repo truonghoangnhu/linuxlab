@@ -10,6 +10,8 @@ full orchestration pipeline) so every individual mandatory invariant
 can be probed in isolation, per Section 28.6.
 """
 
+import pytest
+
 from scripts.release_gate.environment import Authority
 from scripts.release_gate.evidence import (
     REQUIRED_SCENARIO_ASSERTIONS,
@@ -413,4 +415,102 @@ def test_rejects_scenario_assertion_integer_0_in_place_of_bool_false():
     assertions["central_inbox_mutated"] = 0
     scenarios[name] = {**scenarios[name], "assertions": assertions}
     decision = validate_for_pass(_make_candidate(scenarios=scenarios))
+    assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v5, Section 3: strict whole-string hash/
+# Git-SHA validation -- a trailing newline/space must never be accepted
+# by validate_for_pass() any more than by validate_sha256_hex() itself.
+
+
+def test_rejects_candidate_with_package_sha256_trailing_newline():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["package_sha256"] = "a" * 64 + "\n"
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_payload_sha256_trailing_space():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["payload_sha256"] = "b" * 64 + " "
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_git_sha_trailing_newline():
+    run = dict(_make_candidate().run)
+    run["git_sha"] = "a" * 40 + "\n"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_git_sha_trailing_space():
+    run = dict(_make_candidate().run)
+    run["git_sha"] = "a" * 40 + " "
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v5, Section 3: strict timestamps -----------
+
+
+@pytest.mark.parametrize(
+    "bad_value", [True, False, 12345, None, "", "not-a-timestamp", "2026-09-04", "2026-09-04T00:00:00+00:00\n"]
+)
+def test_rejects_candidate_with_malformed_started_at(bad_value):
+    run = dict(_make_candidate().run)
+    run["started_at"] = bad_value
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "not-a-timestamp"])
+def test_rejects_candidate_with_malformed_finished_at(bad_value):
+    run = dict(_make_candidate().run)
+    run["finished_at"] = bad_value
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v5, Section 3: strict required string
+# metadata -- a bool/int must never satisfy a required non-empty-string
+# field just because it is truthy (e.g. `not True` is falsy, so a naive
+# `not value` check wrongly admits `True`).
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "unknown"])
+def test_rejects_candidate_with_malformed_environment_platform(bad_value):
+    environment = dict(_GOOD_ENVIRONMENT)
+    environment["platform"] = bad_value
+    decision = validate_for_pass(_make_candidate(environment=environment))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "unknown"])
+def test_rejects_candidate_with_malformed_python_version(bad_value):
+    environment = dict(_GOOD_ENVIRONMENT)
+    environment["python_version"] = bad_value
+    decision = validate_for_pass(_make_candidate(environment=environment))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "unknown"])
+def test_rejects_candidate_with_malformed_django_version(bad_value):
+    environment = dict(_GOOD_ENVIRONMENT)
+    environment["django_version"] = bad_value
+    decision = validate_for_pass(_make_candidate(environment=environment))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, ""])
+def test_rejects_candidate_with_malformed_central_profile(bad_value):
+    profiles = {"central": bad_value, "node": "linuxlab.settings.node"}
+    decision = validate_for_pass(_make_candidate(profiles=profiles))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, ""])
+def test_rejects_candidate_with_malformed_node_profile(bad_value):
+    profiles = {"central": "linuxlab.settings.central", "node": bad_value}
+    decision = validate_for_pass(_make_candidate(profiles=profiles))
     assert decision.eligible is False

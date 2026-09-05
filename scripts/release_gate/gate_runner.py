@@ -242,8 +242,15 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
 
     try:
         with dual_deployment_factory(scenario_tmp_dir, run_id=child_run_id) as deployment:
-            stage = Stage.SCENARIO
+            # Task 15 Task 11 corrective v5, Section 6: STARTUP covers
+            # deployment context entry AND every post-enter setup step
+            # before the scenario callable itself -- secret registration
+            # here included. `stage` only advances to SCENARIO
+            # immediately before the scenario body actually runs, so a
+            # failure in _register_deployment_secrets() classifies as
+            # STARTUP_FAILURE, never SCENARIO_FAILURE.
             _register_deployment_secrets(deployment, secrets)
+            stage = Stage.SCENARIO
             detail_value = scenario_func(deployment)
             assertions = build_typed_assertions(detail_value)
             stage = Stage.CLEANUP
@@ -410,67 +417,126 @@ def _finish(
     only ever additional information, never a replacement."""
     finished_at = _utc_now_iso()
 
+    # Task 15 Task 11 corrective v5, Section 5: ONE outer sanitized
+    # FINALIZE boundary covers proof building, metadata building,
+    # candidate assembly, and validate_for_pass -- every one of the
+    # injection points this corrective's exception matrix requires
+    # (Section 15.2), not merely the render/secret-scan/publish steps
+    # already covered below by publish_evidence()'s own broad `except
+    # Exception`. `evidence` stays None if candidate assembly itself
+    # never completed; the fallback immediately below then builds a
+    # minimal-but-honest record from only the pieces already known safe
+    # BEFORE this boundary, so a genuine internal FINALIZE bug can never
+    # escape as a raw, unclassified traceback.
     finalization_failure = None
+    evidence = None
     try:
-        proofs = build_typed_proofs(*detail_values.values())
-    except InvalidProofError as exc:
-        proofs = {}
-        finalization_failure = _sanitize_exception(exc, "finalize_proofs", "CLEANUP_FAILURE", secrets)
+        # Proof building keeps its own narrower InvalidProofError
+        # handling (Section 18.1) so a malformed scenario-returned proof
+        # value still yields a FULL candidate (proofs={}, everything
+        # else populated) rather than falling all the way through to
+        # the minimal fallback below.
+        try:
+            proofs = build_typed_proofs(*detail_values.values())
+        except InvalidProofError as exc:
+            proofs = {}
+            finalization_failure = _sanitize_exception(exc, "finalize_proofs", "CLEANUP_FAILURE", secrets)
 
-    if finalization_failure is not None and overall == "PASS":
-        overall = "CLEANUP_FAILURE"
+        # Predicted True whenever publication will actually be attempted
+        # -- corrected back to False below if that attempt fails. This
+        # value must be decided BEFORE the evidence is rendered/
+        # published, since the persisted JSON/Markdown pair has to agree
+        # with what is actually on disk the moment it is written
+        # (Section 12: JSON and Markdown parity extends to matching
+        # their own retained state).
+        retention = {
+            "keep_on_failure_requested": keep_on_failure,
+            "execution_resources_retained": False,
+            "sanitized_debug_bundle_retained": evidence_dir is not None,
+        }
 
-    # Predicted True whenever publication will actually be attempted --
-    # corrected back to False below if that attempt fails. This value
-    # must be decided BEFORE the evidence is rendered/published, since
-    # the persisted JSON/Markdown pair has to agree with what is
-    # actually on disk the moment it is written (Section 12: JSON and
-    # Markdown parity extends to matching their own retained state).
-    retention = {
-        "keep_on_failure_requested": keep_on_failure,
-        "execution_resources_retained": False,
-        "sanitized_debug_bundle_retained": evidence_dir is not None,
-    }
+        evidence = ReleaseEvidence(
+            schema_version=SCHEMA_VERSION,
+            run={
+                "run_id": run_id,
+                "git_sha": git_sha,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "authority": authority.__dict__,
+            },
+            environment=_environment_metadata(db_admin),
+            profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
+            validation=validation,
+            scenarios={result.name: result.__dict__ for result in scenario_results},
+            proofs=proofs,
+            retention=retention,
+            primary_failure=primary_failure.to_dict() if primary_failure is not None else None,
+            cleanup_failure=cleanup_failure.to_dict() if cleanup_failure is not None else None,
+            finalization_failure=None,
+            cleanup_status=cleanup_status,
+            overall=overall,
+            exit_code=EXIT_CODE[overall],
+        )
 
-    evidence = ReleaseEvidence(
-        schema_version=SCHEMA_VERSION,
-        run={
-            "run_id": run_id,
-            "git_sha": git_sha,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "authority": authority.__dict__,
-        },
-        environment=_environment_metadata(db_admin),
-        profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
-        validation=validation,
-        scenarios={result.name: result.__dict__ for result in scenario_results},
-        proofs=proofs,
-        retention=retention,
-        primary_failure=primary_failure.to_dict() if primary_failure is not None else None,
-        cleanup_failure=cleanup_failure.to_dict() if cleanup_failure is not None else None,
-        finalization_failure=finalization_failure.to_dict() if finalization_failure is not None else None,
-        cleanup_status=cleanup_status,
-        overall=overall,
-        exit_code=EXIT_CODE[overall],
-    )
+        # Section 3: PASS is not a default state -- the ONLY way
+        # `overall` may remain "PASS" past this point is if the real,
+        # hardcoded evidence.validate_for_pass() actually certifies this
+        # exact candidate. Only consulted when nothing else has already
+        # failed the run, so it can only ever GATE a would-be PASS,
+        # never override an already-worse primary/cleanup failure.
+        if finalization_failure is None and evidence.overall == "PASS":
+            decision = validate_for_pass(evidence)
+            if not decision.eligible:
+                safe_message = secrets.redact_text("; ".join(decision.reasons))
+                finalization_failure = FailureRecord(
+                    category="CLEANUP_FAILURE",
+                    stage="finalize_pass_validation",
+                    code="EvidenceInvariantError",
+                    safe_message=safe_message,
+                )
+    except Exception as exc:  # noqa: BLE001 -- FINALIZE fail-safe boundary (Section 5): normalize ANY other
+        # unexpected failure while building or validating the candidate
+        # -- never let raw exception content escape uncaught. `evidence`
+        # is left as whatever it already was: None if this failed before
+        # candidate assembly completed (handled by the fallback below),
+        # or the already-assembled candidate if this failed later (e.g.
+        # during validate_for_pass), which is kept rather than discarded.
+        finalization_failure = _sanitize_exception(exc, "finalize_build_candidate", "CLEANUP_FAILURE", secrets)
 
-    # Section 3: PASS is not a default state -- the ONLY way `overall`
-    # may remain "PASS" past this point is if the real, hardcoded
-    # evidence.validate_for_pass() actually certifies this exact
-    # candidate. Only consulted when nothing else has already failed
-    # the run, so it can only ever GATE a would-be PASS, never override
-    # an already-worse primary/cleanup failure.
-    if evidence.overall == "PASS":
-        decision = validate_for_pass(evidence)
-        if not decision.eligible:
-            safe_message = secrets.redact_text("; ".join(decision.reasons))
-            evidence.finalization_failure = FailureRecord(
-                category="CLEANUP_FAILURE",
-                stage="finalize_pass_validation",
-                code="EvidenceInvariantError",
-                safe_message=safe_message,
-            ).to_dict()
+    if evidence is None:
+        # Candidate assembly itself never completed -- build a minimal,
+        # honest fallback record from only the pieces already known safe
+        # before entering the boundary above.
+        evidence = ReleaseEvidence(
+            schema_version=SCHEMA_VERSION,
+            run={
+                "run_id": run_id,
+                "git_sha": git_sha,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "authority": authority.__dict__,
+            },
+            environment={},
+            profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
+            validation=validation,
+            scenarios={result.name: result.__dict__ for result in scenario_results},
+            proofs={},
+            retention={
+                "keep_on_failure_requested": keep_on_failure,
+                "execution_resources_retained": False,
+                "sanitized_debug_bundle_retained": False,
+            },
+            primary_failure=primary_failure.to_dict() if primary_failure is not None else None,
+            cleanup_failure=cleanup_failure.to_dict() if cleanup_failure is not None else None,
+            finalization_failure=None,
+            cleanup_status=cleanup_status,
+            overall=overall,
+            exit_code=EXIT_CODE[overall],
+        )
+
+    if finalization_failure is not None:
+        evidence.finalization_failure = finalization_failure.to_dict()
+        if evidence.overall == "PASS":
             evidence.overall = "CLEANUP_FAILURE"
             evidence.exit_code = EXIT_CODE["CLEANUP_FAILURE"]
 
@@ -659,7 +725,10 @@ def run_release_gate(
             shutil.rmtree(tmp_root_path)
         except FileNotFoundError:
             pass
-        except OSError as exc:
+        # Task 15 Task 11 corrective v5, Section 7: audited cleanup
+        # covers ordinary Exception -- OSError, RuntimeError, TypeError
+        # alike -- not merely OSError.
+        except (OSError, RuntimeError, TypeError) as exc:
             cleanup_records.append(
                 _sanitize_exception(exc, "outer_temp_root_cleanup", "CLEANUP_FAILURE", secrets)
             )

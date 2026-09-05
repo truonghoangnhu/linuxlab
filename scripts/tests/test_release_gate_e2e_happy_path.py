@@ -12,8 +12,27 @@ Central's real /api/v1/sync/events/ -- no Django test-client
 substitute for the release scenario, no browser automation.
 """
 
+import inspect
+
 from scripts.release_gate import scenarios
 from scripts.release_gate.e2e_support import dual_deployment
+
+
+def test_run_happy_path_proof_values_are_measured_not_hardcoded():
+    """Task 15 Task 11 corrective v5, Section 8: happy-path proof values
+    (signature_verified, outbox_to_inbox) must be built from variables
+    that measure real observed facts earlier in the function, never
+    returned as hardcoded literals -- otherwise Python's -O optimized
+    mode (which strips every `assert` statement entirely) could let a
+    genuinely failed observation still be reported as successful in
+    release evidence. Mirrors the exact measured-variable pattern
+    already used by run_n3_ack_lost_real_proxy()'s own
+    `duplicate_idempotent`/`final_node_state` (see scenarios.py)."""
+    source = inspect.getsource(scenarios.run_happy_path)
+    assert '"signature_verified": True' not in source
+    assert '"inbox_count": 1,' not in source
+    assert '"node_state": "DELIVERED",' not in source
+    assert '"duplicate_idempotent": True,' not in source
 
 
 def test_real_dual_deployment_happy_path(tmp_path):

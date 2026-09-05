@@ -22,7 +22,16 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# Task 15 Task 11 corrective v5, Section 3: `\Z` (true end of string),
+# never `$` -- Python's `$` also matches immediately BEFORE a single
+# trailing "\n", so a `$`-anchored pattern would wrongly accept a
+# well-formed digest followed by a trailing newline as "whole string
+# valid". `\Z` has no such exception.
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+_ISO8601_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})\Z"
+)
 _VALID_DELIVERY_STATES = ("PENDING", "DELIVERED")
 _OUTBOX_TO_INBOX_REQUIRED_KEYS = frozenset({"event_uuid", "inbox_count", "node_state", "duplicate_idempotent"})
 
@@ -560,6 +569,22 @@ class PassDecision:
     reasons: tuple
 
 
+def _is_valid_iso8601_timestamp(value) -> bool:
+    """Task 15 Task 11 corrective v5, Section 3: a strict STRING in the
+    approved ISO-8601 format -- never a bool/int/None (a naive `not
+    value` truthy check would wrongly admit `True`), and never an
+    arbitrary or malformed string silently accepted/repaired."""
+    return type(value) is str and bool(_ISO8601_TIMESTAMP_RE.match(value))
+
+
+def _is_valid_required_string(value) -> bool:
+    """Task 15 Task 11 corrective v5, Section 3: a strict non-empty,
+    non-"unknown" STRING -- `type(value) is str` first, so a bool (a
+    subclass of int, never of str) or int can never satisfy this merely
+    by being truthy."""
+    return type(value) is str and value != "" and value != "unknown"
+
+
 def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> None:
     if candidate.schema_version != SCHEMA_VERSION:
         reasons.append("schema_version_mismatch")
@@ -567,15 +592,19 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
     if not run.get("run_id") or run.get("run_id") == "unknown":
         reasons.append("run_id_missing")
     git_sha = run.get("git_sha")
-    # Task 15 Task 11 corrective v4, Section 10: "exact valid git SHA
-    # representation used by this codebase" -- not merely non-empty.
-    # environment.resolve_git_sha() always returns exactly 40 lowercase
-    # hex characters (a real `git rev-parse HEAD`); anything else is
-    # not a valid SHA this codebase could have actually produced.
-    if type(git_sha) is not str or not re.match(r"^[0-9a-f]{40}$", git_sha):
+    # Task 15 Task 11 corrective v4, Section 10 (hardened by corrective
+    # v5, Section 3): "exact valid git SHA representation used by this
+    # codebase" -- not merely non-empty, and not merely `$`-anchored
+    # (which would admit a trailing newline). environment.resolve_git_
+    # sha() always returns exactly 40 lowercase hex characters (a real
+    # `git rev-parse HEAD`); anything else is not a valid SHA this
+    # codebase could have actually produced.
+    if type(git_sha) is not str or not _GIT_SHA_RE.match(git_sha):
         reasons.append("git_sha_missing_or_malformed")
-    if not run.get("started_at") or not run.get("finished_at"):
-        reasons.append("timestamps_missing")
+    if not _is_valid_iso8601_timestamp(run.get("started_at")):
+        reasons.append("started_at_missing_or_malformed")
+    if not _is_valid_iso8601_timestamp(run.get("finished_at")):
+        reasons.append("finished_at_missing_or_malformed")
 
     authority = run.get("authority")
     if not isinstance(authority, dict) or "authoritative" not in authority or "platform" not in authority:
@@ -590,12 +619,12 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
         reasons.append("authority_missing")
 
     environment = candidate.environment or {}
-    for key in ("python_version", "django_version", "postgres_version"):
-        if not environment.get(key) or environment.get(key) == "unknown":
+    for key in ("platform", "python_version", "django_version", "postgres_version"):
+        if not _is_valid_required_string(environment.get(key)):
             reasons.append(f"environment_{key}_unknown")
 
     profiles = candidate.profiles or {}
-    if not profiles.get("central") or not profiles.get("node"):
+    if not _is_valid_required_string(profiles.get("central")) or not _is_valid_required_string(profiles.get("node")):
         reasons.append("profiles_missing")
 
 
@@ -790,7 +819,13 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
             shutil.rmtree(staging_dir)
         except FileNotFoundError:
             pass
-        except OSError:
+        # Task 15 Task 11 corrective v5, Section 7: audited cleanup
+        # covers ordinary Exception -- OSError, RuntimeError, TypeError
+        # alike -- not merely OSError. A narrower catch here would let a
+        # RuntimeError/TypeError raised while removing the staging
+        # directory escape uncaught instead of becoming a recorded
+        # StagingCleanupError.
+        except (OSError, RuntimeError, TypeError):
             raise StagingCleanupError(
                 "evidence staging directory cleanup failed after a publication failure"
             ) from original_exc

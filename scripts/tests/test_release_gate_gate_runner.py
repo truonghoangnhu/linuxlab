@@ -296,6 +296,35 @@ def test_startup_failure_before_any_scenario_body_runs_is_exit_3(tmp_path):
     assert entered_body == [], "scenario body must never run when setup itself fails"
 
 
+def test_post_enter_pre_body_failure_is_startup_failure_exit_3(tmp_path):
+    """Task 15 Task 11 corrective v5, Section 6: STARTUP includes
+    deployment context entry, secret registration, and scenario argument
+    preparation -- all post-enter setup BEFORE the scenario callable
+    itself runs. `stage` must not advance to SCENARIO merely because the
+    `with dual_deployment_factory(...)` block was entered; a failure in
+    the post-enter setup that follows (here, _register_deployment_
+    secrets()) must still classify as STARTUP_FAILURE/exit 3, never
+    SCENARIO_FAILURE/exit 4."""
+    entered_body = []
+
+    def scenario(deployment):
+        entered_body.append(True)
+        return {}
+
+    with patch.object(
+        gate_runner,
+        "_register_deployment_secrets",
+        side_effect=RuntimeError("simulated post-enter setup failure"),
+    ):
+        result = _run(
+            repo_root=tmp_path,
+            scenario_specs=(("fake_post_enter_fail", scenario),),
+        )
+    assert result.overall == "STARTUP_FAILURE"
+    assert result.exit_code == 3
+    assert entered_body == [], "scenario body must never run when post-enter setup fails"
+
+
 def test_cleanup_only_failure_is_exit_5(tmp_path):
     result = _run(
         repo_root=tmp_path,
@@ -752,6 +781,89 @@ def test_finalization_failure_never_overrides_an_existing_worse_primary_failure(
     assert result.evidence.finalization_failure["code"] == "InvalidProofError"
 
 
+# --- Task 15 Task 11 corrective v5, Section 5: FINALIZE is a single
+# fail-safe boundary -- proof building, metadata building, candidate
+# assembly, and validate_for_pass must ALL be covered, not merely the
+# render/secret-scan/publish steps that already flow through
+# publish_evidence()'s own broad `except Exception`. Each injection
+# point below must produce a non-zero exit, a safe finalization_failure
+# record, and never leak the injected exception's own message text
+# (which stands in for raw traceback/sentinel content) into evidence.
+
+
+_FINALIZE_SENTINEL = "sentinel-finalize-internal-detail-8f2c"
+
+
+def test_finalize_proof_building_unexpected_exception_is_cleanup_failure_exit_5(tmp_path):
+    with patch.object(gate_runner, "build_typed_proofs", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "RuntimeError"
+    assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
+
+
+def test_finalize_metadata_building_unexpected_exception_is_cleanup_failure_exit_5(tmp_path):
+    with patch.object(gate_runner, "_environment_metadata", side_effect=TypeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "TypeError"
+    assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
+
+
+def test_finalize_candidate_assembly_unexpected_exception_is_cleanup_failure_exit_5(tmp_path):
+    """The FIRST ReleaseEvidence(...) call (the real candidate build)
+    fails; the fallback build inside _finish() calls ReleaseEvidence(...)
+    again to construct its minimal-but-honest record, which must still
+    succeed -- so only the first call is made to fail here, exactly like
+    this file's other flaky-first-call cleanup fixtures."""
+    from scripts.release_gate.evidence import ReleaseEvidence as RealReleaseEvidence
+
+    calls = {"n": 0}
+
+    def _flaky_release_evidence(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(_FINALIZE_SENTINEL)
+        return RealReleaseEvidence(*args, **kwargs)
+
+    with patch.object(gate_runner, "ReleaseEvidence", side_effect=_flaky_release_evidence):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence is not None
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "RuntimeError"
+    assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
+
+
+def test_finalize_validate_for_pass_unexpected_exception_is_cleanup_failure_exit_5(tmp_path):
+    """Only a genuinely PASS-worthy candidate ever reaches the
+    validate_for_pass() call, so this uses the full real 7-scenario
+    PASS-worthy spec set to actually get there."""
+    with patch.object(gate_runner, "validate_for_pass", side_effect=TypeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path)
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.exit_code == 5
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "TypeError"
+    assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
+
+
+def test_finalize_unexpected_exception_never_overrides_an_existing_worse_primary_failure(tmp_path):
+    with patch.object(gate_runner, "build_typed_proofs", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_fail", _always_fail("simulated body failure")),))
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
+    assert result.evidence.primary_failure["category"] == "SCENARIO_FAILURE"
+    assert result.evidence.finalization_failure is not None
+    assert result.evidence.finalization_failure["code"] == "RuntimeError"
+    assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
+
+
 def test_malformed_assertion_value_fails_the_owning_scenario(tmp_path):
     """Section 8: an owning scenario that returns a malformed typed
     assertion value (here, a non-bool for a bool-typed assertion key)
@@ -854,6 +966,35 @@ def test_staging_cleanup_double_failure_splits_into_cleanup_and_finalization_fai
 
 
 # --- fail-closed cleanup (corrective v3, Section 20/21/28.5) --------------
+
+
+@pytest.mark.parametrize("cleanup_exc", [OSError, RuntimeError, TypeError])
+def test_outer_temp_root_cleanup_failure_for_any_ordinary_exception_prevents_pass(tmp_path, monkeypatch, cleanup_exc):
+    """Task 15 Task 11 corrective v5, Section 7: outer-root cleanup must
+    be audited for ordinary Exception -- OSError, RuntimeError, TypeError
+    alike -- not merely OSError. A narrower catch would let a
+    RuntimeError/TypeError raised while removing the run's own outer
+    temp root escape uncaught instead of becoming a recorded cleanup
+    failure."""
+    import scripts.release_gate.gate_runner as gate_runner_module
+
+    original_rmtree = gate_runner_module.shutil.rmtree
+    calls = {"n": 0}
+
+    def _flaky_rmtree(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise cleanup_exc("simulated outer temp root cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(gate_runner_module.shutil, "rmtree", _flaky_rmtree)
+
+    result = _run(repo_root=tmp_path)
+
+    assert result.overall != "PASS"
+    assert result.exit_code == 5
+    assert result.evidence.cleanup_status != "clean"
+    assert result.evidence.cleanup_failure is not None
 
 
 def test_outer_temp_root_cleanup_failure_prevents_pass_and_clean_status(tmp_path, monkeypatch):

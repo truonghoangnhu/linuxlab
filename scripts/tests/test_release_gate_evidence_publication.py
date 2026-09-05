@@ -153,6 +153,29 @@ def test_publish_evidence_raises_staging_cleanup_error_when_both_publication_and
     assert not evidence_dir.exists()
 
 
+@pytest.mark.parametrize("cleanup_exc", [OSError, RuntimeError, TypeError])
+def test_publish_evidence_raises_staging_cleanup_error_for_any_ordinary_cleanup_exception(tmp_path, cleanup_exc):
+    """Task 15 Task 11 corrective v5, Section 7: staging cleanup must be
+    audited for ordinary Exception, not merely OSError -- a RuntimeError
+    or TypeError raised while removing the staging directory after a
+    publication failure must still surface as StagingCleanupError with
+    the original publication failure preserved, never escape raw or be
+    silently swallowed."""
+    evidence_dir = tmp_path / "rpub00000001"
+
+    import scripts.release_gate.evidence as evidence_module
+
+    with (
+        patch.object(evidence_module, "_atomic_write_text", side_effect=RuntimeError("simulated write failure")),
+        patch.object(evidence_module.shutil, "rmtree", side_effect=cleanup_exc("simulated staging cleanup failure")),
+        pytest.raises(evidence_module.StagingCleanupError) as exc_info,
+    ):
+        publish_evidence(evidence_dir, _make_evidence(), SecretRegistry())
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert not evidence_dir.exists()
+
+
 def test_publish_evidence_leaves_no_partial_pair_when_atomic_rename_fails(tmp_path):
     evidence_dir = tmp_path / "rpub00000001"
 

@@ -232,14 +232,22 @@ def run_happy_path(deployment) -> dict:
 
     outbox_after = run_action(deployment.node_profile_env, "find-outbox-message", "--event-id", event_id)
     assert outbox_after["found"] is True
-    assert outbox_after["state"] == "delivered"
+    # Task 15 Task 11 corrective v5, Section 8: MEASURED from the real
+    # outbox row's own state, never a hard-coded "DELIVERED" literal --
+    # so this stays truthful even under Python's -O mode, where the
+    # `assert` just below disappears entirely.
+    observed_node_state = "DELIVERED" if outbox_after["state"] == "delivered" else outbox_after["state"].upper()
+    assert observed_node_state == "DELIVERED"
 
     inbox = run_action(deployment.central_profile_env, "find-inbox-message", "--event-id", event_id)
     assert inbox["found"] is True
     assert inbox["event_type"] == "activity.completed"
     assert inbox["aggregate_type"] == "attempt"
     assert inbox["aggregate_public_id"] == attempt_public_id
-    assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
+    observed_inbox_count = run_action(
+        deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id
+    )["count"]
+    assert observed_inbox_count == 1
 
     resend = run_action(
         deployment.node_profile_env,
@@ -252,8 +260,18 @@ def run_happy_path(deployment) -> dict:
         deployment.node_id,
         stdin_json={"secret": deployment.node_secret},
     )
-    assert resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
-    assert run_action(deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id)["count"] == 1
+    # MEASURED from the real resend result -- the retry-driven resend of
+    # an already-delivered event was recognized as the same event_id
+    # (status "duplicate"), not treated as a fresh delivery.
+    observed_duplicate_idempotent = resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
+    assert observed_duplicate_idempotent
+
+    # A successful import_and_activate() call earlier already performed
+    # the real Ed25519 signature verification (Task 11/12's verify_
+    # package() runs inside it) -- measured here as an explicit fact,
+    # not assumed.
+    observed_signature_verified = activated["state"] == "active"
+    assert observed_signature_verified
 
     # Typed scenario assertions (Task 11 corrective v4, Section 19: MEASURED
     # from the same already-fetched real facts above, never a hard-coded
@@ -290,21 +308,23 @@ def run_happy_path(deployment) -> dict:
         "max_score": submit_body["max_score"],
         "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
         "public_key_fingerprint": _public_key_fingerprint(deployment),
-        # A successful import_and_activate() call above already IS the
-        # real Ed25519 signature verification (Task 11/12's
-        # verify_package() runs inside it) -- recorded here as an
-        # explicit proof fact rather than left implicit.
-        "signature_verified": True,
+        # Task 15 Task 11 corrective v5, Section 8: MEASURED values
+        # (observed_signature_verified/observed_inbox_count/observed_
+        # node_state/observed_duplicate_idempotent, computed above from
+        # real facts), never hard-coded literals -- so evidence stays
+        # truthful even under Python's -O mode, where every `assert`
+        # above disappears entirely.
+        "signature_verified": observed_signature_verified,
         # The delivered-Outbox / found-Inbox / exactly-one-Inbox-row /
-        # resend-is-duplicate sequence already asserted above IS the
+        # resend-is-duplicate sequence already measured above IS the
         # real Outbox->Inbox delivery proof for this run -- reported as
         # a typed structure (Task 11 corrective v2, Section 7.3), never
         # a bare "delivered" string.
         "outbox_to_inbox": {
             "event_uuid": event_id,
-            "inbox_count": 1,
-            "node_state": "DELIVERED",
-            "duplicate_idempotent": True,
+            "inbox_count": observed_inbox_count,
+            "node_state": observed_node_state,
+            "duplicate_idempotent": observed_duplicate_idempotent,
         },
         "package_installed_and_activated": package_installed_and_activated,
         "result_matches_installed_artifact": result_matches_installed_artifact,

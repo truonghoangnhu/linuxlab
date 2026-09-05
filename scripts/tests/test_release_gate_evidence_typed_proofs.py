@@ -42,6 +42,14 @@ def test_validate_sha256_hex_accepts_a_well_formed_digest():
         None,
         12345,
         {"nested": "dict"},
+        # Task 15 Task 11 corrective v5, Section 3: a trailing newline/space
+        # must never be accepted by a "whole string" hex-digest check. A
+        # permissive `$`-anchored regex (which matches BEFORE a trailing
+        # newline in Python, not only at the true end of string) would
+        # wrongly admit these.
+        "a" * 64 + "\n",
+        "a" * 64 + " ",
+        "a" * 64 + "\r\n",
     ],
 )
 def test_validate_sha256_hex_rejects_malformed_values(bad_value):
