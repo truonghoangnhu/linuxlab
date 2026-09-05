@@ -144,3 +144,31 @@ def test_cli_prints_only_sanitized_terminal_failure_fields(monkeypatch, capsys):
     assert "terminal failure: CLEANUP_FAILURE at finalize (RuntimeError)" in output
     assert sentinel not in output
     assert "Traceback" not in output
+
+
+def test_cli_final_containment_when_run_release_gate_itself_raises(monkeypatch, capsys):
+    """Task 15 Task 11 corrective v7, Section 9: run_release_gate() is
+    designed to never raise (it has its own outer terminal fail-safe),
+    but the shipped CLI provides ONE MORE fixed-literal safety boundary
+    beyond that, in case it somehow does anyway. Must print only a fixed
+    safe message -- never `str(exc)`/`repr(exc)`/a traceback/any sentinel
+    the raised exception happened to carry -- and return a deterministic
+    non-zero exit code."""
+    import scripts.release_gate.gate_runner as gate_runner_module
+    from scripts.phase1_release_gate import main
+
+    sentinel = "sentinel-should-never-reach-cli-output-9f1c"
+
+    def _raises(**kwargs):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(gate_runner_module, "run_release_gate", _raises)
+
+    exit_code = main([])
+
+    assert exit_code == 5
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert sentinel not in output
+    assert "Traceback" not in output
+    assert "RuntimeError" not in output

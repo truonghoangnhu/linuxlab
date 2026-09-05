@@ -32,7 +32,7 @@ import pytest
 
 from scripts.release_gate import gate_runner
 from scripts.release_gate.cleanup import CleanupAggregateError
-from scripts.release_gate.environment import GateEnvironment, PreflightError
+from scripts.release_gate.environment import Authority, GateEnvironment, PreflightError
 from scripts.release_gate.evidence import REQUIRED_SCENARIO_ASSERTIONS, REQUIRED_SCENARIOS
 from scripts.release_gate.processes import StartupError
 
@@ -774,13 +774,41 @@ def test_real_retained_database_makes_execution_resources_retained_true(tmp_path
     assert result.evidence.retention["execution_resources_retained"] is True
 
 
-def test_workspace_cleanup_failure_also_makes_execution_resources_retained_true(tmp_path):
+def test_workspace_cleanup_failure_reconciled_by_later_successful_outer_cleanup(tmp_path):
+    """Task 15 Task 11 corrective v7, Section 15: a scenario's OWN
+    workspace-removal cleanup failing is not the last word -- the run's
+    own outer-root removal (which succeeds here, and which recursively
+    contains every scenario's workspace) definitely also removes that
+    exact directory. Final retention truth must reflect that real end
+    state, not the earlier, now-stale cleanup failure."""
     result = _run(
         repo_root=tmp_path,
         dual_deployment_factory=_make_factory(
             raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
         ),
     )
+    assert result.evidence.cleanup_status == "failed", "the historical cleanup failure is still recorded"
+    assert result.evidence.retention["execution_resources_retained"] is False
+
+
+def test_workspace_still_retained_when_outer_cleanup_also_fails(tmp_path, monkeypatch):
+    """The converse: if the run's own outer-root removal ALSO fails (so
+    there is no later successful cleanup to reconcile against), the
+    workspace genuinely remains retained."""
+    import scripts.release_gate.gate_runner as gate_runner_module
+
+    def _always_fails(path, *args, **kwargs):
+        raise OSError("simulated outer cleanup failure")
+
+    monkeypatch.setattr(gate_runner_module.shutil, "rmtree", _always_fails)
+
+    result = _run(
+        repo_root=tmp_path,
+        dual_deployment_factory=_make_factory(
+            raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
+        ),
+    )
+    assert result.evidence.cleanup_status == "failed"
     assert result.evidence.retention["execution_resources_retained"] is True
 
 
@@ -1207,3 +1235,123 @@ def test_gate_runner_never_shells_out_to_git_tag_commit_or_push():
     source = inspect.getsource(gate_runner)
     for forbidden in ("git tag", "git commit", "git push", '"tag"', "'tag'"):
         assert forbidden not in source
+
+
+# --- Task 15 Task 11 corrective v7, Section 18-20: publication is
+# PHYSICALLY mandatory for PASS -- an otherwise fully well-formed,
+# PASS-worthy candidate must still not become PASS/0 when there is no
+# valid publication destination. Exercised by calling _finalize()
+# directly (via the public _safe_finalize() wrapper) since
+# run_release_gate()'s own normal path always supplies a real
+# evidence_dir; this is the only way to construct the "no destination"
+# case the spec requires.
+
+
+def _pass_worthy_scenario_results_and_details():
+    scenario_results = []
+    detail_values = {}
+    for name in REQUIRED_SCENARIOS:
+        assertions = _pass_worthy_assertions_for(name)
+        detail = dict(assertions)
+        if name == "happy_path":
+            detail.update(_PASS_WORTHY_PROOFS_DETAIL)
+        scenario_results.append(
+            gate_runner.ScenarioResult(name=name, status="PASS", assertions=assertions, duration_ms=1.0, detail="")
+        )
+        detail_values[name] = detail
+    return scenario_results, detail_values
+
+
+def _finalize_kwargs_for_pass_worthy_candidate(*, evidence_dir):
+    import os
+
+    from scripts.release_gate.environment import DatabaseAdminConnection
+
+    scenario_results, detail_values = _pass_worthy_scenario_results_and_details()
+    return {
+        "run_id": "rfaketest0001",
+        "git_sha": _FAKE_VALID_GIT_SHA,
+        "started_at": gate_runner._utc_now_iso(),
+        "authority": Authority(authoritative=False, platform="darwin", reason="development_only_platform"),
+        "scenario_results": scenario_results,
+        "detail_values": detail_values,
+        "validation": dict(_OK_VALIDATION),
+        "secrets": gate_runner.SecretRegistry(),
+        "evidence_dir": evidence_dir,
+        "keep_on_failure": False,
+        # Real, working local-dev credentials -- _finalize() genuinely
+        # connects to resolve environment.postgres_version, and
+        # validate_for_pass() refuses PASS when that comes back
+        # "unknown".
+        "db_admin": DatabaseAdminConnection(
+            host=os.environ.get("POSTGRES_HOST", "127.0.0.1"),
+            port=os.environ.get("POSTGRES_PORT", "5432"),
+            user=os.environ.get("POSTGRES_USER", "linuxlab"),
+            password=os.environ.get("POSTGRES_PASSWORD", ""),
+        ),
+    }
+
+
+def test_no_publication_destination_prohibits_pass(tmp_path):
+    """An otherwise fully PASS-worthy candidate must NOT become PASS/0
+    when there is no publication destination -- publication is
+    physically mandatory for PASS, not merely validation success."""
+    state = gate_runner.RunState()
+    result = gate_runner._safe_finalize(
+        state=state, **_finalize_kwargs_for_pass_worthy_candidate(evidence_dir=None)
+    )
+    assert result.overall != "PASS"
+    assert result.exit_code != 0
+    assert state.publication_outcome != gate_runner.PublicationOutcome.PUBLISHED
+    assert result.evidence.retention["sanitized_debug_bundle_retained"] is False
+
+
+def test_same_candidate_with_a_real_destination_does_reach_pass(tmp_path):
+    """Converse of the above: the exact same candidate DOES reach PASS/0
+    once a real, writable publication destination is supplied and
+    publication actually succeeds -- proving the prohibition above is
+    about publication, not some other defect in the fixture."""
+    evidence_dir = tmp_path / "artifacts" / "rfaketest0001"
+    state = gate_runner.RunState()
+    result = gate_runner._safe_finalize(
+        state=state, **_finalize_kwargs_for_pass_worthy_candidate(evidence_dir=evidence_dir)
+    )
+    assert result.overall == "PASS"
+    assert result.exit_code == 0
+    assert state.publication_outcome == gate_runner.PublicationOutcome.PUBLISHED
+    assert result.evidence.retention["sanitized_debug_bundle_retained"] is True
+
+
+# --- Task 15 Task 11 corrective v7, Section 5/15: literal, observable
+# lifecycle stage transitions -- FINALIZE and DONE must be real
+# transitions on the ONE shared RunState, not stale/decorative values.
+
+
+def test_finalize_and_done_are_observed_on_the_shared_run_state(tmp_path):
+    state = gate_runner.RunState()
+    assert state.stage == gate_runner.Stage.PRECHECK
+
+    result = gate_runner._safe_finalize(
+        state=state, **_finalize_kwargs_for_pass_worthy_candidate(evidence_dir=tmp_path / "evidence")
+    )
+
+    assert state.stage == gate_runner.Stage.DONE
+    assert result.stage == gate_runner.Stage.DONE
+
+
+def test_scenario_stage_transitions_are_written_onto_the_shared_run_state(tmp_path):
+    """STARTUP/SCENARIO/CLEANUP transitions during a scenario's own
+    execution must land on the SAME RunState the rest of the run
+    shares -- never a locally-shadowed variable that leaves `state`
+    stale during that time."""
+    state = gate_runner.RunState()
+    observed_stage_during_body = []
+
+    def scenario(deployment):
+        observed_stage_during_body.append(state.stage)
+        return {}
+
+    gate_runner._run_one_scenario(
+        state, "router0001", "fake_scenario", scenario, tmp_path, _make_factory(), gate_runner.SecretRegistry()
+    )
+    assert observed_stage_during_body == [gate_runner.Stage.SCENARIO]

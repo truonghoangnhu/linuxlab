@@ -28,6 +28,19 @@ def test_validate_sha256_hex_accepts_a_well_formed_digest():
     assert validate_sha256_hex(VALID_SHA256, field_name="package_sha256") == VALID_SHA256
 
 
+def test_validate_sha256_hex_rejects_a_str_subclass():
+    """Task 15 Task 11 corrective v7, Section 23/24: canonical string
+    fields use `type(value) is str`, never `isinstance`, so a str
+    SUBCLASS is rejected even though `isinstance(value, str)` would be
+    True for it."""
+
+    class _SneakyStr(str):
+        pass
+
+    with pytest.raises(InvalidProofError):
+        validate_sha256_hex(_SneakyStr(VALID_SHA256), field_name="package_sha256")
+
+
 @pytest.mark.parametrize(
     "bad_value",
     [

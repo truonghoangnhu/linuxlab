@@ -30,6 +30,16 @@ SCHEMA_VERSION = 1
 # valid". `\Z` has no such exception.
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+# Task 15 Task 11 corrective v7, Section 25: layer 1 of timestamp
+# validation -- a strict, `\Z`-anchored structural match (date, time,
+# optional fractional seconds, and either "Z" or a signed HH:MM offset)
+# that also captures the offset's hour/minute digits so layer 2 can
+# range-check them explicitly (datetime.fromisoformat() alone silently
+# normalizes an out-of-range offset minute instead of rejecting it).
+_TIMESTAMP_STRUCTURE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?P<tz>Z|(?P<tz_sign>[+-])(?P<tz_hour>\d{2}):(?P<tz_minute>\d{2}))\Z"
+)
 _VALID_DELIVERY_STATES = ("PENDING", "DELIVERED")
 _OUTBOX_TO_INBOX_REQUIRED_KEYS = frozenset({"event_uuid", "inbox_count", "node_state", "duplicate_idempotent"})
 
@@ -49,8 +59,14 @@ class InvalidProofError(Exception):
 def validate_sha256_hex(value, *, field_name: str) -> str:
     """Sha256Hex (Section 7.1): exactly 64 lowercase hexadecimal
     characters. Applies to package_sha256, payload_sha256, and
-    public_key_fingerprint."""
-    if not isinstance(value, str) or not _SHA256_HEX_RE.match(value):
+    public_key_fingerprint.
+
+    Task 15 Task 11 corrective v7, Section 23/24: `type(value) is str`,
+    never `isinstance` -- a str SUBCLASS could carry hidden/overridden
+    behavior (e.g. an overridden `__eq__`/`__hash__`, or lazily-computed
+    content) while still comparing equal to a well-formed digest; exact
+    type matching rejects it regardless."""
+    if type(value) is not str or not _SHA256_HEX_RE.match(value):
         raise InvalidProofError(
             f"{field_name} must be a 64-character lowercase hexadecimal sha256 digest"
         )
@@ -91,7 +107,9 @@ class OutboxInboxProof:
             raise InvalidProofError("OutboxInboxProof.event_uuid must be a valid UUID") from exc
         if not isinstance(self.inbox_count, int) or isinstance(self.inbox_count, bool) or self.inbox_count < 0:
             raise InvalidProofError("OutboxInboxProof.inbox_count must be a non-negative int")
-        if not isinstance(self.node_state, str) or self.node_state not in _VALID_DELIVERY_STATES:
+        # Task 15 Task 11 corrective v7, Section 23/24: exact `type(x) is
+        # str`, never `isinstance`, for canonical strings.
+        if type(self.node_state) is not str or self.node_state not in _VALID_DELIVERY_STATES:
             raise InvalidProofError(
                 f"OutboxInboxProof.node_state must be one of {_VALID_DELIVERY_STATES}"
             )
@@ -149,7 +167,9 @@ def _validate_nonneg_int_assertion(value, key: str) -> int:
 
 
 def _validate_delivery_state_assertion(value, key: str) -> str:
-    if not isinstance(value, str) or value not in _VALID_DELIVERY_STATES:
+    # Task 15 Task 11 corrective v7, Section 23/24: exact `type(x) is
+    # str`, never `isinstance`, for canonical strings.
+    if type(value) is not str or value not in _VALID_DELIVERY_STATES:
         raise InvalidProofError(f"assertion {key!r} must be one of {_VALID_DELIVERY_STATES}")
     return value
 
@@ -568,16 +588,37 @@ class PassDecision:
 
 
 def _is_valid_iso8601_timestamp(value) -> bool:
-    """Task 15 Task 11 corrective v6, Section 7: SEMANTIC datetime
-    parsing, not a format-only regex -- a regex that only checks digit
-    counts and separators would still accept a calendar-impossible value
-    like "2026-02-30T00:00:00+00:00" (no such day) or an out-of-range
-    offset like "+24:00". `datetime.fromisoformat()` validates real
-    calendar/clock/offset semantics. Also requires the result to be
-    timezone-AWARE -- a parseable but naive timestamp (no offset/`Z`) is
-    still rejected, per the spec's "timezone-aware ISO-8601 datetimes"."""
+    """Task 15 Task 11 corrective v6/v7, Section 7/25: three independent
+    layers, ALL of which must pass:
+
+    1. strict full-string structural match (`_TIMESTAMP_STRUCTURE_RE`,
+       `\\Z`-anchored -- rejects a trailing newline/junk, and rejects
+       anything that isn't exactly date/time/offset shaped);
+    2. explicit timezone-offset-component RANGE validation (0-59 for
+       the minute component) -- `datetime.fromisoformat()` alone is
+       NOT sufficient here: it silently NORMALIZES an out-of-range
+       offset minute like "+00:99" into a different, validly-formed
+       offset ("+01:39") instead of raising, so a value that layer 1's
+       structural match accepts could still carry a bogus offset that
+       only an explicit range check catches;
+    3. semantic datetime parsing (`datetime.fromisoformat()`) -- catches
+       calendar-impossible values (e.g. "2026-02-30", hour 25) that a
+       format-only regex would wrongly accept, and confirms the result
+       is timezone-AWARE (a parseable but naive timestamp, with no
+       offset/`Z`, is still rejected)."""
     if type(value) is not str:
         return False
+
+    match = _TIMESTAMP_STRUCTURE_RE.match(value)
+    if match is None:
+        return False
+
+    if match.group("tz") != "Z":
+        offset_hour = int(match.group("tz_hour"))
+        offset_minute = int(match.group("tz_minute"))
+        if not (0 <= offset_hour <= 23) or not (0 <= offset_minute <= 59):
+            return False
+
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:

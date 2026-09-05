@@ -93,7 +93,22 @@ def main(argv=None) -> int:
     _setup_django()
     from scripts.release_gate.gate_runner import run_release_gate
 
-    result = run_release_gate(repo_root=_REPO_ROOT, keep_on_failure=args.keep_on_failure)
+    # Task 15 Task 11 corrective v7, Section 9: run_release_gate() is
+    # designed to never raise -- it has its own outer terminal fail-safe
+    # (scripts/release_gate/gate_runner.py) -- but the shipped CLI adds
+    # ONE MORE fixed-literal safety boundary beyond that, in case it
+    # somehow does anyway. This is a last-resort containment boundary,
+    # not normal control flow: no `str(exc)`/`repr(exc)`, no traceback,
+    # no sentinel echo -- a single fixed message and a deterministic
+    # exit code.
+    try:
+        result = run_release_gate(repo_root=_REPO_ROOT, keep_on_failure=args.keep_on_failure)
+    except Exception:  # noqa: BLE001 -- last-resort CLI containment, never silently dropped, never raw
+        print(
+            "phase1_release_gate: an unexpected internal failure occurred (exit 5)",
+            file=sys.stderr,
+        )
+        return 5
 
     print(f"phase1_release_gate: {result.overall} (exit {result.exit_code})")
     if result.evidence is not None:

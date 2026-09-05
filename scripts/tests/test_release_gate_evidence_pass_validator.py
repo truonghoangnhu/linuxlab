@@ -590,3 +590,58 @@ def test_accepts_candidate_with_z_suffix_timestamp():
     run["started_at"] = "2026-09-04T00:00:00Z"
     decision = validate_for_pass(_make_candidate(run=run))
     assert decision.eligible is True
+
+
+# --- Task 15 Task 11 corrective v7, Section 25: an offset-MINUTE value
+# outside 00-59 must be rejected -- Python's own datetime.fromisoformat()
+# silently normalizes "+00:99" into a different (but validly-formed)
+# offset ("+01:39") rather than raising, so semantic parsing ALONE is
+# insufficient; an explicit range check on the parsed components is
+# also required.
+
+
+def test_rejects_candidate_with_timezone_offset_minute_out_of_range():
+    run = dict(_make_candidate().run)
+    run["started_at"] = "2026-01-01T00:00:00+00:99"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_timezone_offset_hour_out_of_range():
+    run = dict(_make_candidate().run)
+    run["started_at"] = "2026-01-01T00:00:00+99:00"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v7, Section 23/24: canonical string
+# fields use `type(value) is str`, never `isinstance`, so a str
+# SUBCLASS (which could carry hidden/overridden behavior while still
+# comparing equal) is rejected even where it would otherwise satisfy a
+# permissive isinstance-based check.
+
+
+class _SneakyStr(str):
+    """A str subclass -- `isinstance(_SneakyStr(...), str)` is True, but
+    `type(_SneakyStr(...)) is str` is False."""
+
+
+def test_rejects_candidate_with_str_subclass_package_sha256():
+    proofs = dict(_GOOD_PROOFS)
+    proofs["package_sha256"] = _SneakyStr("a" * 64)
+    decision = validate_for_pass(_make_candidate(proofs=proofs))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_str_subclass_git_sha():
+    run = dict(_make_candidate().run)
+    run["git_sha"] = _SneakyStr("a" * 40)
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_str_subclass_run_id():
+    run = dict(_make_candidate().run)
+    run["run_id"] = _SneakyStr("rgoodrun00001")
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
