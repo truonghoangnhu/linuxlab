@@ -35,6 +35,54 @@ def test_run_happy_path_proof_values_are_measured_not_hardcoded():
     assert '"duplicate_idempotent": True,' not in source
 
 
+# --- Task 15 Task 11 corrective v6, Section 11: durable post-resend
+# Inbox measurement -- the idempotence proof must use the Inbox count
+# measured AFTER the resend/duplicate-delivery attempt, never only the
+# pre-resend count, so a hypothetical bug that let a "duplicate" resend
+# actually insert a second Inbox row is caught rather than silently
+# reported as idempotent. Tested directly as a pure function since
+# forcing this specific failure mode through the real dual-deployment
+# E2E path would require deliberately breaking production idempotency
+# handling.
+
+
+def test_measure_happy_path_idempotence_true_when_durable_state_unchanged():
+    assert scenarios._measure_happy_path_idempotence(
+        before_inbox_count=1, duplicate_response_observed=True, after_inbox_count=1
+    ) is True
+
+
+def test_measure_happy_path_idempotence_false_when_durable_inbox_mutates():
+    """A duplicate ACK that actually mutated durable Inbox state
+    (1 -> 2) must be measured as NOT idempotent -- PASS must be
+    impossible."""
+    assert scenarios._measure_happy_path_idempotence(
+        before_inbox_count=1, duplicate_response_observed=True, after_inbox_count=2
+    ) is False
+
+
+def test_measure_happy_path_idempotence_false_when_resend_not_recognized_as_duplicate():
+    assert scenarios._measure_happy_path_idempotence(
+        before_inbox_count=1, duplicate_response_observed=False, after_inbox_count=1
+    ) is False
+
+
+def test_measure_happy_path_idempotence_false_when_before_count_already_wrong():
+    assert scenarios._measure_happy_path_idempotence(
+        before_inbox_count=2, duplicate_response_observed=True, after_inbox_count=1
+    ) is False
+
+
+def test_run_happy_path_measures_inbox_count_after_resend():
+    """The final outbox_to_inbox proof's inbox_count must come from a
+    measurement taken AFTER the resend, never only the pre-resend
+    count."""
+    source = inspect.getsource(scenarios.run_happy_path)
+    assert "after_inbox_count" in source
+    assert "before_inbox_count" in source
+    assert '"inbox_count": after_inbox_count' in source
+
+
 def test_real_dual_deployment_happy_path(tmp_path):
     with dual_deployment(tmp_path) as deployment:
         detail = scenarios.run_happy_path(deployment)

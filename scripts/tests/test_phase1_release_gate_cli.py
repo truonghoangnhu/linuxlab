@@ -106,3 +106,41 @@ def test_cli_rejects_dirty_working_tree_with_exit_2_and_no_git_side_effects(tmp_
     ).stdout
     assert after_head == before_head, "the CLI must never create a commit"
     assert after_tags == before_tags, "the CLI must never create a tag"
+
+
+def test_cli_prints_only_sanitized_terminal_failure_fields(monkeypatch, capsys):
+    """Task 15 Task 11 corrective v6, Section 5/15: when run_release_gate()
+    returns the last-resort terminal fail-safe result (evidence=None,
+    terminal_failure populated), the shipped CLI must still print only
+    the already-sanitized category/stage/code/safe_message fields --
+    never a raw exception message, `str(exc)`/`repr(exc)`, or a
+    traceback -- and must never crash trying to read evidence.* fields
+    that do not exist on this result."""
+    import scripts.release_gate.gate_runner as gate_runner_module
+    from scripts.phase1_release_gate import main
+
+    sentinel = "sentinel-should-never-reach-cli-output-7d2a"
+    fake_result = gate_runner_module.GateRunResult(
+        overall="CLEANUP_FAILURE",
+        exit_code=5,
+        evidence=None,
+        evidence_dir=None,
+        json_path=None,
+        markdown_path=None,
+        terminal_failure={
+            "category": "CLEANUP_FAILURE",
+            "stage": "finalize",
+            "code": "RuntimeError",
+            "safe_message": "RuntimeError raised during finalize",
+        },
+    )
+    monkeypatch.setattr(gate_runner_module, "run_release_gate", lambda **kwargs: fake_result)
+
+    exit_code = main([])
+
+    assert exit_code == 5
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "terminal failure: CLEANUP_FAILURE at finalize (RuntimeError)" in output
+    assert sentinel not in output
+    assert "Traceback" not in output

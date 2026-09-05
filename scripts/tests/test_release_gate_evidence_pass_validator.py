@@ -514,3 +514,79 @@ def test_rejects_candidate_with_malformed_node_profile(bad_value):
     profiles = {"central": "linuxlab.settings.central", "node": bad_value}
     decision = validate_for_pass(_make_candidate(profiles=profiles))
     assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v6, Section 7: stricter scalar identity
+# checks -- schema_version/run_id/authority.platform must reject a bool
+# substitute, since `True == 1` and `not True` is falsy, so naive
+# equality/truthy checks would wrongly admit `True`.
+
+
+def test_rejects_candidate_with_schema_version_true():
+    """`True == 1` in Python, so a naive `!=` comparison against
+    SCHEMA_VERSION (1) would wrongly accept the bool True as a valid
+    schema_version."""
+    decision = validate_for_pass(_make_candidate(schema_version=True))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "unknown"])
+def test_rejects_candidate_with_malformed_run_id(bad_value):
+    run = dict(_make_candidate().run)
+    run["run_id"] = bad_value
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 12345, None, ""])
+def test_rejects_candidate_with_malformed_authority_platform(bad_value):
+    """authority.platform must be validated as a strict non-empty string
+    in its own right, not merely inferred from the authoritative/reason
+    branches -- e.g. a non-authoritative candidate with
+    authority.platform=True and a correct `reason` must still be
+    rejected."""
+    run = dict(_make_candidate().run)
+    run["authority"] = {"authoritative": False, "platform": bad_value, "reason": "development_only_platform"}
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+# --- Task 15 Task 11 corrective v6, Section 7: semantic (not
+# format-only-regex) ISO-8601 timestamp validation -- must reject
+# calendar-impossible dates/times and out-of-range UTC offsets that a
+# format-only regex would wrongly accept.
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "2026-02-30T00:00:00+00:00",  # February 30th does not exist
+        "2026-01-01T25:00:00+00:00",  # hour 25 is impossible
+        "2026-01-01T00:61:00+00:00",  # minute 61 is impossible
+        "2026-01-01T00:00:00+24:00",  # +24:00 offset is out of range
+        "2026-13-01T00:00:00+00:00",  # month 13 does not exist
+    ],
+)
+def test_rejects_candidate_with_calendar_impossible_started_at(bad_value):
+    run = dict(_make_candidate().run)
+    run["started_at"] = bad_value
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_rejects_candidate_with_timezone_naive_started_at():
+    """A parseable but timezone-NAIVE timestamp must still be rejected --
+    the spec requires timezone-aware ISO-8601 datetimes."""
+    run = dict(_make_candidate().run)
+    run["started_at"] = "2026-09-04T00:00:00"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is False
+
+
+def test_accepts_candidate_with_z_suffix_timestamp():
+    """A "Z"-suffixed (Zulu/UTC) timestamp is valid, timezone-aware
+    ISO-8601 and must be accepted."""
+    run = dict(_make_candidate().run)
+    run["started_at"] = "2026-09-04T00:00:00Z"
+    decision = validate_for_pass(_make_candidate(run=run))
+    assert decision.eligible is True

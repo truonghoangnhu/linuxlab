@@ -153,14 +153,24 @@ def test_publish_evidence_raises_staging_cleanup_error_when_both_publication_and
     assert not evidence_dir.exists()
 
 
-@pytest.mark.parametrize("cleanup_exc", [OSError, RuntimeError, TypeError])
+class _CustomStagingCleanupTestError(Exception):
+    """Task 15 Task 11 corrective v6, Section 10: cleanup coverage must
+    be ordinary `Exception`, not a hard-coded tuple of specific classes
+    -- an arbitrary custom Exception subclass must still be caught."""
+
+
+@pytest.mark.parametrize(
+    "cleanup_exc", [OSError, RuntimeError, TypeError, ValueError, _CustomStagingCleanupTestError]
+)
 def test_publish_evidence_raises_staging_cleanup_error_for_any_ordinary_cleanup_exception(tmp_path, cleanup_exc):
-    """Task 15 Task 11 corrective v5, Section 7: staging cleanup must be
-    audited for ordinary Exception, not merely OSError -- a RuntimeError
-    or TypeError raised while removing the staging directory after a
-    publication failure must still surface as StagingCleanupError with
-    the original publication failure preserved, never escape raw or be
-    silently swallowed."""
+    """Task 15 Task 11 corrective v5/v6, Section 7/10: staging cleanup
+    must be audited for ordinary Exception -- OSError, RuntimeError,
+    TypeError, ValueError, and an arbitrary custom Exception subclass
+    alike -- not merely OSError, and not a hard-coded tuple of specific
+    classes. Raised while removing the staging directory after a
+    publication failure, it must still surface as StagingCleanupError
+    with the original publication failure preserved, never escape raw or
+    be silently swallowed."""
     evidence_dir = tmp_path / "rpub00000001"
 
     import scripts.release_gate.evidence as evidence_module

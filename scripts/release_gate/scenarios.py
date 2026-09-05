@@ -27,6 +27,7 @@ import pytest
 
 from linuxlab.publication.package import SIGNATURE_MEMBER
 from scripts.release_gate import http_bridge
+from scripts.release_gate.cleanup import run_cleanup_actions
 from scripts.release_gate.database import (
     create_database,
     drop_database,
@@ -130,6 +131,20 @@ def _submit_a_real_attempt(deployment, authored):
 
 
 # --- Happy path (Task 8) -----------------------------------------------------
+
+
+def _measure_happy_path_idempotence(
+    *, before_inbox_count: int, duplicate_response_observed: bool, after_inbox_count: int
+) -> bool:
+    """Task 15 Task 11 corrective v6, Section 11: durable idempotence
+    proof. True only if the resend was recognized as a duplicate AND
+    durable Central Inbox state never actually changed across it (the
+    count measured before the resend equals the count measured AFTER
+    it, and both equal 1) -- never merely the pre-resend count. A
+    hypothetical bug that let a "duplicate" resend actually insert a
+    second Inbox row (before=1, after=2) must be measured as NOT
+    idempotent rather than silently reported as successful."""
+    return duplicate_response_observed and before_inbox_count == 1 and after_inbox_count == 1
 
 
 def run_happy_path(deployment) -> dict:
@@ -244,10 +259,13 @@ def run_happy_path(deployment) -> dict:
     assert inbox["event_type"] == "activity.completed"
     assert inbox["aggregate_type"] == "attempt"
     assert inbox["aggregate_public_id"] == attempt_public_id
-    observed_inbox_count = run_action(
+    # Task 15 Task 11 corrective v6, Section 11: measured BEFORE the
+    # resend -- the durable idempotence proof below also requires the
+    # count measured AFTER the resend, never only this pre-resend value.
+    before_inbox_count = run_action(
         deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id
     )["count"]
-    assert observed_inbox_count == 1
+    assert before_inbox_count == 1
 
     resend = run_action(
         deployment.node_profile_env,
@@ -263,7 +281,21 @@ def run_happy_path(deployment) -> dict:
     # MEASURED from the real resend result -- the retry-driven resend of
     # an already-delivered event was recognized as the same event_id
     # (status "duplicate"), not treated as a fresh delivery.
-    observed_duplicate_idempotent = resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
+    duplicate_response_observed = resend["results"] == [{"event_id": event_id, "status": "duplicate", "code": ""}]
+
+    # Task 15 Task 11 corrective v6, Section 11: the DURABLE Central
+    # Inbox state measured AFTER the resend -- this, not
+    # before_inbox_count, is what the final proof reports. A resend
+    # that the response claims was "duplicate" but that actually
+    # mutated durable state (before=1, after=2) must still be caught.
+    after_inbox_count = run_action(
+        deployment.central_profile_env, "count-inbox-messages", "--event-id", event_id
+    )["count"]
+    observed_duplicate_idempotent = _measure_happy_path_idempotence(
+        before_inbox_count=before_inbox_count,
+        duplicate_response_observed=duplicate_response_observed,
+        after_inbox_count=after_inbox_count,
+    )
     assert observed_duplicate_idempotent
 
     # A successful import_and_activate() call earlier already performed
@@ -308,12 +340,12 @@ def run_happy_path(deployment) -> dict:
         "max_score": submit_body["max_score"],
         "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
         "public_key_fingerprint": _public_key_fingerprint(deployment),
-        # Task 15 Task 11 corrective v5, Section 8: MEASURED values
-        # (observed_signature_verified/observed_inbox_count/observed_
-        # node_state/observed_duplicate_idempotent, computed above from
-        # real facts), never hard-coded literals -- so evidence stays
-        # truthful even under Python's -O mode, where every `assert`
-        # above disappears entirely.
+        # Task 15 Task 11 corrective v5/v6, Section 8/11: MEASURED
+        # values (observed_signature_verified/after_inbox_count/
+        # observed_node_state/observed_duplicate_idempotent, computed
+        # above from real facts), never hard-coded literals -- so
+        # evidence stays truthful even under Python's -O mode, where
+        # every `assert` above disappears entirely.
         "signature_verified": observed_signature_verified,
         # The delivered-Outbox / found-Inbox / exactly-one-Inbox-row /
         # resend-is-duplicate sequence already measured above IS the
@@ -322,7 +354,9 @@ def run_happy_path(deployment) -> dict:
         # a bare "delivered" string.
         "outbox_to_inbox": {
             "event_uuid": event_id,
-            "inbox_count": observed_inbox_count,
+            # Task 15 Task 11 corrective v6, Section 11: the DURABLE
+            # post-resend count, never the pre-resend one.
+            "inbox_count": after_inbox_count,
             "node_state": observed_node_state,
             "duplicate_idempotent": observed_duplicate_idempotent,
         },
@@ -956,8 +990,23 @@ def run_backup_restore_smoke(deployment) -> dict:
             (second_attempt_public_id, second_outbox),
         )
     finally:
-        drop_database(deployment.db_admin, deployment.gate_names, "restore_node")
-        drop_database(deployment.db_admin, deployment.gate_names, "restore_central")
+        # Task 15 Task 11 corrective v6, Section 9/10: both drops are
+        # ALWAYS attempted, even if the first raises -- the same
+        # invariant already enforced for dual_deployment()'s own
+        # central/node database cleanup (restore_node cleanup failing
+        # must never skip restore_central cleanup, and vice versa).
+        run_cleanup_actions(
+            [
+                (
+                    "drop_restore_node_database",
+                    lambda: drop_database(deployment.db_admin, deployment.gate_names, "restore_node"),
+                ),
+                (
+                    "drop_restore_central_database",
+                    lambda: drop_database(deployment.db_admin, deployment.gate_names, "restore_central"),
+                ),
+            ]
+        )
 
     return {
         "first_attempt_public_id": first_attempt_public_id,

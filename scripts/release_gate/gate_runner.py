@@ -82,6 +82,7 @@ import django
 import psycopg
 
 from scripts.release_gate import scenarios as scenario_module
+from scripts.release_gate.cleanup import CleanupAggregateError
 from scripts.release_gate.e2e_support import dual_deployment as real_dual_deployment
 from scripts.release_gate.environment import (
     GateEnvironment,
@@ -126,8 +127,55 @@ class Stage:
 
 
 # Worst-first. Used to fold each scenario's own category into one
-# overall run classification -- see module docstring.
-_SEVERITY = {"PASS": 0, "CLEANUP_FAILURE": 1, "SCENARIO_FAILURE": 2, "STARTUP_FAILURE": 3}
+# overall run classification -- see module docstring. "UNDECIDED"
+# (Task 15 Task 11 corrective v6, Section 3: "there is no initial/
+# fallback PASS") is the run's OWN starting placeholder, ranked
+# alongside PASS -- nothing has failed yet, but it is not yet a real,
+# certified PASS either; only evidence.validate_for_pass() may ever
+# turn it into the literal "PASS" string (see _finish()).
+_SEVERITY = {"UNDECIDED": 0, "PASS": 0, "CLEANUP_FAILURE": 1, "SCENARIO_FAILURE": 2, "STARTUP_FAILURE": 3}
+
+# Task 15 Task 11 corrective v6, Section 3: a GATE_RUNNER-internal-only
+# accommodation for the transient "UNDECIDED" placeholder value _finish()
+# may still be holding at the point an interim ReleaseEvidence candidate
+# is first constructed (always resolved to a real category -- "PASS" or
+# a failure -- before _finish() ever returns). Deliberately NOT added to
+# evidence.EXIT_CODE itself, which remains exactly the public,
+# documented PASS/PRECHECK/STARTUP/SCENARIO/CLEANUP exit-code contract
+# (design spec Section 18).
+_INTERIM_EXIT_CODE = {**EXIT_CODE, "UNDECIDED": EXIT_CODE["PASS"]}
+
+# Task 15 Task 11 corrective v6, Section 9: maps each dual_deployment()-
+# owned cleanup action's own fixed, safe name (scripts/release_gate/
+# e2e_support.py's cleanup_actions list) to the resource-ownership-
+# ledger category it corresponds to. A process (stop_node_process/
+# stop_central_process) is not one of the tracked execution-resource
+# categories -- only data/artifact-bearing resources are. Every
+# generated release artifact (keys, `.llpkg`, dumps, logs) lives inside
+# the workspace directory, so "remove_workspace" alone covers all of
+# them (e2e_support.dual_deployment()'s own docstring).
+_CLEANUP_ACTION_TO_RESOURCE = {
+    "remove_workspace": "workspace",
+    "drop_node_database": "node_db",
+    "drop_central_database": "central_db",
+}
+
+
+def _resource_keys_from_cleanup_exception(exc: BaseException) -> frozenset:
+    """Task 15 Task 11 corrective v6, Section 9: extracts WHICH specific
+    execution resources remain owned (not yet verifiably cleaned up)
+    from a cleanup failure -- used only to ENRICH the resource-ownership
+    ledger once a failure has already been classified as a cleanup
+    failure via `stage` (never used to determine cleanup-ness itself,
+    per Section 6.4). `CleanupAggregateError.failures` names are already
+    fixed, safe action identifiers (never raw exception content), so
+    reading them here carries no new leak risk."""
+    if isinstance(exc, CleanupAggregateError):
+        return frozenset(
+            _CLEANUP_ACTION_TO_RESOURCE[name] for name, _ in exc.failures if name in _CLEANUP_ACTION_TO_RESOURCE
+        )
+    return frozenset()
+
 
 # Short, DB-identifier-safe codes for deriving each scenario's own CHILD
 # run_id from the outer RunContext's run_id (Section 4: "the same
@@ -161,6 +209,22 @@ class GateRunResult:
     evidence_dir: Path | None
     json_path: Path | None
     markdown_path: Path | None
+    # Task 15 Task 11 corrective v6, Section 5/14: populated ONLY by the
+    # last-resort terminal fail-safe (_terminal_fallback_result() below),
+    # when _finish() itself raised -- a safe FailureRecord.to_dict()
+    # describing that failure, since `evidence` (and therefore
+    # `evidence.finalization_failure`) is unavailable in that case. None
+    # on every ordinary path, where the usual evidence.*_failure fields
+    # already carry this information.
+    terminal_failure: dict | None = None
+    # Task 15 Task 11 corrective v6, Section 4/15: the final lifecycle
+    # stage this run actually reached -- an OBSERVABLE proof that
+    # FINALIZE and DONE are real transitions, not merely declared Stage
+    # values nothing ever sets. Always Stage.DONE once a terminal
+    # decision has been safely determined, on every path (PASS, any
+    # ordinary failure category, or the last-resort terminal fail-safe
+    # alike) -- there is no other value a caller ever observes.
+    stage: str = Stage.DONE
 
 
 def _utc_now_iso() -> str:
@@ -202,9 +266,13 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
     CHILD run_id derived from `outer_run_id` (Section 4: traceable
     identity, never an unrelated random one). Returns (ScenarioResult,
     category_or_None, primary_FailureRecord_or_None,
-    cleanup_FailureRecord_or_None, detail_value_or_None). `category` is
-    None on success, else one of "STARTUP_FAILURE"/"SCENARIO_FAILURE"/
-    "CLEANUP_FAILURE".
+    cleanup_FailureRecord_or_None, detail_value_or_None,
+    owned_resources_frozenset). `category` is None on success, else one
+    of "STARTUP_FAILURE"/"SCENARIO_FAILURE"/"CLEANUP_FAILURE".
+    `owned_resources_frozenset` (Task 15 Task 11 corrective v6, Section
+    9) names which execution-resource-ledger categories this scenario's
+    OWN dual_deployment() cleanup failed to verifiably release --
+    always empty unless a cleanup failure actually occurred.
 
     Explicit stage tracking (Section 5/16, hardened by corrective v4
     Section 6.4): `stage` starts at Stage.STARTUP and is advanced to
@@ -266,8 +334,10 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
             None,
             None,
             detail_value,
+            frozenset(),
         )
 
+    owned_resources: frozenset = frozenset()
     if stage == Stage.CLEANUP:
         # Setup and the scenario body both fully succeeded -- whatever
         # this exception's actual class is, it can only have come from
@@ -275,6 +345,7 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
         cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
         category = "CLEANUP_FAILURE"
         record = cleanup_record
+        owned_resources = _resource_keys_from_cleanup_exception(outcome_exception)
     else:
         # Setup or the scenario body itself failed. If teardown ALSO
         # then failed while that original exception was unwinding,
@@ -284,6 +355,7 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
         if original_exception is not None:
             cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
             record = _sanitize_exception(original_exception, name, category, secrets)
+            owned_resources = _resource_keys_from_cleanup_exception(outcome_exception)
         else:
             cleanup_record = None
             record = _sanitize_exception(outcome_exception, name, category, secrets)
@@ -294,6 +366,7 @@ def _run_one_scenario(outer_run_id, name, scenario_func, scenario_tmp_dir, dual_
         record,
         cleanup_record,
         None,
+        owned_resources,
     )
 
 
@@ -390,15 +463,17 @@ def _finish(
     evidence_dir,
     keep_on_failure,
     db_admin=None,
+    owned_resources: frozenset = frozenset(),
 ) -> GateRunResult:
-    """Task 11 corrective v2/v3/v4, Section 13/16: the FINALIZE stage.
+    """Task 11 corrective v2/v3/v4/v6, Section 13/16: the FINALIZE stage.
     Typed proof/assertion construction happens here for proofs
     (assertions are already built per-scenario in _run_one_scenario --
     see that function's docstring for why); the canonical EvidenceV1
     candidate is built; then, ONLY if nothing has failed it so far
-    (`overall == "PASS"`), the AUTHORITATIVE `evidence.validate_for_
+    (`overall == "UNDECIDED"`), the AUTHORITATIVE `evidence.validate_for_
     pass()` is consulted as the single gate a candidate must clear to
-    be minted PASS (Section 3: "PASS is not a default state"). This is
+    be minted PASS (Section 3: "there is no initial/fallback PASS").
+    This is
     a direct, hardcoded call -- corrective v4, Section 3.1: production
     `run_release_gate()`/`_finish()` accept no injectable validator/
     callback/hook capable of deciding PASS eligibility; tests that need
@@ -451,7 +526,13 @@ def _finish(
         # their own retained state).
         retention = {
             "keep_on_failure_requested": keep_on_failure,
-            "execution_resources_retained": False,
+            # Task 15 Task 11 corrective v6, Section 9: DERIVED from the
+            # real resource-ownership ledger -- true iff at least one
+            # execution resource (a database, the workspace, the run's
+            # own outer temp root, the evidence staging directory) is
+            # not verifiably released, never an optimistic hardcoded
+            # value.
+            "execution_resources_retained": bool(owned_resources),
             "sanitized_debug_bundle_retained": evidence_dir is not None,
         }
 
@@ -475,18 +556,23 @@ def _finish(
             finalization_failure=None,
             cleanup_status=cleanup_status,
             overall=overall,
-            exit_code=EXIT_CODE[overall],
+            exit_code=_INTERIM_EXIT_CODE[overall],
         )
 
-        # Section 3: PASS is not a default state -- the ONLY way
-        # `overall` may remain "PASS" past this point is if the real,
-        # hardcoded evidence.validate_for_pass() actually certifies this
-        # exact candidate. Only consulted when nothing else has already
-        # failed the run, so it can only ever GATE a would-be PASS,
-        # never override an already-worse primary/cleanup failure.
-        if finalization_failure is None and evidence.overall == "PASS":
+        # Section 3: "there is no initial/fallback PASS" -- `evidence.
+        # overall` starts as "UNDECIDED" (or an already-known failure
+        # category) and the literal string "PASS" is assigned ONLY
+        # right here, ONLY if the real, hardcoded evidence.validate_for_
+        # pass() actually certifies this exact candidate. Only consulted
+        # when nothing else has already failed the run, so it can only
+        # ever GATE a would-be PASS, never override an already-worse
+        # primary/cleanup failure.
+        if finalization_failure is None and evidence.overall == "UNDECIDED":
             decision = validate_for_pass(evidence)
-            if not decision.eligible:
+            if decision.eligible:
+                evidence.overall = "PASS"
+                evidence.exit_code = EXIT_CODE["PASS"]
+            else:
                 safe_message = secrets.redact_text("; ".join(decision.reasons))
                 finalization_failure = FailureRecord(
                     category="CLEANUP_FAILURE",
@@ -523,7 +609,7 @@ def _finish(
             proofs={},
             retention={
                 "keep_on_failure_requested": keep_on_failure,
-                "execution_resources_retained": False,
+                "execution_resources_retained": bool(owned_resources),
                 "sanitized_debug_bundle_retained": False,
             },
             primary_failure=primary_failure.to_dict() if primary_failure is not None else None,
@@ -531,12 +617,12 @@ def _finish(
             finalization_failure=None,
             cleanup_status=cleanup_status,
             overall=overall,
-            exit_code=EXIT_CODE[overall],
+            exit_code=_INTERIM_EXIT_CODE[overall],
         )
 
     if finalization_failure is not None:
         evidence.finalization_failure = finalization_failure.to_dict()
-        if evidence.overall == "PASS":
+        if evidence.overall == "UNDECIDED":
             evidence.overall = "CLEANUP_FAILURE"
             evidence.exit_code = EXIT_CODE["CLEANUP_FAILURE"]
 
@@ -561,6 +647,11 @@ def _finish(
                         exc, "finalize_publish_staging_cleanup", "CLEANUP_FAILURE", secrets
                     ).to_dict()
                 evidence.cleanup_status = "failed"
+                # Task 15 Task 11 corrective v6, Section 9: the staging
+                # directory itself is now a genuinely un-released
+                # resource -- retention must say so, never leave the
+                # earlier (pre-publication-attempt) prediction standing.
+                evidence.retention["execution_resources_retained"] = True
                 original_exc = exc.__cause__
                 if original_exc is not None and evidence.finalization_failure is None:
                     evidence.finalization_failure = _sanitize_exception(
@@ -584,6 +675,49 @@ def _finish(
     )
 
 
+def _terminal_fallback_result(overall: str, exc: BaseException, secrets: SecretRegistry) -> GateRunResult:
+    """Task 15 Task 11 corrective v6, Section 5/14: the LAST-RESORT
+    fail-safe, used only when _finish() itself raises -- meaning a
+    PERSISTENT failure (one that recurs on every call, not just the
+    first) defeated even _finish()'s own internal fallback-evidence
+    construction (which also calls ReleaseEvidence()/_utc_now_iso()).
+    Deliberately touches none of EvidenceCandidate construction,
+    timestamp generation, rendering, secret-scanning, or publication --
+    only fixed-safe values and the one exception's TYPE NAME (never
+    `str(exc)`/`repr(exc)`/traceback), exactly like _sanitize_exception()
+    elsewhere. No retry, no recursive fallback construction: a single,
+    minimal, always-safe GateRunResult with evidence=None.
+
+    `overall` here is whatever category the run had already reached
+    BEFORE _finish() was invoked (Section 6: "earlier primary failure
+    keeps precedence") -- if that was already a real failure category,
+    it is preserved verbatim; only a would-be PASS falls back to
+    CLEANUP_FAILURE, since FINALIZE has no exit code of its own."""
+    record = _sanitize_exception(exc, "finalize", "CLEANUP_FAILURE", secrets)
+    fallback_overall = overall if overall in EXIT_CODE and overall != "PASS" else "CLEANUP_FAILURE"
+    return GateRunResult(
+        overall=fallback_overall,
+        exit_code=EXIT_CODE[fallback_overall],
+        evidence=None,
+        evidence_dir=None,
+        json_path=None,
+        markdown_path=None,
+        terminal_failure=record.to_dict(),
+    )
+
+
+def _safe_finish(*, overall, secrets, **finish_kwargs) -> GateRunResult:
+    """Task 15 Task 11 corrective v6, Section 5: the ONE outer terminal
+    fail-safe boundary, outside the normal FINALIZE pipeline -- every
+    call to _finish() goes through here so a persistent failure that
+    escapes _finish()'s own internal fail-safe boundary still cannot
+    reach the caller raw. Never catches BaseException."""
+    try:
+        return _finish(overall=overall, secrets=secrets, **finish_kwargs)
+    except Exception as exc:  # noqa: BLE001 -- last-resort terminal fail-safe, never silently dropped, never raw
+        return _terminal_fallback_result(overall, exc, secrets)
+
+
 def run_release_gate(
     *,
     repo_root,
@@ -595,6 +729,43 @@ def run_release_gate(
     run_validation=_run_validation_checks,
     tmp_root=None,
 ) -> GateRunResult:
+    """Task 15 Task 11 corrective v6, Section 5: the ONE outer terminal
+    fail-safe boundary for the top-level release-gate orchestration,
+    outside the normal FINALIZE pipeline -- a thin wrapper around
+    _run_release_gate(). Even a failure BEFORE any of that function's
+    own internal try/except blocks begin (e.g. `_utc_now_iso()` itself
+    raising while computing `started_at`, the very first thing it does)
+    is still caught here rather than propagating raw. Never catches
+    BaseException."""
+    secrets = SecretRegistry()
+    try:
+        return _run_release_gate(
+            repo_root=repo_root,
+            keep_on_failure=keep_on_failure,
+            check_platform=check_platform,
+            scenario_specs=scenario_specs,
+            dual_deployment_factory=dual_deployment_factory,
+            environment_builder=environment_builder,
+            run_validation=run_validation,
+            tmp_root=tmp_root,
+            secrets=secrets,
+        )
+    except Exception as exc:  # noqa: BLE001 -- outermost terminal fail-safe, never silently dropped, never raw
+        return _terminal_fallback_result("UNDECIDED", exc, secrets)
+
+
+def _run_release_gate(
+    *,
+    repo_root,
+    keep_on_failure: bool,
+    check_platform: bool,
+    scenario_specs,
+    dual_deployment_factory,
+    environment_builder,
+    run_validation,
+    tmp_root,
+    secrets: SecretRegistry,
+) -> GateRunResult:
     """Runs the full release gate: preflight -> validation checks ->
     every scenario in `scenario_specs` (each in its own fresh
     dual_deployment() using a run_id DERIVED from the one RunContext
@@ -602,11 +773,12 @@ def run_release_gate(
     all of them, and never an unrelated random identity either) ->
     evidence assembly -> returns the result.
 
-    Outermost fail-safe boundary (Section 9/16): this function never
-    raises for ANY failure, expected or not. Every stage is wrapped so
+    Fail-safe boundary (Section 9/16): every stage below is wrapped so
     an unanticipated exception is still classified by the stage it
     occurred in and still produces sanitized evidence when that remains
-    possible, rather than propagating a raw traceback to the caller.
+    possible, rather than propagating a raw traceback to the caller --
+    and run_release_gate() above adds one more outer boundary for
+    whatever might escape even this.
 
     Authority (Section 10) is computed from the ACTUAL running platform
     unconditionally, independent of `check_platform` -- a Darwin
@@ -615,7 +787,6 @@ def run_release_gate(
     non-authoritative."""
     repo_root = Path(repo_root)
     started_at = _utc_now_iso()
-    secrets = SecretRegistry()
     authority = compute_authority(platform_name=platform.system())
     stage = Stage.PRECHECK
 
@@ -628,7 +799,7 @@ def run_release_gate(
         env: GateEnvironment = environment_builder(repo_root=repo_root, keep_on_failure=keep_on_failure)
     except Exception as exc:  # noqa: BLE001 -- classified below, never silently dropped, never raw
         record = _sanitize_exception(exc, "preflight", "PRECHECK_FAILURE", secrets)
-        return _finish(
+        return _safe_finish(
             run_id="unknown",
             git_sha="unknown",
             started_at=started_at,
@@ -659,7 +830,7 @@ def run_release_gate(
             raise PreflightError("validation checks did not pass (see validation section for status)")
     except Exception as exc:  # noqa: BLE001 -- classified below, never silently dropped, never raw
         record = _sanitize_exception(exc, stage, "PRECHECK_FAILURE", secrets)
-        return _finish(
+        return _safe_finish(
             run_id=env.run_id,
             git_sha=env.git_sha,
             started_at=started_at,
@@ -684,7 +855,20 @@ def run_release_gate(
     # whose OWN category matches the worst `overall` category observed
     # -- never a mismatched reconstruction.
     failure_records: list = []
-    overall = "PASS"
+    # Task 15 Task 11 corrective v6, Section 3: "there is no initial/
+    # fallback PASS" -- this run has not yet observed any failure, but
+    # it has also not yet been certified PASS by validate_for_pass()
+    # either (that happens only in _finish()). "UNDECIDED" is only ever
+    # upgraded to a real failure category below; only _finish() may ever
+    # turn it into the literal "PASS" string.
+    overall = "UNDECIDED"
+    # Task 15 Task 11 corrective v6, Section 9: the run-level resource-
+    # ownership ledger -- accumulates every execution-resource category
+    # (across every scenario, plus this run's own outer temp root/
+    # staging directory below) that a cleanup failure left NOT
+    # verifiably released. Retention evidence derives from this, never
+    # from an optimistic hardcoded value.
+    owned_resources: set = set()
 
     tmp_root_path = Path(
         tempfile.mkdtemp(prefix=f"phase1-release-{env.run_id}-", dir=str(tmp_root) if tmp_root is not None else None)
@@ -694,8 +878,8 @@ def run_release_gate(
             stage = name
             scenario_tmp_dir = tmp_root_path / name
             scenario_tmp_dir.mkdir(parents=True, exist_ok=True)
-            result, category, primary_record, cleanup_record, detail_value = _run_one_scenario(
-                env.run_id, name, scenario_func, scenario_tmp_dir, dual_deployment_factory, secrets
+            result, category, primary_record, cleanup_record, detail_value, scenario_owned_resources = (
+                _run_one_scenario(env.run_id, name, scenario_func, scenario_tmp_dir, dual_deployment_factory, secrets)
             )
             scenario_results.append(result)
             if detail_value:
@@ -706,6 +890,7 @@ def run_release_gate(
                     overall = category
             if cleanup_record is not None:
                 cleanup_records.append(cleanup_record)
+            owned_resources.update(scenario_owned_resources)
     except Exception as exc:  # noqa: BLE001 -- unexpected failure OUTSIDE any single scenario's own handling
         record = _sanitize_exception(exc, stage, "STARTUP_FAILURE", secrets)
         failure_records.append(record)
@@ -725,13 +910,15 @@ def run_release_gate(
             shutil.rmtree(tmp_root_path)
         except FileNotFoundError:
             pass
-        # Task 15 Task 11 corrective v5, Section 7: audited cleanup
-        # covers ordinary Exception -- OSError, RuntimeError, TypeError
-        # alike -- not merely OSError.
-        except (OSError, RuntimeError, TypeError) as exc:
+        # Task 15 Task 11 corrective v6, Section 10: audited cleanup
+        # covers ordinary Exception generically -- not a hard-coded
+        # tuple of specific classes -- so an unanticipated exception
+        # class can never escape uncaught. Never `except BaseException`.
+        except Exception as exc:  # noqa: BLE001 -- classified as a cleanup failure below, never silently dropped
             cleanup_records.append(
                 _sanitize_exception(exc, "outer_temp_root_cleanup", "CLEANUP_FAILURE", secrets)
             )
+            owned_resources.add("outer_root")
 
     # The primary_failure is the recorded FailureRecord whose OWN
     # category matches `overall` -- the worst one observed -- never an
@@ -748,10 +935,10 @@ def run_release_gate(
     cleanup_status = "clean"
     if cleanup_failure is not None:
         cleanup_status = "failed"
-        if overall == "PASS":
+        if overall == "UNDECIDED":
             overall = "CLEANUP_FAILURE"
 
-    return _finish(
+    return _safe_finish(
         run_id=env.run_id,
         git_sha=env.git_sha,
         started_at=started_at,
@@ -767,4 +954,5 @@ def run_release_gate(
         evidence_dir=env.artifact_dir,
         keep_on_failure=keep_on_failure,
         db_admin=env.db_admin,
+        owned_resources=owned_resources,
     )

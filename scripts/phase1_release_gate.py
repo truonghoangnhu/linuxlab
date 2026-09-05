@@ -121,6 +121,17 @@ def main(argv=None) -> int:
             f"non-authoritative run: {result.evidence.run['authority']['reason']}",
             file=sys.stderr,
         )
+    # Task 15 Task 11 corrective v6, Section 5/14: populated only by the
+    # last-resort terminal fail-safe (no evidence could be produced at
+    # all) -- still only the already-sanitized FailureRecord fields,
+    # never raw exception text or a traceback.
+    if result.terminal_failure is not None:
+        failure = result.terminal_failure
+        print(
+            f"terminal failure: {failure['category']} at {failure['stage']} "
+            f"({failure['code']}): {failure['safe_message']}",
+            file=sys.stderr,
+        )
 
     return result.exit_code
 

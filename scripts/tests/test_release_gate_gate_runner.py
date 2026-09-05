@@ -231,6 +231,20 @@ def test_happy_pass_is_exit_0(tmp_path):
     assert result.evidence.validation == _OK_VALIDATION
 
 
+def test_completed_run_reaches_observable_done_stage(tmp_path):
+    """Task 15 Task 11 corrective v6, Section 4/15: FINALIZE and DONE
+    must be real, observable transitions -- not merely declared Stage
+    values that nothing ever sets. Any run that reaches a terminal
+    decision (PASS or FAIL alike) must report stage == DONE."""
+    result = _run(repo_root=tmp_path)
+    assert result.stage == gate_runner.Stage.DONE
+
+
+def test_scenario_failure_run_also_reaches_observable_done_stage(tmp_path):
+    result = _run(repo_root=tmp_path, scenario_specs=(("fake_fail", _always_fail()),))
+    assert result.stage == gate_runner.Stage.DONE
+
+
 def test_preflight_refusal_is_exit_2(tmp_path):
     def _failing_builder(*, repo_root, keep_on_failure=False):
         raise PreflightError("simulated preflight refusal")
@@ -743,6 +757,49 @@ def test_evidence_never_carries_a_retained_resources_field_any_more(tmp_path):
     assert "retained_resources" not in doc
 
 
+# --- Task 15 Task 11 corrective v6, Section 9: retention is DERIVED from
+# a real resource-ownership ledger, never optimistically hardcoded --
+# when a database genuinely fails to drop, evidence must say so.
+
+
+def test_real_retained_database_makes_execution_resources_retained_true(tmp_path):
+    result = _run(
+        repo_root=tmp_path,
+        dual_deployment_factory=_make_factory(
+            raise_on_exit=CleanupAggregateError([("drop_node_database", RuntimeError("simulated leak"))])
+        ),
+    )
+    assert result.overall == "CLEANUP_FAILURE"
+    assert result.evidence.cleanup_status == "failed"
+    assert result.evidence.retention["execution_resources_retained"] is True
+
+
+def test_workspace_cleanup_failure_also_makes_execution_resources_retained_true(tmp_path):
+    result = _run(
+        repo_root=tmp_path,
+        dual_deployment_factory=_make_factory(
+            raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
+        ),
+    )
+    assert result.evidence.retention["execution_resources_retained"] is True
+
+
+def test_process_stop_failure_alone_does_not_claim_a_retained_execution_resource(tmp_path):
+    """Stopping a Gunicorn process failing is still a genuine cleanup
+    failure (cleanup_status stays failed), but a process is not one of
+    the tracked execution-resource ledger categories (central_db/
+    node_db/workspace/...) -- it must not be reported as a retained
+    resource on its own."""
+    result = _run(
+        repo_root=tmp_path,
+        dual_deployment_factory=_make_factory(
+            raise_on_exit=CleanupAggregateError([("stop_node_process", RuntimeError("simulated leak"))])
+        ),
+    )
+    assert result.evidence.cleanup_status == "failed"
+    assert result.evidence.retention["execution_resources_retained"] is False
+
+
 # --- explicit stage classification (corrective v2, Section 16) ------------
 
 
@@ -864,6 +921,45 @@ def test_finalize_unexpected_exception_never_overrides_an_existing_worse_primary
     assert _FINALIZE_SENTINEL not in json.dumps(result.evidence.to_dict())
 
 
+# --- Task 15 Task 11 corrective v6, Section 5/14: the outer terminal
+# fail-safe -- a PERSISTENT failure (one that keeps happening on every
+# call, not just the first) can defeat _finish()'s own internal
+# fallback-evidence construction too (that fallback ALSO calls
+# ReleaseEvidence(...)/_utc_now_iso()). Something outside the normal
+# FINALIZE pipeline must still produce a safe, non-zero, evidence-free
+# terminal result rather than let the exception escape raw.
+
+
+def test_persistent_candidate_constructor_failure_yields_safe_terminal_result(tmp_path):
+    with patch.object(gate_runner, "ReleaseEvidence", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall != "PASS"
+    assert result.exit_code != 0
+    assert result.evidence is None
+    assert result.evidence_dir is None
+    assert result.json_path is None
+    assert result.markdown_path is None
+
+
+def test_persistent_timestamp_generator_failure_yields_safe_terminal_result(tmp_path):
+    with patch.object(gate_runner, "_utc_now_iso", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall != "PASS"
+    assert result.exit_code != 0
+    assert result.evidence is None
+
+
+def test_persistent_finalize_failure_never_overrides_an_existing_worse_primary_failure(tmp_path):
+    """Even the last-resort terminal fail-safe must preserve failure
+    precedence -- a genuine scenario failure stays primary; FINALIZE
+    imploding entirely must not silently look like a lesser failure."""
+    with patch.object(gate_runner, "ReleaseEvidence", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_fail", _always_fail("simulated body failure")),))
+    assert result.overall == "SCENARIO_FAILURE"
+    assert result.exit_code == 4
+    assert result.evidence is None
+
+
 def test_malformed_assertion_value_fails_the_owning_scenario(tmp_path):
     """Section 8: an owning scenario that returns a malformed typed
     assertion value (here, a non-bool for a bool-typed assertion key)
@@ -968,14 +1064,22 @@ def test_staging_cleanup_double_failure_splits_into_cleanup_and_finalization_fai
 # --- fail-closed cleanup (corrective v3, Section 20/21/28.5) --------------
 
 
-@pytest.mark.parametrize("cleanup_exc", [OSError, RuntimeError, TypeError])
+class _CustomCleanupError(Exception):
+    """Task 15 Task 11 corrective v6, Section 10: cleanup coverage must
+    be ordinary `Exception`, not a hard-coded tuple of specific classes
+    -- an arbitrary custom Exception subclass neither this codebase nor
+    a hard-coded tuple would anticipate must still be caught."""
+
+
+@pytest.mark.parametrize("cleanup_exc", [OSError, RuntimeError, TypeError, ValueError, _CustomCleanupError])
 def test_outer_temp_root_cleanup_failure_for_any_ordinary_exception_prevents_pass(tmp_path, monkeypatch, cleanup_exc):
-    """Task 15 Task 11 corrective v5, Section 7: outer-root cleanup must
-    be audited for ordinary Exception -- OSError, RuntimeError, TypeError
-    alike -- not merely OSError. A narrower catch would let a
-    RuntimeError/TypeError raised while removing the run's own outer
-    temp root escape uncaught instead of becoming a recorded cleanup
-    failure."""
+    """Task 15 Task 11 corrective v5/v6, Section 7/10: outer-root cleanup
+    must be audited for ordinary Exception -- OSError, RuntimeError,
+    TypeError, ValueError, and an arbitrary custom Exception subclass
+    alike -- not merely OSError, and not a hard-coded tuple of specific
+    classes. A narrower catch would let an unanticipated exception class
+    raised while removing the run's own outer temp root escape uncaught
+    instead of becoming a recorded cleanup failure."""
     import scripts.release_gate.gate_runner as gate_runner_module
 
     original_rmtree = gate_runner_module.shutil.rmtree

@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import uuid as uuid_module
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -29,9 +30,6 @@ SCHEMA_VERSION = 1
 # valid". `\Z` has no such exception.
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
-_ISO8601_TIMESTAMP_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})\Z"
-)
 _VALID_DELIVERY_STATES = ("PENDING", "DELIVERED")
 _OUTBOX_TO_INBOX_REQUIRED_KEYS = frozenset({"event_uuid", "inbox_count", "node_state", "duplicate_idempotent"})
 
@@ -570,11 +568,21 @@ class PassDecision:
 
 
 def _is_valid_iso8601_timestamp(value) -> bool:
-    """Task 15 Task 11 corrective v5, Section 3: a strict STRING in the
-    approved ISO-8601 format -- never a bool/int/None (a naive `not
-    value` truthy check would wrongly admit `True`), and never an
-    arbitrary or malformed string silently accepted/repaired."""
-    return type(value) is str and bool(_ISO8601_TIMESTAMP_RE.match(value))
+    """Task 15 Task 11 corrective v6, Section 7: SEMANTIC datetime
+    parsing, not a format-only regex -- a regex that only checks digit
+    counts and separators would still accept a calendar-impossible value
+    like "2026-02-30T00:00:00+00:00" (no such day) or an out-of-range
+    offset like "+24:00". `datetime.fromisoformat()` validates real
+    calendar/clock/offset semantics. Also requires the result to be
+    timezone-AWARE -- a parseable but naive timestamp (no offset/`Z`) is
+    still rejected, per the spec's "timezone-aware ISO-8601 datetimes"."""
+    if type(value) is not str:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _is_valid_required_string(value) -> bool:
@@ -586,10 +594,14 @@ def _is_valid_required_string(value) -> bool:
 
 
 def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> None:
-    if candidate.schema_version != SCHEMA_VERSION:
+    # Task 15 Task 11 corrective v6, Section 7: `type(x) is int` first --
+    # `True == 1` in Python, so a bare `!=` comparison against
+    # SCHEMA_VERSION would wrongly accept the bool True (bool is an int
+    # subclass, but never `type(x) is int`).
+    if type(candidate.schema_version) is not int or candidate.schema_version != SCHEMA_VERSION:
         reasons.append("schema_version_mismatch")
     run = candidate.run or {}
-    if not run.get("run_id") or run.get("run_id") == "unknown":
+    if not _is_valid_required_string(run.get("run_id")):
         reasons.append("run_id_missing")
     git_sha = run.get("git_sha")
     # Task 15 Task 11 corrective v4, Section 10 (hardened by corrective
@@ -607,7 +619,17 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
         reasons.append("finished_at_missing_or_malformed")
 
     authority = run.get("authority")
-    if not isinstance(authority, dict) or "authoritative" not in authority or "platform" not in authority:
+    # Task 15 Task 11 corrective v6, Section 7: authority.platform is
+    # validated as a strict non-empty string in its own right here --
+    # never merely inferred from the authoritative/reason branches
+    # below, which would leave a non-string platform value (e.g. `True`)
+    # on the authoritative=False side undetected as long as `reason`
+    # happened to already be correct.
+    if (
+        not isinstance(authority, dict)
+        or "authoritative" not in authority
+        or not _is_valid_required_string(authority.get("platform"))
+    ):
         reasons.append("authority_missing")
     elif authority.get("authoritative") is True:
         if authority.get("platform") != "linux" or authority.get("reason") is not None:
@@ -819,13 +841,13 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
             shutil.rmtree(staging_dir)
         except FileNotFoundError:
             pass
-        # Task 15 Task 11 corrective v5, Section 7: audited cleanup
-        # covers ordinary Exception -- OSError, RuntimeError, TypeError
-        # alike -- not merely OSError. A narrower catch here would let a
-        # RuntimeError/TypeError raised while removing the staging
-        # directory escape uncaught instead of becoming a recorded
-        # StagingCleanupError.
-        except (OSError, RuntimeError, TypeError):
+        # Task 15 Task 11 corrective v6, Section 10: audited cleanup
+        # covers ordinary Exception generically -- not a hard-coded
+        # tuple of specific classes -- so an unanticipated exception
+        # class raised while removing the staging directory can never
+        # escape uncaught instead of becoming a recorded
+        # StagingCleanupError. Never `except BaseException`.
+        except Exception:  # noqa: BLE001 -- re-raised as StagingCleanupError immediately below, never dropped
             raise StagingCleanupError(
                 "evidence staging directory cleanup failed after a publication failure"
             ) from original_exc
