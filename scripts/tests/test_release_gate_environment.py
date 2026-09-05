@@ -19,6 +19,7 @@ from scripts.release_gate.environment import (
     assert_clean_working_tree,
     assert_keep_on_failure_allowed,
     assert_linux_platform,
+    assert_valid_git_sha,
     assert_valid_run_id,
     build_gate_environment,
     generate_run_id,
@@ -41,6 +42,20 @@ def test_generate_run_id_is_filesystem_and_db_name_safe():
 def test_assert_valid_run_id_rejects_unsafe_values(bad_id):
     with pytest.raises(PreflightError):
         assert_valid_run_id(bad_id)
+
+
+def test_assert_valid_run_id_rejects_a_str_subclass():
+    """Task 15 Task 11 corrective v8, Section 24: canonical run_id uses
+    `type(value) is str`, never `isinstance` -- a str SUBCLASS (which
+    could carry hidden/overridden behavior while still comparing equal
+    to a well-formed run_id) is rejected even though isinstance-based
+    checking would accept it."""
+
+    class _SneakyStr(str):
+        pass
+
+    with pytest.raises(PreflightError):
+        assert_valid_run_id(_SneakyStr(generate_run_id()))
 
 
 def test_generate_run_id_is_unique_across_calls():
@@ -104,6 +119,40 @@ def test_resolve_git_sha_returns_current_head(tmp_path):
 
     assert len(sha) == 40
     assert all(c in "0123456789abcdef" for c in sha)
+
+
+def test_assert_valid_git_sha_accepts_a_well_formed_sha():
+    assert_valid_git_sha("a" * 40)  # does not raise
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    [
+        "a" * 39,
+        "a" * 41,
+        "A" * 40,
+        "g" * 40,
+        "a" * 40 + "\n",
+        "",
+        None,
+        12345,
+    ],
+)
+def test_assert_valid_git_sha_rejects_malformed_values(bad_sha):
+    with pytest.raises(PreflightError):
+        assert_valid_git_sha(bad_sha)
+
+
+def test_assert_valid_git_sha_rejects_a_str_subclass():
+    """Task 15 Task 11 corrective v8, Section 24: `type(value) is str`,
+    never `isinstance` -- a str subclass is rejected even though it
+    would otherwise satisfy every other check."""
+
+    class _SneakyStr(str):
+        pass
+
+    with pytest.raises(PreflightError):
+        assert_valid_git_sha(_SneakyStr("a" * 40))
 
 
 def test_assert_clean_working_tree_passes_on_clean_repo(tmp_path):
@@ -171,6 +220,23 @@ def test_build_gate_environment_produces_run_identity(tmp_path):
     assert len(environment.git_sha) == 40
     assert environment.artifact_dir.name == environment.run_id
     assert "phase1-release" in str(environment.artifact_dir)
+
+
+def test_build_gate_environment_rejects_a_str_subclass_git_sha(tmp_path, monkeypatch):
+    """Task 15 Task 11 corrective v8, Section 24/25: the builder itself
+    must reject a str-subclass git_sha, not merely rely on the final
+    validate_for_pass() boundary elsewhere."""
+    import scripts.release_gate.environment as environment_module
+
+    class _SneakyStr(str):
+        pass
+
+    _init_git_repo(tmp_path)
+    real_sha = resolve_git_sha(tmp_path)
+    monkeypatch.setattr(environment_module, "resolve_git_sha", lambda repo_root=None: _SneakyStr(real_sha))
+
+    with pytest.raises(PreflightError):
+        build_gate_environment(repo_root=tmp_path, env={})
 
 
 def test_build_gate_environment_rejects_dirty_tree(tmp_path):

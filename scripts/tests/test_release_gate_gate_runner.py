@@ -734,6 +734,52 @@ def test_retention_records_the_flag_but_never_claims_execution_resources_retaine
     assert retention["sanitized_debug_bundle_retained"] is True
 
 
+# --- Task 15 Task 11 corrective v8, Section 6/21: persisted JSON/
+# Markdown failure evidence must agree with the RETURNED terminal truth
+# -- never mutate the evidence object after publish_evidence() has
+# already rendered/written it.
+
+
+def test_published_scenario_failure_json_agrees_with_returned_evidence(tmp_path):
+    """A scenario failure with a healthy publish must persist the exact
+    same terminal truth it returns -- in particular,
+    sanitized_debug_bundle_retained must be True in BOTH the persisted
+    JSON and the returned evidence, since publication genuinely
+    succeeded despite the run failing."""
+    result = _run(
+        repo_root=tmp_path,
+        scenario_specs=(("n2", _always_fail("simulated failure")),),
+    )
+    assert result.overall == "SCENARIO_FAILURE"
+    persisted = json.loads(result.json_path.read_text())
+    returned = result.evidence.to_dict()
+    assert persisted["retention"]["sanitized_debug_bundle_retained"] is True
+    assert persisted["retention"] == returned["retention"]
+    assert persisted["overall"] == returned["overall"]
+    assert persisted["exit_code"] == returned["exit_code"]
+    assert persisted["cleanup_status"] == returned["cleanup_status"]
+    assert persisted["primary_failure"] == returned["primary_failure"]
+    assert persisted["cleanup_failure"] == returned["cleanup_failure"]
+    assert persisted["finalization_failure"] == returned["finalization_failure"]
+
+
+def test_published_finalization_failure_json_agrees_with_returned_evidence(tmp_path):
+    """A finalization failure (proof-building raised) with a healthy
+    publish must also persist the exact same terminal truth it
+    returns."""
+    with patch.object(gate_runner, "build_typed_proofs", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
+        result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
+    assert result.overall == "CLEANUP_FAILURE"
+    persisted = json.loads(result.json_path.read_text())
+    returned = result.evidence.to_dict()
+    assert persisted["finalization_failure"] is not None
+    assert persisted["retention"]["sanitized_debug_bundle_retained"] is True
+    assert persisted["retention"] == returned["retention"]
+    assert persisted["finalization_failure"] == returned["finalization_failure"]
+    assert persisted["overall"] == returned["overall"]
+    assert persisted["exit_code"] == returned["exit_code"]
+
+
 def test_retention_reflects_false_when_not_requested(tmp_path):
     result = _run(
         repo_root=tmp_path,
@@ -1223,6 +1269,57 @@ def test_gate_runner_reaches_real_pass_when_the_real_validator_is_genuinely_sati
     result = _run(repo_root=tmp_path)
     assert result.overall == "PASS"
     assert result.exit_code == 0
+
+
+def test_successful_pass_builds_the_terminal_snapshot_exactly_once(tmp_path):
+    """Task 15 Task 11 corrective v8, Section 4/5: for a genuine,
+    successfully-published PASS, the terminal evidence snapshot that
+    gets rendered/published is never rebuilt afterward -- there is
+    exactly one real (non-provisional) snapshot construction. A second,
+    THROWAWAY, PASS-shaped candidate is still built purely to hand to
+    validate_for_pass() (never rendered or returned), so the real
+    count here is 2, not 1 -- but critically NOT 3, which is what a
+    post-publication rebuild would produce."""
+    calls = {"n": 0}
+    real_build_snapshot = gate_runner._build_snapshot
+
+    def _counting_build_snapshot(*args, **kwargs):
+        calls["n"] += 1
+        return real_build_snapshot(*args, **kwargs)
+
+    with patch.object(gate_runner, "_build_snapshot", side_effect=_counting_build_snapshot):
+        result = _run(repo_root=tmp_path)
+
+    assert result.overall == "PASS"
+    assert calls["n"] == 2, "one provisional candidate for validate_for_pass(), one real snapshot -- never a rebuild"
+
+
+def test_publish_failure_for_a_would_be_pass_rebuilds_a_fresh_corrected_snapshot(tmp_path):
+    """When a would-be-PASS candidate's publication actually fails, the
+    ALREADY-published (attempted) snapshot is never mutated in place --
+    a brand-new, corrected snapshot is built instead (never re-
+    published) so the returned truth matches reality (nothing was
+    actually persisted) rather than the optimistic pre-publication
+    prediction."""
+    calls = {"n": 0}
+    real_build_snapshot = gate_runner._build_snapshot
+
+    def _counting_build_snapshot(*args, **kwargs):
+        calls["n"] += 1
+        return real_build_snapshot(*args, **kwargs)
+
+    with (
+        patch.object(gate_runner, "_build_snapshot", side_effect=_counting_build_snapshot),
+        patch.object(gate_runner, "publish_evidence", side_effect=RuntimeError("simulated publish failure")),
+    ):
+        result = _run(repo_root=tmp_path)
+
+    assert result.overall != "PASS"
+    assert result.exit_code != 0
+    assert result.evidence.retention["sanitized_debug_bundle_retained"] is False
+    # provisional (for validate_for_pass) + predicted-PASS (attempted
+    # publish) + rebuilt-corrected (returned) -- exactly 3, never more.
+    assert calls["n"] == 3
 
 
 # --- no auto-tag / auto-commit / auto-push --------------------------------

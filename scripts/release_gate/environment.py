@@ -17,6 +17,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 _RUN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+# Task 15 Task 11 corrective v8, Section 24: the exact canonical Git SHA
+# shape this codebase's own resolve_git_sha() ("git rev-parse HEAD",
+# stripped) always produces -- `\Z`, never `$`, since Python's `$` also
+# matches immediately before a trailing "\n".
+_GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}\Z")
 
 # Checkpoint corrective 3 (finding #1): PostgreSQL silently truncates any
 # identifier longer than this to fit -- two distinct run IDs that only
@@ -51,7 +56,11 @@ def generate_run_id() -> str:
 
 
 def assert_valid_run_id(run_id: str) -> None:
-    if not isinstance(run_id, str) or not _RUN_ID_PATTERN.match(run_id):
+    # Task 15 Task 11 corrective v8, Section 24: `type(x) is str`, never
+    # `isinstance` -- a str SUBCLASS could carry hidden/overridden
+    # behavior while still comparing/matching equal to a well-formed
+    # run_id; exact type matching rejects it regardless.
+    if type(run_id) is not str or not _RUN_ID_PATTERN.match(run_id):
         raise PreflightError(f"run_id {run_id!r} is not filesystem/DB-name safe")
     byte_length = len(run_id.encode("ascii"))
     if byte_length > MAX_GATE_RUN_ID_BYTES:
@@ -63,6 +72,18 @@ def assert_valid_run_id(run_id: str) -> None:
             "a longer run_id risks silent truncation and collision with a "
             "different run"
         )
+
+
+def assert_valid_git_sha(git_sha) -> None:
+    """Task 15 Task 11 corrective v8, Section 24/25: the builder-level
+    boundary for the exact canonical Git SHA shape this codebase's own
+    resolve_git_sha() always produces -- exactly 40 lowercase hex
+    characters, `type(x) is str` (never `isinstance`, so a str subclass
+    is rejected too). Builder strictness here does not replace the
+    final, independent evidence.validate_for_pass() re-check (Section
+    25) -- both exist."""
+    if type(git_sha) is not str or not _GIT_SHA_PATTERN.match(git_sha):
+        raise PreflightError("git_sha is not a valid 40-character lowercase hex SHA")
 
 
 def resolve_git_sha(repo_root=None) -> str:
@@ -170,6 +191,7 @@ def build_gate_environment(*, repo_root, keep_on_failure=False, env=None) -> Gat
     run_id = generate_run_id()
     assert_valid_run_id(run_id)
     git_sha = resolve_git_sha(repo_root)
+    assert_valid_git_sha(git_sha)
 
     repo_root_path = Path(repo_root)
     artifact_dir = repo_root_path / "artifacts" / "phase1-release" / run_id

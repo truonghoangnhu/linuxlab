@@ -95,7 +95,8 @@ import psycopg
 
 from scripts.release_gate import scenarios as scenario_module
 from scripts.release_gate.cleanup import CleanupAggregateError
-from scripts.release_gate.database import GateDatabaseNames
+from scripts.release_gate.database import GateDatabaseNames, drop_database
+from scripts.release_gate.e2e_support import db_admin_from_env
 from scripts.release_gate.e2e_support import dual_deployment as real_dual_deployment
 from scripts.release_gate.environment import (
     GateEnvironment,
@@ -251,33 +252,38 @@ class RunState:
 # happen" facts on RunState instead.
 _PRIMARY_SEVERITY = {"CLEANUP_FAILURE": 1, "SCENARIO_FAILURE": 2, "STARTUP_FAILURE": 3}
 
-# Task 15 Task 11 corrective v6/v7, Section 9/11: maps each cleanup
-# action's own fixed, safe name -- scripts/release_gate/e2e_support.py's
-# dual_deployment() cleanup_actions list, and scenarios.py's
-# run_backup_restore_smoke() restore-database cleanup (Task 11
-# corrective v6) -- to the resource-ledger category it corresponds to.
-# A process (stop_node_process/stop_central_process) is not a tracked
-# execution-resource category. Every generated release artifact (keys,
-# `.llpkg`, dumps, logs) lives inside the workspace directory, so
+# Task 15 Task 11 corrective v6/v7, Section 9/11: maps each
+# dual_deployment()-owned cleanup action's own fixed, safe name
+# (scripts/release_gate/e2e_support.py's cleanup_actions list) to the
+# resource-ledger category it corresponds to. A process
+# (stop_node_process/stop_central_process) is not a tracked execution-
+# resource category. Every generated release artifact (keys, `.llpkg`,
+# dumps, logs) lives inside the workspace directory, so
 # "remove_workspace" alone covers all of them.
+#
+# Task 15 Task 11 corrective v8, Section 9/13: restore Central/Node
+# databases are DELIBERATELY NOT in this table any more -- v7 inferred
+# their ownership after the fact from a cleanup exception's action
+# name, which both missed genuine partial-creation residue (Section
+# 11) and misclassified a drop failure as an ordinary scenario failure
+# instead of a CLEANUP concern (Section 15). They are now first-class,
+# ACTIVELY acquired resources (scenarios.run_backup_restore_smoke()
+# acquires each the instant it is created, via the shared
+# `deployment.resource_ledger`) whose disposal is a dedicated,
+# unconditional CLEANUP-stage step -- see _dispose_restore_databases().
 _CLEANUP_ACTION_TO_RESOURCE_KIND = {
     "remove_workspace": ResourceKind.WORKSPACE,
     "drop_node_database": ResourceKind.NODE_DB,
     "drop_central_database": ResourceKind.CENTRAL_DB,
-    "drop_restore_node_database": ResourceKind.RESTORE_NODE_DB,
-    "drop_restore_central_database": ResourceKind.RESTORE_CENTRAL_DB,
 }
 
 # Every resource-ledger category one scenario's own dual_deployment()
-# (central_db, node_db, workspace) or scenario-internal backup/restore
-# logic (restore_central_db, restore_node_db) could ever acquire.
-# Reconciled to a definite owned/released state after each scenario
-# completes, regardless of outcome (Section 12).
+# (central_db, node_db, workspace) could ever acquire. Reconciled to a
+# definite owned/released state after each scenario completes,
+# regardless of outcome (Section 12).
 _ALL_SCENARIO_RESOURCE_KINDS = (
     ResourceKind.CENTRAL_DB,
     ResourceKind.NODE_DB,
-    ResourceKind.RESTORE_CENTRAL_DB,
-    ResourceKind.RESTORE_NODE_DB,
     ResourceKind.WORKSPACE,
 )
 
@@ -286,8 +292,6 @@ def _resource_safe_id(kind: str, gate_names: GateDatabaseNames, workspace_path: 
     return {
         ResourceKind.CENTRAL_DB: gate_names.central,
         ResourceKind.NODE_DB: gate_names.node,
-        ResourceKind.RESTORE_CENTRAL_DB: gate_names.restore_central,
-        ResourceKind.RESTORE_NODE_DB: gate_names.restore_node,
         ResourceKind.WORKSPACE: str(workspace_path),
     }[kind]
 
@@ -540,6 +544,37 @@ def _register_deployment_secrets(deployment, secrets: SecretRegistry) -> None:
             secrets.register(path.read_text())
 
 
+def _dispose_restore_databases(state: RunState, gate_names: GateDatabaseNames, secrets: SecretRegistry) -> None:
+    """Task 15 Task 11 corrective v8, Section 14-16: restore Central/
+    Node database disposal ALWAYS happens here, under Stage.CLEANUP,
+    regardless of how the scenario body itself concluded -- never
+    inside the scenario's own body (which would misclassify a drop
+    failure as an ordinary scenario failure while cleanup_status stayed
+    clean). A safe, cheap no-op for every scenario except
+    backup_restore_smoke, the only one that ever acquires these two
+    ledger entries (via the shared `deployment.resource_ledger`,
+    scenarios.run_backup_restore_smoke()'s own doing). Both members are
+    always attempted, even if the first raises, matching the same
+    invariant already enforced for dual_deployment()'s own central/node
+    database cleanup."""
+    db_admin = db_admin_from_env()
+    for member, kind in (
+        ("restore_node", ResourceKind.RESTORE_NODE_DB),
+        ("restore_central", ResourceKind.RESTORE_CENTRAL_DB),
+    ):
+        safe_id = getattr(gate_names, member)
+        if not state.resources.contains(kind, safe_id):
+            continue
+        try:
+            drop_database(db_admin, gate_names, member)
+        except Exception as exc:  # noqa: BLE001 -- classified as a cleanup failure below, never silently dropped
+            _record_cleanup_failure(
+                state, _sanitize_exception(exc, "restore_database_cleanup", "CLEANUP_FAILURE", secrets)
+            )
+        else:
+            state.resources.release(kind, safe_id)
+
+
 def _run_one_scenario(
     state: RunState, outer_run_id, name, scenario_func, scenario_tmp_dir, dual_deployment_factory, secrets
 ):
@@ -601,6 +636,12 @@ def _run_one_scenario(
             # secrets() classifies as STARTUP_FAILURE, never
             # SCENARIO_FAILURE.
             _register_deployment_secrets(deployment, secrets)
+            # Task 15 Task 11 corrective v8, Section 9/16: gives the
+            # scenario body real-time access to the SAME shared ledger
+            # -- restore-database creation (backup_restore_smoke only)
+            # acquires ownership the instant it succeeds, never
+            # inferred later from cleanup-exception names.
+            deployment.resource_ledger = state.resources
             state.stage = Stage.SCENARIO
             detail_value = scenario_func(deployment)
             assertions = build_typed_assertions(detail_value)
@@ -609,6 +650,18 @@ def _run_one_scenario(
         outcome_exception = exc
 
     duration_ms = (time.monotonic() - start) * 1000.0
+    # Captured BEFORE restore-database disposal (below) forces
+    # `state.stage` to CLEANUP unconditionally -- this is the
+    # scenario's OWN concluding stage, needed to classify ITS outcome
+    # correctly.
+    scenario_stage = state.stage
+
+    # Task 15 Task 11 corrective v8, Section 15/16: restore-database
+    # disposal always executes under Stage.CLEANUP, regardless of how
+    # the scenario body itself concluded -- never as part of the
+    # scenario body's own classification.
+    state.stage = Stage.CLEANUP
+    _dispose_restore_databases(state, gate_names, secrets)
 
     if outcome_exception is None:
         _reconcile_scenario_resources(state, gate_names, workspace_path, None)
@@ -617,7 +670,7 @@ def _run_one_scenario(
             detail_value,
         )
 
-    if state.stage == Stage.CLEANUP:
+    if scenario_stage == Stage.CLEANUP:
         # Setup and the scenario body both fully succeeded -- whatever
         # this exception's actual class is, it can only have come from
         # __exit__ (teardown).
@@ -633,7 +686,7 @@ def _run_one_scenario(
     # failed while that original exception was unwinding, Python's own
     # implicit chaining set `__context__` to it.
     original_exception = outcome_exception.__context__
-    category = "SCENARIO_FAILURE" if state.stage == Stage.SCENARIO else "STARTUP_FAILURE"
+    category = "SCENARIO_FAILURE" if scenario_stage == Stage.SCENARIO else "STARTUP_FAILURE"
     if original_exception is not None:
         cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
         _record_cleanup_failure(state, cleanup_record)
@@ -725,6 +778,76 @@ def _environment_metadata(db_admin=None) -> dict:
     return metadata
 
 
+def _build_snapshot(
+    *,
+    overall: str,
+    bundle_retained: bool,
+    state: RunState,
+    run_id,
+    git_sha,
+    started_at,
+    finished_at,
+    authority,
+    environment: dict,
+    validation: dict,
+    scenario_results,
+    proofs: dict,
+    keep_on_failure: bool,
+) -> ReleaseEvidence:
+    """Task 15 Task 11 corrective v8, Section 4/5: builds ONE complete,
+    self-consistent EvidenceV1 snapshot from CURRENT `state` plus the
+    already-known facts passed in -- a pure function, never mutated
+    after it returns. `overall` and `bundle_retained` are passed in
+    explicitly rather than read live from `state.decision`/
+    `state.publication_outcome` because the PRE-publication call needs
+    a PREDICTED value (publication hasn't happened yet -- Section 8:
+    "avoid circularity"), while a POST-publication call (only needed
+    when that prediction turns out to disagree with reality) passes the
+    real, final values instead. Every other field (resource retention,
+    cleanup status, primary/cleanup/finalization failure) is read
+    directly from `state`, which by either call site is already
+    completely settled."""
+    return ReleaseEvidence(
+        schema_version=SCHEMA_VERSION,
+        run={
+            "run_id": run_id,
+            "git_sha": git_sha,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "authority": authority.__dict__,
+        },
+        environment=environment,
+        profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
+        validation=validation,
+        scenarios={result.name: result.__dict__ for result in scenario_results},
+        proofs=proofs,
+        retention={
+            "keep_on_failure_requested": keep_on_failure,
+            "execution_resources_retained": bool(state.resources.retained_execution_resources()),
+            "sanitized_debug_bundle_retained": bundle_retained,
+        },
+        primary_failure=state.primary_failure.to_dict() if state.primary_failure is not None else None,
+        cleanup_failure=state.cleanup_failure.to_dict() if state.cleanup_failure is not None else None,
+        finalization_failure=state.finalization_failure.to_dict() if state.finalization_failure is not None else None,
+        cleanup_status="failed" if state.cleanup_failure is not None else "clean",
+        overall=overall,
+        exit_code=EXIT_CODE[overall],
+    )
+
+
+def _predicted_overall(state: RunState) -> str:
+    """The PRE-publication prediction of what `overall` will be if
+    publication, which hasn't been attempted yet, goes on to succeed --
+    see _build_snapshot()'s docstring. Never used as the final,
+    returned decision; _derive_decision() alone is authoritative for
+    that."""
+    if _would_pass_ignoring_publication(state):
+        return Decision.PASS
+    if state.primary_failure is not None:
+        return state.primary_failure.category
+    return Decision.CLEANUP_FAILURE
+
+
 def _finalize(
     *,
     state: RunState,
@@ -765,6 +888,18 @@ def _finalize(
     state.stage = Stage.FINALIZE
     finished_at = _utc_now_iso()
 
+    common_kwargs = {
+        "state": state,
+        "run_id": run_id,
+        "git_sha": git_sha,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "authority": authority,
+        "validation": validation,
+        "scenario_results": scenario_results,
+        "keep_on_failure": keep_on_failure,
+    }
+
     evidence = None
     try:
         try:
@@ -773,48 +908,27 @@ def _finalize(
             proofs = {}
             state.finalization_failure = _sanitize_exception(exc, "finalize_proofs", "CLEANUP_FAILURE", secrets)
 
-        evidence = ReleaseEvidence(
-            schema_version=SCHEMA_VERSION,
-            run={
-                "run_id": run_id,
-                "git_sha": git_sha,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "authority": authority.__dict__,
-            },
-            environment=_environment_metadata(db_admin),
-            profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
-            validation=validation,
-            scenarios={result.name: result.__dict__ for result in scenario_results},
-            proofs=proofs,
-            # Placeholder retention -- recomputed from `state` once
-            # publication has actually been attempted, below.
-            retention={
-                "keep_on_failure_requested": keep_on_failure,
-                "execution_resources_retained": bool(state.resources.retained_execution_resources()),
-                "sanitized_debug_bundle_retained": False,
-            },
-            primary_failure=state.primary_failure.to_dict() if state.primary_failure is not None else None,
-            cleanup_failure=state.cleanup_failure.to_dict() if state.cleanup_failure is not None else None,
-            finalization_failure=None,
-            cleanup_status="failed" if state.cleanup_failure is not None else "clean",
-            overall=Decision.UNDECIDED,
-            exit_code=0,
-        )
+        environment = _environment_metadata(db_admin)
 
         # Section 3/28: "no branch begins from overall=PASS" -- only
         # consulted when nothing has failed the run so far, so it can
         # only ever GATE a would-be PASS, never override an already-
-        # worse primary/cleanup failure. Eligibility here is necessary
-        # but NOT sufficient for PASS -- publication still has to
-        # actually succeed, checked independently by _derive_decision()
-        # after the publish attempt below.
+        # worse primary/cleanup failure. This provisional, PASS-shaped
+        # candidate exists ONLY to hand to validate_for_pass() -- it is
+        # never rendered, published, or returned; if it is rejected,
+        # `state.finalization_failure` is set here, and the ONE real
+        # snapshot built below (from the now-fully-settled `state`)
+        # naturally predicts a non-PASS category instead.
         if (
             state.finalization_failure is None
             and state.primary_failure is None
             and state.cleanup_failure is None
         ):
-            decision = validate_for_pass(evidence)
+            provisional = _build_snapshot(
+                overall=Decision.PASS, bundle_retained=True, environment=environment, proofs=proofs,
+                **common_kwargs,
+            )
+            decision = validate_for_pass(provisional)
             if not decision.eligible:
                 safe_message = secrets.redact_text("; ".join(decision.reasons))
                 state.finalization_failure = FailureRecord(
@@ -823,72 +937,41 @@ def _finalize(
                     code="EvidenceInvariantError",
                     safe_message=safe_message,
                 )
+
+        # Task 15 Task 11 corrective v8, Section 4/5: THE snapshot --
+        # built exactly once, from `state` now that every failure it can
+        # hold before publication has been fully settled. `overall`/
+        # `bundle_retained` are still a PREDICTION (publication hasn't
+        # been attempted yet -- Section 8 "avoid circularity"): the only
+        # way this can turn out wrong is publication itself failing, and
+        # publish_evidence()'s own transactional (stage-then-atomic-
+        # rename) design guarantees no artifact is ever left at
+        # `evidence_dir` in that case, so a persisted false "PASS" claim
+        # is structurally impossible.
+        evidence = _build_snapshot(
+            overall=_predicted_overall(state),
+            bundle_retained=evidence_dir is not None,
+            environment=environment,
+            proofs=proofs,
+            **common_kwargs,
+        )
     except Exception as exc:  # noqa: BLE001 -- FINALIZE fail-safe boundary: normalize ANY other unexpected
         # failure while building or validating the candidate -- never
-        # let raw exception content escape uncaught. `evidence` is left
-        # as whatever it already was: None if this failed before
-        # candidate assembly completed (handled by the fallback below),
-        # or the already-assembled candidate if this failed later,
-        # which is kept rather than discarded.
+        # let raw exception content escape uncaught.
         state.finalization_failure = _sanitize_exception(exc, "finalize_build_candidate", "CLEANUP_FAILURE", secrets)
+        evidence = None
 
     if evidence is None:
         # Candidate assembly itself never completed -- build a minimal,
-        # honest fallback record from only the pieces already known safe
-        # before entering the boundary above.
-        evidence = ReleaseEvidence(
-            schema_version=SCHEMA_VERSION,
-            run={
-                "run_id": run_id,
-                "git_sha": git_sha,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "authority": authority.__dict__,
-            },
+        # honest fallback snapshot from only the pieces already known
+        # safe before entering the boundary above.
+        evidence = _build_snapshot(
+            overall=_predicted_overall(state),
+            bundle_retained=evidence_dir is not None,
             environment={},
-            profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},
-            validation=validation,
-            scenarios={result.name: result.__dict__ for result in scenario_results},
             proofs={},
-            retention={
-                "keep_on_failure_requested": keep_on_failure,
-                "execution_resources_retained": bool(state.resources.retained_execution_resources()),
-                "sanitized_debug_bundle_retained": False,
-            },
-            primary_failure=state.primary_failure.to_dict() if state.primary_failure is not None else None,
-            cleanup_failure=state.cleanup_failure.to_dict() if state.cleanup_failure is not None else None,
-            finalization_failure=None,
-            cleanup_status="failed" if state.cleanup_failure is not None else "clean",
-            overall=Decision.UNDECIDED,
-            exit_code=0,
+            **common_kwargs,
         )
-
-    # Task 15 Task 11 corrective v7, Section 21 ("avoid circularity"):
-    # what actually gets WRITTEN into the published JSON/Markdown pair
-    # is decided HERE, before publication is even attempted -- `overall`
-    # cannot yet depend on `state.publication_outcome` (publication
-    # hasn't happened), so this predicts PASS only from the publication-
-    # INDEPENDENT factors (primary/cleanup/finalization failure,
-    # retained resources). The only way this prediction can end up wrong
-    # is publication itself failing, and publish_evidence()'s own
-    # transactional (stage-then-atomic-rename) design guarantees that no
-    # artifact is ever left at `evidence_dir` in that case -- so a
-    # persisted false "PASS" claim is structurally impossible. The
-    # REAL, authoritative decision -- which also requires publication to
-    # have actually succeeded -- is derived once more, for real, via
-    # _derive_decision() below, and overwrites this prediction in memory
-    # (never on disk) if it turns out to disagree.
-    if _would_pass_ignoring_publication(state):
-        evidence.overall = Decision.PASS
-        evidence.exit_code = EXIT_CODE[Decision.PASS]
-        evidence.retention["sanitized_debug_bundle_retained"] = True
-    else:
-        predicted_category = (
-            state.primary_failure.category if state.primary_failure is not None else Decision.CLEANUP_FAILURE
-        )
-        evidence.overall = predicted_category
-        evidence.exit_code = EXIT_CODE[predicted_category]
-        evidence.retention["sanitized_debug_bundle_retained"] = False
 
     json_path = None
     markdown_path = None
@@ -924,25 +1007,31 @@ def _finalize(
     # publication cannot occur"), which alone is enough for
     # _derive_decision() below to refuse PASS.
 
-    overall = _derive_decision(state)
-    # Task 15 Task 11 corrective v7, Section 3/4: written back onto the
-    # ONE shared RunState -- `state.decision` is never left stale at its
-    # initial UNDECIDED placeholder once the real derivation has run.
-    state.decision = overall
+    final_overall = _derive_decision(state)
+    state.decision = final_overall
+    final_bundle_retained = state.publication_outcome == PublicationOutcome.PUBLISHED
 
-    evidence.retention["execution_resources_retained"] = bool(state.resources.retained_execution_resources())
-    evidence.retention["sanitized_debug_bundle_retained"] = state.publication_outcome == PublicationOutcome.PUBLISHED
-    evidence.cleanup_status = "failed" if state.cleanup_failure is not None else "clean"
-    evidence.cleanup_failure = state.cleanup_failure.to_dict() if state.cleanup_failure is not None else None
-    evidence.finalization_failure = (
-        state.finalization_failure.to_dict() if state.finalization_failure is not None else None
-    )
-    evidence.overall = overall
-    evidence.exit_code = EXIT_CODE[overall]
+    # Task 15 Task 11 corrective v8, Section 5/6/8: if anything was
+    # actually published, `evidence` at this point IS the exact object
+    # publish_evidence() rendered and wrote -- it is NEVER mutated here.
+    # It is only rebuilt (as a brand-new object, never re-published)
+    # when reality after the publish attempt disagrees with what was
+    # predicted before it (i.e. publication failed or was never
+    # attempted) -- so the returned truth never contradicts whatever was
+    # actually persisted, and a failed/no-destination run never silently
+    # inherits a stale "would-be PASS" claim.
+    if final_overall != evidence.overall or final_bundle_retained != evidence.retention["sanitized_debug_bundle_retained"]:
+        evidence = _build_snapshot(
+            overall=final_overall,
+            bundle_retained=final_bundle_retained,
+            environment=evidence.environment,
+            proofs=evidence.proofs,
+            **common_kwargs,
+        )
 
     state.stage = Stage.DONE
     return GateRunResult(
-        overall=overall,
+        overall=evidence.overall,
         exit_code=evidence.exit_code,
         evidence=evidence,
         evidence_dir=evidence_dir,

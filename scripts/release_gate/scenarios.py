@@ -27,10 +27,8 @@ import pytest
 
 from linuxlab.publication.package import SIGNATURE_MEMBER
 from scripts.release_gate import http_bridge
-from scripts.release_gate.cleanup import run_cleanup_actions
 from scripts.release_gate.database import (
     create_database,
-    drop_database,
     dump_database,
     restore_database,
 )
@@ -978,35 +976,42 @@ def run_backup_restore_smoke(deployment) -> dict:
     assert central_dump_path.stat().st_size > 0
     assert node_dump_path.stat().st_size > 0
 
+    # Task 15 Task 11 corrective v8, Section 9-11: acquire ownership of
+    # each restore database in the shared resource-ownership ledger
+    # IMMEDIATELY once it is successfully created -- restore_central is
+    # already ledger-owned before restore_node is even attempted, so a
+    # partial-creation failure (restore_node's create raising after
+    # restore_central's succeeded) can never leave a physically-created
+    # database the ledger doesn't yet know about. `resource_ledger` is
+    # attached by gate_runner._run_one_scenario() (never required --
+    # calling this scenario directly, as scripts.tests.
+    # test_release_gate_backup_restore.py's own baseline test does, is
+    # still fully supported without a ledger present).
+    #
+    # Disposal of these two databases is NOT this scenario's own
+    # responsibility any more (Section 15/16: "restore disposal must
+    # execute under lifecycle stage CLEANUP") -- see gate_runner.
+    # _run_one_scenario()'s own restore-database cleanup step, which
+    # always runs after this function returns OR raises, regardless of
+    # outcome.
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+
     create_database(deployment.db_admin, deployment.gate_names, "restore_central")
+    if resource_ledger is not None:
+        resource_ledger.acquire("restore_central_db", deployment.gate_names.restore_central)
+
     create_database(deployment.db_admin, deployment.gate_names, "restore_node")
-    try:
-        restore_assertions = _restore_and_verify(
-            deployment,
-            authored,
-            deployment.tmp_dir,
-            (central_dump_path, node_dump_path),
-            (first_attempt_public_id, first_outbox),
-            (second_attempt_public_id, second_outbox),
-        )
-    finally:
-        # Task 15 Task 11 corrective v6, Section 9/10: both drops are
-        # ALWAYS attempted, even if the first raises -- the same
-        # invariant already enforced for dual_deployment()'s own
-        # central/node database cleanup (restore_node cleanup failing
-        # must never skip restore_central cleanup, and vice versa).
-        run_cleanup_actions(
-            [
-                (
-                    "drop_restore_node_database",
-                    lambda: drop_database(deployment.db_admin, deployment.gate_names, "restore_node"),
-                ),
-                (
-                    "drop_restore_central_database",
-                    lambda: drop_database(deployment.db_admin, deployment.gate_names, "restore_central"),
-                ),
-            ]
-        )
+    if resource_ledger is not None:
+        resource_ledger.acquire("restore_node_db", deployment.gate_names.restore_node)
+
+    restore_assertions = _restore_and_verify(
+        deployment,
+        authored,
+        deployment.tmp_dir,
+        (central_dump_path, node_dump_path),
+        (first_attempt_public_id, first_outbox),
+        (second_attempt_public_id, second_outbox),
+    )
 
     return {
         "first_attempt_public_id": first_attempt_public_id,
