@@ -94,7 +94,6 @@ import django
 import psycopg
 
 from scripts.release_gate import scenarios as scenario_module
-from scripts.release_gate.cleanup import CleanupAggregateError
 from scripts.release_gate.database import GateDatabaseNames, drop_database
 from scripts.release_gate.e2e_support import db_admin_from_env
 from scripts.release_gate.e2e_support import dual_deployment as real_dual_deployment
@@ -252,82 +251,24 @@ class RunState:
 # happen" facts on RunState instead.
 _PRIMARY_SEVERITY = {"CLEANUP_FAILURE": 1, "SCENARIO_FAILURE": 2, "STARTUP_FAILURE": 3}
 
-# Task 15 Task 11 corrective v6/v7, Section 9/11: maps each
-# dual_deployment()-owned cleanup action's own fixed, safe name
-# (scripts/release_gate/e2e_support.py's cleanup_actions list) to the
-# resource-ledger category it corresponds to. A process
-# (stop_node_process/stop_central_process) is not a tracked execution-
-# resource category. Every generated release artifact (keys, `.llpkg`,
-# dumps, logs) lives inside the workspace directory, so
-# "remove_workspace" alone covers all of them.
-#
-# Task 15 Task 11 corrective v8, Section 9/13: restore Central/Node
-# databases are DELIBERATELY NOT in this table any more -- v7 inferred
-# their ownership after the fact from a cleanup exception's action
-# name, which both missed genuine partial-creation residue (Section
-# 11) and misclassified a drop failure as an ordinary scenario failure
-# instead of a CLEANUP concern (Section 15). They are now first-class,
-# ACTIVELY acquired resources (scenarios.run_backup_restore_smoke()
-# acquires each the instant it is created, via the shared
-# `deployment.resource_ledger`) whose disposal is a dedicated,
-# unconditional CLEANUP-stage step -- see _dispose_restore_databases().
-_CLEANUP_ACTION_TO_RESOURCE_KIND = {
-    "remove_workspace": ResourceKind.WORKSPACE,
-    "drop_node_database": ResourceKind.NODE_DB,
-    "drop_central_database": ResourceKind.CENTRAL_DB,
-}
-
-# Every resource-ledger category one scenario's own dual_deployment()
-# (central_db, node_db, workspace) could ever acquire. Reconciled to a
-# definite owned/released state after each scenario completes,
-# regardless of outcome (Section 12).
-_ALL_SCENARIO_RESOURCE_KINDS = (
-    ResourceKind.CENTRAL_DB,
-    ResourceKind.NODE_DB,
-    ResourceKind.WORKSPACE,
-)
-
-
-def _resource_safe_id(kind: str, gate_names: GateDatabaseNames, workspace_path: Path) -> str:
-    return {
-        ResourceKind.CENTRAL_DB: gate_names.central,
-        ResourceKind.NODE_DB: gate_names.node,
-        ResourceKind.WORKSPACE: str(workspace_path),
-    }[kind]
-
-
-def _reconcile_scenario_resources(
-    state: RunState, gate_names: GateDatabaseNames, workspace_path: Path, *cleanup_exceptions: BaseException | None
-) -> None:
-    """Task 15 Task 11 corrective v7, Section 11/12/14: resolves every
-    resource this ONE scenario could have created to a definite final
-    ledger state -- acquired (still owned) iff a real cleanup failure
-    named that exact resource's cleanup action, released (verified
-    clean) otherwise. Never guesses: `CleanupAggregateError.failures`
-    already lists only the cleanup actions that ACTUALLY failed (every
-    action not listed there genuinely succeeded, per
-    scripts.release_gate.cleanup.run_cleanup_actions()'s own contract),
-    so this reads as ground truth, not inference from exception class
-    alone. Restore Central/Node databases are reconciled exactly like
-    the other three -- whether or not THIS scenario happens to use them,
-    since a scenario that never created them simply never fails their
-    (nonexistent) cleanup action, and they are released here as a safe
-    no-op."""
-    retained_kinds: set[str] = set()
-    for exc in cleanup_exceptions:
-        if exc is None:
-            continue
-        if isinstance(exc, CleanupAggregateError):
-            for action_name, _ in exc.failures:
-                kind = _CLEANUP_ACTION_TO_RESOURCE_KIND.get(action_name)
-                if kind is not None:
-                    retained_kinds.add(kind)
-    for kind in _ALL_SCENARIO_RESOURCE_KINDS:
-        safe_id = _resource_safe_id(kind, gate_names, workspace_path)
-        if kind in retained_kinds:
-            state.resources.acquire(kind, safe_id)
-        else:
-            state.resources.release(kind, safe_id)
+# Task 15 Task 11 corrective v9, Section 14/23: the OLD
+# `_CLEANUP_ACTION_TO_RESOURCE_KIND` / `_ALL_SCENARIO_RESOURCE_KINDS` /
+# `_reconcile_scenario_resources()` retroactive-inference mechanism
+# (pattern-matching a cleanup exception's ACTION NAME against a fixed
+# table, only AFTER a scenario finished, to decide central_db/node_db/
+# workspace ownership) has been REMOVED entirely -- it is exactly the
+# anti-pattern spec Section 23 forbids ("ownership must not depend on
+# cleanup-error names"). Ownership for these three kinds is now
+# established the INSTANT each physical resource is created, inside
+# scripts/release_gate/e2e_support.py's own dual_deployment() (given
+# the shared `state.resources` ledger below), and released ONLY
+# immediately after that exact resource's OWN disposal action verifiably
+# succeeds -- see dual_deployment()'s own cleanup-action closures. No
+# post-hoc reconciliation step is needed here any more: by the time
+# dual_deployment()'s `finally` block (and therefore this function's own
+# `with` statement) has finished, the ledger already reflects verified
+# reality for central_db/node_db/workspace, exactly as it always has for
+# the two restore databases (Section 9 of corrective v8).
 
 
 def _record_primary_failure(state: RunState, category: str, record: FailureRecord) -> None:
@@ -583,9 +524,14 @@ def _run_one_scenario(
     identity, never an unrelated random one). Mutates `state` in place
     -- records this scenario's own primary failure (if any, folded by
     severity into `state.primary_failure`), its own cleanup failure (if
-    any), and reconciles its own execution resources (central_db,
-    node_db, the two restore databases, workspace) to a definite final
-    ledger state. Returns (ScenarioResult, detail_value_or_None).
+    any). Central/Node database and workspace ownership (Task 15 Task
+    11 corrective v9, Section 14/15) are established/released directly
+    by dual_deployment_factory(...) itself (given the shared ledger
+    passed into it below), never reconciled here after the fact;
+    restore-database disposal is still this function's own explicit
+    CLEANUP-stage responsibility (Section 15/16 of corrective v8; see
+    _dispose_restore_databases()). Returns (ScenarioResult,
+    detail_value_or_None).
 
     Explicit stage tracking (hardened by corrective v4 Section 6.4):
     `stage` starts at Stage.STARTUP and is advanced to Stage.SCENARIO
@@ -614,7 +560,6 @@ def _run_one_scenario(
     exception's class."""
     child_run_id = _child_run_id(outer_run_id, name)
     gate_names = GateDatabaseNames.for_run(child_run_id)
-    workspace_path = scenario_tmp_dir / f"gate-workspace-{child_run_id}"
 
     start = time.monotonic()
     # Task 15 Task 11 corrective v7, Section 3: written directly onto
@@ -627,7 +572,20 @@ def _run_one_scenario(
     assertions: dict = {}
 
     try:
-        with dual_deployment_factory(scenario_tmp_dir, run_id=child_run_id) as deployment:
+        # Task 15 Task 11 corrective v9, Section 13/14/15: the shared
+        # ledger is passed straight into the factory now, so
+        # dual_deployment() (the real one) can acquire the workspace and
+        # both ephemeral databases the INSTANT each physical creation
+        # succeeds -- BEFORE this function ever regains control, never
+        # only after the fact via the `deployment.resource_ledger = ...`
+        # assignment below (kept for the SAME reason it always existed:
+        # scenario code and any dual_deployment_factory implementation
+        # that does not itself accept/use this kwarg -- e.g. a fake
+        # factory in a fast orchestration test -- still finds a working
+        # ledger reference at `deployment.resource_ledger`).
+        with dual_deployment_factory(
+            scenario_tmp_dir, run_id=child_run_id, resource_ledger=state.resources
+        ) as deployment:
             # STARTUP covers deployment context entry AND every post-
             # enter setup step before the scenario callable itself --
             # secret registration here included. `state.stage` only
@@ -664,7 +622,6 @@ def _run_one_scenario(
     _dispose_restore_databases(state, gate_names, secrets)
 
     if outcome_exception is None:
-        _reconcile_scenario_resources(state, gate_names, workspace_path, None)
         return (
             ScenarioResult(name=name, status="PASS", assertions=assertions, duration_ms=duration_ms, detail=""),
             detail_value,
@@ -676,7 +633,6 @@ def _run_one_scenario(
         # __exit__ (teardown).
         cleanup_record = _sanitize_exception(outcome_exception, name, "CLEANUP_FAILURE", secrets)
         _record_cleanup_failure(state, cleanup_record)
-        _reconcile_scenario_resources(state, gate_names, workspace_path, outcome_exception)
         return (
             ScenarioResult(name=name, status="FAIL", duration_ms=duration_ms, detail=cleanup_record.safe_message),
             None,
@@ -694,7 +650,6 @@ def _run_one_scenario(
     else:
         record = _sanitize_exception(outcome_exception, name, category, secrets)
     _record_primary_failure(state, category, record)
-    _reconcile_scenario_resources(state, gate_names, workspace_path, outcome_exception, original_exception)
 
     return (
         ScenarioResult(name=name, status="FAIL", duration_ms=duration_ms, detail=record.safe_message),
@@ -977,7 +932,12 @@ def _finalize(
     markdown_path = None
     if evidence_dir is not None:
         try:
-            json_path, markdown_path = publish_evidence(evidence_dir, evidence, secrets)
+            # Task 15 Task 11 corrective v9, Section 17: the shared
+            # ledger is threaded straight into publish_evidence() now,
+            # which acquires the staging directory itself the instant
+            # it is created (and releases it after verified disposal) --
+            # never only retroactively from this except branch.
+            json_path, markdown_path = publish_evidence(evidence_dir, evidence, secrets, resource_ledger=state.resources)
             state.publication_outcome = PublicationOutcome.PUBLISHED
         except Exception as exc:  # noqa: BLE001 -- publication must never crash the gate itself
             state.publication_outcome = PublicationOutcome.FAILED
@@ -988,13 +948,15 @@ def _finalize(
                 # cleanup failure itself (cleanup_failure) and the
                 # ORIGINAL publication failure (preserved as
                 # `__cause__`, never overwritten) as finalization_
-                # failure. The staging directory is acquired into the
-                # resource ledger as genuinely un-released.
+                # failure. publish_evidence() has already acquired the
+                # staging directory into the resource ledger (Section
+                # 17) and, since disposal was never verified successful
+                # on this exact branch, never released it either -- no
+                # re-acquire is needed here any more.
                 _record_cleanup_failure(
                     state,
                     _sanitize_exception(exc, "finalize_publish_staging_cleanup", "CLEANUP_FAILURE", secrets),
                 )
-                state.resources.acquire(ResourceKind.STAGING_DIR, "evidence_staging")
                 original_exc = exc.__cause__
                 if original_exc is not None and state.finalization_failure is None:
                     state.finalization_failure = _sanitize_exception(
@@ -1191,6 +1153,13 @@ def _run_release_gate(
     tmp_root_path = Path(
         tempfile.mkdtemp(prefix=f"phase1-release-{env.run_id}-", dir=str(tmp_root) if tmp_root is not None else None)
     )
+    # Task 15 Task 11 corrective v9, Section 16/22: acquired IMMEDIATELY
+    # after physical creation succeeds -- never only retroactively, on
+    # the specific branch below where its own later removal happens to
+    # fail. Every scenario that runs after this point (and therefore
+    # every resource IT acquires) does so while the outer root is
+    # already ledger-owned.
+    state.resources.acquire(ResourceKind.OUTER_ROOT, str(tmp_root_path))
     try:
         for name, scenario_func in scenario_specs:
             state.stage = name
@@ -1215,6 +1184,12 @@ def _run_release_gate(
         state.stage = Stage.CLEANUP
         try:
             shutil.rmtree(tmp_root_path)
+            # Task 15 Task 11 corrective v9, Section 16/20: verified
+            # successful removal -- release the outer root itself now,
+            # on this success path (never only inside the failure branch
+            # below, which used to be the ONLY place this resource was
+            # ever registered at all).
+            state.resources.release(ResourceKind.OUTER_ROOT, str(tmp_root_path))
             # Task 15 Task 11 corrective v7, Section 15: outer-root
             # removal succeeding means every scenario workspace nested
             # inside it is now ALSO gone, even if an earlier per-
@@ -1227,7 +1202,11 @@ def _run_release_gate(
                 if ref.kind == ResourceKind.WORKSPACE:
                     state.resources.release(ref.kind, ref.safe_id)
         except FileNotFoundError:
-            pass
+            # Already gone -- verified absence is itself verified
+            # disposal (Section 20), so the outer root is released here
+            # too, not left stuck retained for a resource that
+            # provably no longer exists.
+            state.resources.release(ResourceKind.OUTER_ROOT, str(tmp_root_path))
         # Audited cleanup covers ordinary Exception generically -- not a
         # hard-coded tuple of specific classes -- so an unanticipated
         # exception class can never escape uncaught. Never `except
@@ -1236,7 +1215,12 @@ def _run_release_gate(
             _record_cleanup_failure(
                 state, _sanitize_exception(exc, "outer_temp_root_cleanup", "CLEANUP_FAILURE", secrets)
             )
-            state.resources.acquire(ResourceKind.OUTER_ROOT, str(tmp_root_path))
+            # Task 15 Task 11 corrective v9, Section 20: removal was NOT
+            # verified successful -- the outer root, already acquired
+            # above at creation time, simply stays retained (never
+            # released without verified disposal). No re-acquire is
+            # needed here any more; this branch no longer needs to be
+            # the FIRST time the ledger hears about this resource.
 
     return _safe_finalize(
         state=state,

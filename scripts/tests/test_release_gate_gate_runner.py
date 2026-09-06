@@ -808,9 +808,32 @@ def test_evidence_never_carries_a_retained_resources_field_any_more(tmp_path):
 # when a database genuinely fails to drop, evidence must say so.
 
 
+# Task 15 Task 11 corrective v9, Section 14/23: these three tests used
+# to rely on the OLD retroactive-inference mechanism (a cleanup
+# exception's ACTION NAME pattern-matched against a fixed table AFTER
+# the fact) -- exactly the anti-pattern v9 removes. They are rewritten
+# here to simulate what the REAL dual_deployment() now does directly:
+# acquire the ledger entry the INSTANT the resource is (simulated to be)
+# created, then let the simulated teardown failure demonstrate that
+# release never happens without VERIFIED disposal -- proving the same
+# retention invariant without any dependence on what the cleanup
+# exception's action happens to be named.
+
+
+def _scenario_that_acquires(kind, safe_id_from_deployment):
+    def scenario(deployment):
+        deployment.resource_ledger.acquire(kind, safe_id_from_deployment(deployment))
+        return {}
+
+    return scenario
+
+
 def test_real_retained_database_makes_execution_resources_retained_true(tmp_path):
     result = _run(
         repo_root=tmp_path,
+        scenario_specs=(
+            ("leaky", _scenario_that_acquires(gate_runner.ResourceKind.NODE_DB, lambda d: "fake_node_db")),
+        ),
         dual_deployment_factory=_make_factory(
             raise_on_exit=CleanupAggregateError([("drop_node_database", RuntimeError("simulated leak"))])
         ),
@@ -829,6 +852,9 @@ def test_workspace_cleanup_failure_reconciled_by_later_successful_outer_cleanup(
     state, not the earlier, now-stale cleanup failure."""
     result = _run(
         repo_root=tmp_path,
+        scenario_specs=(
+            ("leaky", _scenario_that_acquires(gate_runner.ResourceKind.WORKSPACE, lambda d: str(d.tmp_dir))),
+        ),
         dual_deployment_factory=_make_factory(
             raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
         ),
@@ -850,6 +876,9 @@ def test_workspace_still_retained_when_outer_cleanup_also_fails(tmp_path, monkey
 
     result = _run(
         repo_root=tmp_path,
+        scenario_specs=(
+            ("leaky", _scenario_that_acquires(gate_runner.ResourceKind.WORKSPACE, lambda d: str(d.tmp_dir))),
+        ),
         dual_deployment_factory=_make_factory(
             raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
         ),

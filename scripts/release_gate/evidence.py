@@ -16,10 +16,14 @@ import os
 import re
 import shutil
 import tempfile
+import types
 import uuid as uuid_module
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from scripts.release_gate.environment import validate_canonical_run_id
 
 SCHEMA_VERSION = 1
 
@@ -503,13 +507,59 @@ class FailureRecord:
         }
 
 
-@dataclass
+def deep_freeze(value):
+    """Task 15 Task 11 corrective v9, Section 5/6: recursively converts
+    a value into an immutable, fully-DETACHED equivalent -- a `dict`
+    becomes a `types.MappingProxyType` wrapping a BRAND NEW dict whose
+    values are each recursively frozen (this both deep-copies/detaches
+    from the original mutable input AND makes item assignment raise
+    `TypeError`); `list`/`tuple` become a tuple of recursively-frozen
+    items; `set` becomes a `frozenset`; anything else (str/int/float/
+    bool/None, and an already-frozen/immutable value) is returned
+    unchanged. Idempotent and safe to call on an already-frozen value
+    (e.g. re-freezing a field copied from a previously-built
+    ReleaseEvidence): a `MappingProxyType`/tuple/frozenset simply falls
+    through the final `return value` branch unmodified, since it is
+    already immutable and already detached from whatever mutable
+    structure it may once have come from.
+
+    A read-only wrapper over an ALIASED mutable dict would be
+    insufficient (spec Section 5) -- the dict COMPREHENSION below
+    builds a genuinely new backing dict for every nested mapping, so
+    mutating the ORIGINAL input after this call can never be reflected
+    here."""
+    if isinstance(value, dict):
+        return types.MappingProxyType({key: deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(deep_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(deep_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value):
+    """The renderer-conversion counterpart to deep_freeze() (spec
+    Section 9): recursively converts a deep-frozen value back into
+    fresh, disposable, genuinely JSON-serializable plain data --
+    `types.MappingProxyType` -> a brand new plain `dict`, `tuple`/
+    `frozenset` -> a brand new plain `list`. The result shares no
+    mutable container with the frozen snapshot it was built from, so
+    mutating it can never mutate the snapshot back (Section 9: "those
+    plain structures are disposable and non-authoritative")."""
+    if isinstance(value, types.MappingProxyType):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, (tuple, frozenset)):
+        return [_thaw(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
 class ReleaseEvidence:
-    """Task 15 Task 11 corrective v2: the ONE canonical in-memory
-    evidence record (EvidenceV1, schema_version 1). Both
-    write_json_evidence() and write_markdown_evidence() render from
-    this same object -- never two independently-maintained partial
-    schemas.
+    """Task 15 Task 11 corrective v2 (deeply immutable as of corrective
+    v9): the ONE canonical in-memory evidence record (EvidenceV1,
+    schema_version 1). Both write_json_evidence() and
+    write_markdown_evidence() render from this same object -- never two
+    independently-maintained partial schemas.
 
     `retention` replaces the prior `retained_resources` field
     (corrective v2, Section 3): execution resources (databases,
@@ -517,7 +567,18 @@ class ReleaseEvidence:
     regardless of --keep-on-failure or failure stage --
     `execution_resources_retained` is therefore always False. Only the
     sanitized evidence pair itself may ever be described as retained
-    (`sanitized_debug_bundle_retained`)."""
+    (`sanitized_debug_bundle_retained`).
+
+    Task 15 Task 11 corrective v9, Section 4-8: the dataclass itself is
+    frozen (blocking top-level field reassignment), and every mutable-
+    typed field is deep-frozen (via deep_freeze(), in __post_init__)
+    the instant an instance is constructed -- regardless of which call
+    site builds it (gate_runner._build_snapshot(), or a test/candidate
+    constructed directly with plain dict literals). This is the ONE
+    place detachment/immutability is enforced, so no decision-bearing
+    mutable reference can ever be shared with a scenario result, proof
+    dict, validation dict, retention dict, environment metadata, or any
+    other caller-owned structure once an instance exists."""
 
     schema_version: int
     run: dict  # run_id, git_sha, started_at, finished_at, authority
@@ -534,19 +595,39 @@ class ReleaseEvidence:
     overall: str
     exit_code: int
 
+    def __post_init__(self):
+        # object.__setattr__ is required here -- the dataclass itself is
+        # frozen, so ordinary attribute assignment (even from inside
+        # __post_init__) would raise dataclasses.FrozenInstanceError.
+        object.__setattr__(self, "run", deep_freeze(self.run))
+        object.__setattr__(self, "environment", deep_freeze(self.environment))
+        object.__setattr__(self, "profiles", deep_freeze(self.profiles))
+        object.__setattr__(self, "validation", deep_freeze(self.validation))
+        object.__setattr__(self, "scenarios", deep_freeze(self.scenarios))
+        object.__setattr__(self, "proofs", deep_freeze(self.proofs))
+        object.__setattr__(self, "retention", deep_freeze(self.retention))
+        object.__setattr__(self, "primary_failure", deep_freeze(self.primary_failure))
+        object.__setattr__(self, "cleanup_failure", deep_freeze(self.cleanup_failure))
+        object.__setattr__(self, "finalization_failure", deep_freeze(self.finalization_failure))
+
     def to_dict(self) -> dict:
+        """The renderer-conversion boundary (spec Section 9): returns a
+        BRAND NEW, fully mutable, disposable plain-data structure every
+        call -- mutating the returned dict can never mutate this frozen
+        snapshot back, and it is always genuinely JSON-serializable
+        (no MappingProxyType/tuple left over from deep_freeze())."""
         return {
             "schema_version": self.schema_version,
-            "run": self.run,
-            "environment": self.environment,
-            "profiles": self.profiles,
-            "validation": self.validation,
-            "scenarios": self.scenarios,
-            "proofs": self.proofs,
-            "retention": self.retention,
-            "primary_failure": self.primary_failure,
-            "cleanup_failure": self.cleanup_failure,
-            "finalization_failure": self.finalization_failure,
+            "run": _thaw(self.run),
+            "environment": _thaw(self.environment),
+            "profiles": _thaw(self.profiles),
+            "validation": _thaw(self.validation),
+            "scenarios": _thaw(self.scenarios),
+            "proofs": _thaw(self.proofs),
+            "retention": _thaw(self.retention),
+            "primary_failure": _thaw(self.primary_failure),
+            "cleanup_failure": _thaw(self.cleanup_failure),
+            "finalization_failure": _thaw(self.finalization_failure),
             "cleanup_status": self.cleanup_status,
             "overall": self.overall,
             "exit_code": self.exit_code,
@@ -642,8 +723,21 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
     if type(candidate.schema_version) is not int or candidate.schema_version != SCHEMA_VERSION:
         reasons.append("schema_version_mismatch")
     run = candidate.run or {}
-    if not _is_valid_required_string(run.get("run_id")):
+    run_id = run.get("run_id")
+    if not _is_valid_required_string(run_id):
         reasons.append("run_id_missing")
+    # Task 15 Task 11 corrective v9, Section 24/28: the final-validator
+    # boundary independently re-applies the SAME canonical run-ID
+    # grammar the builder (environment.assert_valid_run_id()) enforces
+    # -- never merely trusting that a candidate went through the
+    # builder. This is deliberately a SEPARATE check from
+    # `_is_valid_required_string` above (not an `elif`): a candidate
+    # that bypasses the builder entirely (e.g. hand-constructed with
+    # run_id="../bad") is a non-empty, non-"unknown" string that would
+    # otherwise satisfy the generic check while still being
+    # filesystem/DB-identifier unsafe.
+    if not validate_canonical_run_id(run_id):
+        reasons.append("run_id_malformed")
     git_sha = run.get("git_sha")
     # Task 15 Task 11 corrective v4, Section 10 (hardened by corrective
     # v5, Section 3): "exact valid git SHA representation used by this
@@ -666,8 +760,13 @@ def _validate_for_pass_metadata(candidate: ReleaseEvidence, reasons: list) -> No
     # below, which would leave a non-string platform value (e.g. `True`)
     # on the authoritative=False side undetected as long as `reason`
     # happened to already be correct.
+    # Task 15 Task 11 corrective v9, Section 5: `candidate.run["authority"]`
+    # is a deep-frozen `types.MappingProxyType`, not a plain `dict`, once
+    # ReleaseEvidence.__post_init__ has run -- `isinstance(x, Mapping)`
+    # (the ABC), never `isinstance(x, dict)`, is required here so this
+    # check keeps working against the frozen representation.
     if (
-        not isinstance(authority, dict)
+        not isinstance(authority, Mapping)
         or "authoritative" not in authority
         or not _is_valid_required_string(authority.get("platform"))
     ):
@@ -723,12 +822,15 @@ def _validate_for_pass_scenarios(candidate: ReleaseEvidence, reasons: list) -> N
         return
     for name in REQUIRED_SCENARIOS:
         result = scenarios[name]
-        if not isinstance(result, dict) or result.get("status") != "PASS":
+        # Task 15 Task 11 corrective v9, Section 5: `result`/`assertions`
+        # are deep-frozen `types.MappingProxyType` values, not plain
+        # `dict` -- `isinstance(x, Mapping)` (the ABC) is required.
+        if not isinstance(result, Mapping) or result.get("status") != "PASS":
             reasons.append(f"scenario_{name}_not_pass")
             continue
         required_keys = REQUIRED_SCENARIO_ASSERTIONS[name]
         assertions = result.get("assertions")
-        if not isinstance(assertions, dict) or set(assertions.keys()) != required_keys:
+        if not isinstance(assertions, Mapping) or set(assertions.keys()) != required_keys:
             reasons.append(f"scenario_{name}_assertion_set_mismatch")
             continue
         for key in required_keys:
@@ -751,8 +853,10 @@ def _validate_for_pass_proofs(candidate: ReleaseEvidence, reasons: list) -> None
             reasons.append(f"proof_{key}_missing_or_malformed")
 
     signature = proofs.get("signature")
+    # Task 15 Task 11 corrective v9, Section 5: `Mapping`, not `dict` --
+    # these are deep-frozen `types.MappingProxyType` values.
     if (
-        not isinstance(signature, dict)
+        not isinstance(signature, Mapping)
         or set(signature.keys()) != {"verified"}
         or type(signature.get("verified")) is not bool
     ):
@@ -761,7 +865,7 @@ def _validate_for_pass_proofs(candidate: ReleaseEvidence, reasons: list) -> None
         reasons.append("proof_signature_not_verified")
 
     outbox = proofs.get("outbox_to_inbox")
-    if not isinstance(outbox, dict) or set(outbox.keys()) != _OUTBOX_TO_INBOX_REQUIRED_KEYS:
+    if not isinstance(outbox, Mapping) or set(outbox.keys()) != _OUTBOX_TO_INBOX_REQUIRED_KEYS:
         reasons.append("proof_outbox_to_inbox_malformed")
     else:
         try:
@@ -832,7 +936,9 @@ def write_json_evidence(path, evidence: ReleaseEvidence, secrets: SecretRegistry
     _atomic_write_text(path, text)
 
 
-def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretRegistry) -> tuple[Path, Path]:
+def publish_evidence(
+    evidence_dir, evidence: ReleaseEvidence, secrets: SecretRegistry, resource_ledger=None
+) -> tuple[Path, Path]:
     """Task 15 Task 11 corrective v2, Section 13: publishes the
     JSON+Markdown evidence pair as a single all-or-nothing operation.
 
@@ -847,7 +953,20 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
     failure, a secret leak, a rename failure) removes the staging
     directory before re-raising, so a half-published pair -- a lone
     `release-evidence.json` with no matching `.md`, or vice versa -- is
-    never observable at the final location."""
+    never observable at the final location.
+
+    `resource_ledger` (Task 15 Task 11 corrective v9, Section 17):
+    an optional shared `gate_runner.ResourceLedger` -- when given, this
+    function acquires ownership of the staging directory the INSTANT
+    its physical creation succeeds (never only retroactively, on the
+    specific StagingCleanupError branch below), using the exact same
+    fixed safe_id gate_runner.py has always used for this resource
+    ("evidence_staging"), and releases it immediately after either the
+    atomic rename succeeds OR a post-failure cleanup verifiably removes
+    the staging directory -- never on the branch where that removal
+    itself also fails (genuine residue correctly stays owned). Defaults
+    to None, preserving the exact prior behavior (no ledger involvement
+    at all) for every existing caller that does not pass one."""
     evidence_dir = Path(evidence_dir)
     if evidence_dir.exists():
         raise EvidencePublicationError(f"release evidence directory already exists: {evidence_dir}")
@@ -859,11 +978,15 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
     staging_dir = evidence_dir.parent / f".{evidence_dir.name}.staging-{os.getpid()}-{uuid_module.uuid4().hex[:8]}"
     try:
         staging_dir.mkdir(parents=True, exist_ok=False)
+        if resource_ledger is not None:
+            resource_ledger.acquire("staging_dir", "evidence_staging")
         json_path = staging_dir / "release-evidence.json"
         markdown_path = staging_dir / "release-evidence.md"
         _atomic_write_text(json_path, json_text)
         _atomic_write_text(markdown_path, markdown_text)
         os.rename(str(staging_dir), str(evidence_dir))
+        if resource_ledger is not None:
+            resource_ledger.release("staging_dir", "evidence_staging")
     except BaseException as original_exc:
         # Task 15 Task 11 corrective v3, Section 21 (hardened by v4,
         # Section 28): staging cleanup on a failed publication is
@@ -892,13 +1015,27 @@ def publish_evidence(evidence_dir, evidence: ReleaseEvidence, secrets: SecretReg
             raise StagingCleanupError(
                 "evidence staging directory cleanup failed after a publication failure"
             ) from original_exc
+        else:
+            # Task 15 Task 11 corrective v9, Section 20: verified
+            # successful removal (or it was never created at all, the
+            # FileNotFoundError case above, in which case this is
+            # always a safe no-op) -- release now. Never released on
+            # the StagingCleanupError branch above, where disposal was
+            # NOT verified and genuine residue remains.
+            if resource_ledger is not None:
+                resource_ledger.release("staging_dir", "evidence_staging")
         raise
 
     return evidence_dir / "release-evidence.json", evidence_dir / "release-evidence.md"
 
 
 def _scenario_field(result, key: str, default=None):
-    if isinstance(result, dict):
+    # Task 15 Task 11 corrective v9, Section 5: `result` is normally a
+    # deep-frozen `types.MappingProxyType` (evidence.scenarios[name]),
+    # not a plain `dict` -- `isinstance(x, Mapping)` (the ABC) is
+    # required so this still reads correctly, alongside the
+    # attribute-based fallback for a raw dataclass/object.
+    if isinstance(result, Mapping):
         return result.get(key, default)
     return getattr(result, key, default)
 

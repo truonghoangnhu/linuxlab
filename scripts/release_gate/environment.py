@@ -16,7 +16,15 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_RUN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+# Task 15 Task 11 corrective v9, Section 26: `\Z` (true end of string),
+# never a permissive trailing `$` -- Python's `$` also matches
+# immediately BEFORE a single trailing "\n", so a `$`-anchored pattern
+# would wrongly accept a well-formed run_id followed by a trailing
+# newline as "whole string valid" (the exact live bug this corrective
+# closes: `assert_valid_run_id("rvalid\n")` did not raise before this
+# change). Paired with `.fullmatch()` (not `.match()`) at every call
+# site below for genuine whole-string semantics.
+_RUN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*\Z")
 # Task 15 Task 11 corrective v8, Section 24: the exact canonical Git SHA
 # shape this codebase's own resolve_git_sha() ("git rev-parse HEAD",
 # stripped) always produces -- `\Z`, never `$`, since Python's `$` also
@@ -55,23 +63,42 @@ def generate_run_id() -> str:
     return "r" + uuid.uuid4().hex[:12]
 
 
+def validate_canonical_run_id(value) -> bool:
+    """Task 15 Task 11 corrective v9, Section 24: the ONE pure canonical
+    run-ID grammar check, used independently at BOTH the builder
+    boundary (assert_valid_run_id() below, a thin wrapper around this)
+    and the final-validator boundary
+    (evidence._validate_for_pass_metadata()) -- so a hand-constructed
+    EvidenceV1 candidate that bypasses the builder entirely is still
+    caught. Returns True/False, never raises; a `str` SUBCLASS is
+    rejected via `type(x) is str` (never `isinstance`), since a
+    subclass could carry hidden/overridden behavior while still
+    comparing/matching equal to a well-formed run_id. Does not invent a
+    new maximum length -- reuses MAX_GATE_RUN_ID_BYTES exactly as
+    assert_valid_run_id() always has."""
+    if type(value) is not str or _RUN_ID_PATTERN.fullmatch(value) is None:
+        return False
+    return len(value.encode("ascii")) <= MAX_GATE_RUN_ID_BYTES
+
+
 def assert_valid_run_id(run_id: str) -> None:
+    if validate_canonical_run_id(run_id):
+        return
     # Task 15 Task 11 corrective v8, Section 24: `type(x) is str`, never
     # `isinstance` -- a str SUBCLASS could carry hidden/overridden
     # behavior while still comparing/matching equal to a well-formed
     # run_id; exact type matching rejects it regardless.
-    if type(run_id) is not str or not _RUN_ID_PATTERN.match(run_id):
+    if type(run_id) is not str or not _RUN_ID_PATTERN.fullmatch(run_id):
         raise PreflightError(f"run_id {run_id!r} is not filesystem/DB-name safe")
     byte_length = len(run_id.encode("ascii"))
-    if byte_length > MAX_GATE_RUN_ID_BYTES:
-        raise PreflightError(
-            f"run_id {run_id!r} is {byte_length} bytes, exceeding the "
-            f"{MAX_GATE_RUN_ID_BYTES}-byte limit derived from PostgreSQL's "
-            f"{POSTGRES_IDENTIFIER_MAX_BYTES}-byte identifier limit and the "
-            f"longest gate database name prefix ({LONGEST_GATE_DB_PREFIX!r}) -- "
-            "a longer run_id risks silent truncation and collision with a "
-            "different run"
-        )
+    raise PreflightError(
+        f"run_id {run_id!r} is {byte_length} bytes, exceeding the "
+        f"{MAX_GATE_RUN_ID_BYTES}-byte limit derived from PostgreSQL's "
+        f"{POSTGRES_IDENTIFIER_MAX_BYTES}-byte identifier limit and the "
+        f"longest gate database name prefix ({LONGEST_GATE_DB_PREFIX!r}) -- "
+        "a longer run_id risks silent truncation and collision with a "
+        "different run"
+    )
 
 
 def assert_valid_git_sha(git_sha) -> None:

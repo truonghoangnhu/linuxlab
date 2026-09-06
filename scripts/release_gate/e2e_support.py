@@ -132,7 +132,7 @@ class DualDeployment:
 
 
 @contextmanager
-def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None):
+def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None, resource_ledger=None):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
@@ -185,7 +185,22 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
     own ephemeral resources is traceably derived from the SAME outer
     run for the duration it exists, even though none of it survives
     past this function's own `finally`. Defaults to a freshly generated
-    run_id, preserving the exact prior behavior when omitted."""
+    run_id, preserving the exact prior behavior when omitted.
+
+    `resource_ledger` (Task 15 Task 11 corrective v9, Section 11-16): an
+    optional shared `gate_runner.ResourceLedger` -- when given, this
+    function acquires ownership of the workspace directory and BOTH
+    ephemeral databases the INSTANT each physical creation succeeds
+    (never retroactively inferred later from a cleanup-exception's
+    action name), and each cleanup action below releases its OWN
+    ledger entry immediately after its OWN physical disposal action
+    verifiably succeeds -- release is directly coupled to that exact
+    resource's own outcome, never to string-matching a cleanup action's
+    name against a table. Defaults to None, preserving the exact prior
+    behavior (no ledger involvement at all) for every existing caller
+    that does not pass one -- also set as `deployment.resource_ledger`
+    on the yielded object, since scenario code (e.g.
+    scenarios.run_backup_restore_smoke()) reads it from there."""
     run_id = run_id if run_id is not None else generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
@@ -197,8 +212,16 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
     private_key_path = None
     try:
         workspace.mkdir(parents=True)
+        if resource_ledger is not None:
+            resource_ledger.acquire("workspace", str(workspace))
+
         create_database(db_admin, gate_names, "central")
+        if resource_ledger is not None:
+            resource_ledger.acquire("central_db", gate_names.central)
+
         create_database(db_admin, gate_names, "node")
+        if resource_ledger is not None:
+            resource_ledger.acquire("node_db", gate_names.node)
 
         central_profile_env = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
         node_profile_env_for_migrate = {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"}
@@ -256,6 +279,14 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
             private_key_path=private_key_path,
             public_key_path=public_key_path,
         )
+        # Task 15 Task 11 corrective v9, Section 13: set directly on the
+        # yielded object here (not left to be assigned later by a
+        # caller such as gate_runner._run_one_scenario(), which used to
+        # be the ONLY place this got set, well AFTER workspace/database
+        # creation had already happened above) -- scenario code (e.g.
+        # scenarios.run_backup_restore_smoke()) reads
+        # `deployment.resource_ledger` unconditionally via getattr().
+        deployment.resource_ledger = resource_ledger
         yield deployment
     finally:
         current_node = deployment.node if deployment is not None else node
@@ -271,11 +302,39 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
         # Every execution resource -- workspace, both ephemeral
         # databases -- is destroyed unconditionally, success or
         # failure alike (Task 15 Task 11 corrective v2, Section 3).
-        cleanup_actions.append(("remove_workspace", lambda: remove_workspace(workspace)))
+        #
+        # Task 15 Task 11 corrective v9, Section 20/23: each action
+        # below releases its OWN ledger entry immediately after ITS OWN
+        # physical disposal action verifiably succeeds (the lambda body
+        # only reaches the `resource_ledger.release(...)` line if the
+        # preceding disposal call returned without raising) -- release
+        # is directly coupled to verified success of that exact
+        # resource's own disposal, with ZERO dependence on matching a
+        # cleanup action's name against any table. A resource that was
+        # never actually created (e.g. Node database creation itself
+        # failed) is simply never in the ledger to begin with, so
+        # releasing it here is always a safe no-op (ResourceLedger.
+        # release() on an absent entry is a no-op `set.discard()`).
+        def _remove_workspace_and_release():
+            remove_workspace(workspace)
+            if resource_ledger is not None:
+                resource_ledger.release("workspace", str(workspace))
+
+        def _drop_node_database_and_release():
+            drop_database(db_admin, gate_names, "node")
+            if resource_ledger is not None:
+                resource_ledger.release("node_db", gate_names.node)
+
+        def _drop_central_database_and_release():
+            drop_database(db_admin, gate_names, "central")
+            if resource_ledger is not None:
+                resource_ledger.release("central_db", gate_names.central)
+
+        cleanup_actions.append(("remove_workspace", _remove_workspace_and_release))
         # The hard invariant: Node database cleanup failing must never
         # skip Central database cleanup. Both are always attempted.
-        cleanup_actions.append(("drop_node_database", lambda: drop_database(db_admin, gate_names, "node")))
-        cleanup_actions.append(("drop_central_database", lambda: drop_database(db_admin, gate_names, "central")))
+        cleanup_actions.append(("drop_node_database", _drop_node_database_and_release))
+        cleanup_actions.append(("drop_central_database", _drop_central_database_and_release))
         run_cleanup_actions(cleanup_actions)
 
 
