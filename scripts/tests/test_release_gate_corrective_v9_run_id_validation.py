@@ -23,7 +23,12 @@ from scripts.release_gate.environment import (
     generate_run_id,
     validate_canonical_run_id,
 )
-from scripts.release_gate.evidence import SCHEMA_VERSION, ReleaseEvidence, validate_for_pass
+from scripts.release_gate.evidence import (
+    SCHEMA_VERSION,
+    ReleaseEvidence,
+    UnsupportedEvidenceValueError,
+    validate_for_pass,
+)
 
 _MALFORMED_RUN_IDS = [
     "rvalid\n",
@@ -124,10 +129,17 @@ def test_validate_for_pass_rejects_bypassed_candidate_with_malformed_run_id(bad_
 
 
 def test_validate_for_pass_rejects_bypassed_candidate_with_str_subclass_run_id():
+    """Task 15 Task 11 corrective v11, Section 5/9/12: `deep_freeze()`
+    now rejects an exact-type mismatch like `_StrSubclass` at snapshot
+    CONSTRUCTION time (ReleaseEvidence.__post_init__), strictly earlier
+    than validate_for_pass()'s own independent exact-type re-check --
+    a candidate carrying this sentinel can no longer be constructed at
+    all, so this asserts the stronger, earlier failure mode instead of
+    ever reaching a PassDecision."""
     run = dict(_make_candidate().run)
     run["run_id"] = _StrSubclass("rgoodrunid001")
-    decision = validate_for_pass(_make_candidate(run=run))
-    assert decision.eligible is False
+    with pytest.raises(UnsupportedEvidenceValueError):
+        _make_candidate(run=run)
 
 
 def test_validate_for_pass_reports_run_id_malformed_reason_for_path_traversal():

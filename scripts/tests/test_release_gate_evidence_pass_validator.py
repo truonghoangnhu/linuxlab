@@ -19,6 +19,7 @@ from scripts.release_gate.evidence import (
     SCHEMA_VERSION,
     PassDecision,
     ReleaseEvidence,
+    UnsupportedEvidenceValueError,
     validate_for_pass,
 )
 
@@ -623,25 +624,33 @@ def test_rejects_candidate_with_timezone_offset_hour_out_of_range():
 
 class _SneakyStr(str):
     """A str subclass -- `isinstance(_SneakyStr(...), str)` is True, but
-    `type(_SneakyStr(...)) is str` is False."""
+    `type(_SneakyStr(...)) is str` is False.
+
+    Task 15 Task 11 corrective v11, Section 5/9/12: `deep_freeze()` now
+    rejects an exact-type mismatch like this at snapshot CONSTRUCTION
+    time (ReleaseEvidence.__post_init__), strictly earlier than
+    validate_for_pass()'s own independent exact-type re-check further
+    below -- a candidate carrying this sentinel can no longer be
+    constructed at all, so the tests below assert the stronger,
+    earlier failure mode instead of ever reaching a PassDecision."""
 
 
 def test_rejects_candidate_with_str_subclass_package_sha256():
     proofs = dict(_GOOD_PROOFS)
     proofs["package_sha256"] = _SneakyStr("a" * 64)
-    decision = validate_for_pass(_make_candidate(proofs=proofs))
-    assert decision.eligible is False
+    with pytest.raises(UnsupportedEvidenceValueError):
+        _make_candidate(proofs=proofs)
 
 
 def test_rejects_candidate_with_str_subclass_git_sha():
     run = dict(_make_candidate().run)
     run["git_sha"] = _SneakyStr("a" * 40)
-    decision = validate_for_pass(_make_candidate(run=run))
-    assert decision.eligible is False
+    with pytest.raises(UnsupportedEvidenceValueError):
+        _make_candidate(run=run)
 
 
 def test_rejects_candidate_with_str_subclass_run_id():
     run = dict(_make_candidate().run)
     run["run_id"] = _SneakyStr("rgoodrun00001")
-    decision = validate_for_pass(_make_candidate(run=run))
-    assert decision.eligible is False
+    with pytest.raises(UnsupportedEvidenceValueError):
+        _make_candidate(run=run)

@@ -76,7 +76,7 @@ def _flush_until_delivered(node_profile_env, *, deadline_seconds=30, poll_interv
     return last_result
 
 
-def _tamper_signature(package_path):
+def _tamper_signature(package_path, *, deployment=None):
     package_bytes = package_path.read_bytes()
     reader = zipfile.ZipFile(io.BytesIO(package_bytes))
     members = {name: reader.read(name) for name in reader.namelist()}
@@ -89,6 +89,17 @@ def _tamper_signature(package_path):
         for name, data in members.items():
             writer.writestr(name, data)
     tampered_path = package_path.with_name(package_path.name + ".tampered")
+    # Task 15 Task 11 corrective v11, Section 22/26/27: reserved BEFORE
+    # the write below (the actual tampered-package producer) -- the
+    # tampered `.llpkg` was previously never individually ledger-owned
+    # at all (v10's audit gap), only implicitly covered by the
+    # enclosing workspace. Registered as the workspace's explicit
+    # structural child, exactly like every other generated `.llpkg`.
+    resource_ledger = getattr(deployment, "resource_ledger", None) if deployment is not None else None
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "temp_llpkg", str(tampered_path), parent_kind="workspace", parent_safe_id=str(deployment.tmp_dir)
+        )
     tampered_path.write_bytes(buffer.getvalue())
     return tampered_path
 
@@ -418,6 +429,17 @@ def run_n1_tampered_replacement(deployment) -> dict:
         deployment.tmp_dir
         / f"package-b-{republished_b['source_public_id']}-v{republished_b['package_version']}.llpkg"
     )
+    # Task 15 Task 11 corrective v10, Section 15 (hardened by corrective
+    # v11, Section 22/27): reserved BEFORE the build-and-sign-package
+    # action (the actual .llpkg producer) is invoked, mirroring
+    # e2e_support.author_and_package()'s own acquisition of its package,
+    # and registered as the workspace's explicit structural child
+    # (corrective v11, Section 13/15).
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "temp_llpkg", str(package_b_path), parent_kind="workspace", parent_safe_id=str(deployment.tmp_dir)
+        )
     run_action(
         deployment.central_profile_env,
         "build-and-sign-package",
@@ -430,13 +452,7 @@ def run_n1_tampered_replacement(deployment) -> dict:
         "--output-file",
         str(package_b_path),
     )
-    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
-    # this second physical .llpkg is confirmed created, mirroring
-    # e2e_support.author_and_package()'s own acquisition of its package.
-    resource_ledger = getattr(deployment, "resource_ledger", None)
-    if resource_ledger is not None:
-        resource_ledger.acquire("temp_llpkg", str(package_b_path))
-    tampered_b_path = _tamper_signature(package_b_path)
+    tampered_b_path = _tamper_signature(package_b_path, deployment=deployment)
 
     with pytest.raises(ActionError, match="PackageImportError") as exc_info:
         import_and_activate(deployment, tampered_b_path)
@@ -650,10 +666,23 @@ def run_n4_central_unavailable(deployment) -> dict:
                 "LINUXLAB_CENTRAL_URL": new_managed.base_url,
             }
 
+        central_restarted_log_path = deployment.tmp_dir / "central-restarted.log"
+        # Task 15 Task 11 corrective v11, Section 26/27: reserved BEFORE
+        # restart_gunicorn() (the actual log-file producer) is called --
+        # this restart log was never individually ledger-owned at all
+        # before v11 (audit gap identified by the v10 review).
+        resource_ledger = getattr(deployment, "resource_ledger", None)
+        if resource_ledger is not None:
+            resource_ledger.acquire(
+                "raw_runtime_log",
+                str(central_restarted_log_path),
+                parent_kind="workspace",
+                parent_safe_id=str(deployment.tmp_dir),
+            )
         restart_gunicorn(
             deployment.central,
             deployment.central_profile_env,
-            deployment.tmp_dir / "central-restarted.log",
+            central_restarted_log_path,
             timeout_seconds=20,
             on_replacement_started=_register_restarted_central,
         )
@@ -710,10 +739,21 @@ def run_n5_node_restart(deployment) -> dict:
     def _register_restarted_node(new_managed):
         deployment.node = new_managed
 
+    node_restarted_log_path = deployment.tmp_dir / "node-restarted.log"
+    # Task 15 Task 11 corrective v11, Section 26/27: reserved BEFORE
+    # restart_gunicorn() (the actual log-file producer) is called.
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "raw_runtime_log",
+            str(node_restarted_log_path),
+            parent_kind="workspace",
+            parent_safe_id=str(deployment.tmp_dir),
+        )
     restart_gunicorn(
         deployment.node,
         deployment.node_profile_env,
-        deployment.tmp_dir / "node-restarted.log",
+        node_restarted_log_path,
         timeout_seconds=20,
         on_replacement_started=_register_restarted_node,
     )
@@ -864,11 +904,25 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
     assert restored_pending_outbox["found"] is True
     assert restored_pending_outbox["state"] == "pending"
 
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+
     restored_central = None
     restored_node = None
     try:
         central_listener = reserve_listener()
-        restored_central = start_gunicorn(restored_central_env, central_listener, workspace / "restored-central.log")
+        restored_central_log_path = workspace / "restored-central.log"
+        # Task 15 Task 11 corrective v11, Section 26/27: reserved BEFORE
+        # start_gunicorn() (the actual log-file producer) is called --
+        # these restored logs were never individually ledger-owned at
+        # all before v11 (audit gap identified by the v10 review).
+        if resource_ledger is not None:
+            resource_ledger.acquire(
+                "raw_runtime_log",
+                str(restored_central_log_path),
+                parent_kind="workspace",
+                parent_safe_id=str(workspace),
+            )
+        restored_central = start_gunicorn(restored_central_env, central_listener, restored_central_log_path)
         wait_ready(restored_central, timeout_seconds=20)
 
         restored_node_env = {
@@ -880,7 +934,15 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
             "LINUXLAB_SYNC_ALLOW_INSECURE_HTTP": "true",
         }
         node_listener = reserve_listener()
-        restored_node = start_gunicorn(restored_node_env, node_listener, workspace / "restored-node.log")
+        restored_node_log_path = workspace / "restored-node.log"
+        if resource_ledger is not None:
+            resource_ledger.acquire(
+                "raw_runtime_log",
+                str(restored_node_log_path),
+                parent_kind="workspace",
+                parent_safe_id=str(workspace),
+            )
+        restored_node = start_gunicorn(restored_node_env, node_listener, restored_node_log_path)
         wait_ready(restored_node, timeout_seconds=20)
 
         fresh_session = http_bridge.LearnerSession.start(restored_node.base_url)
@@ -975,43 +1037,53 @@ def run_backup_restore_smoke(deployment) -> dict:
     )
     assert second_outbox["state"] == "pending"
 
+    # Task 15 Task 11 corrective v8, Section 9-11 (resource_ledger lookup
+    # itself hoisted here by corrective v10, Section 15, and further by
+    # corrective v11, Section 22/27 so each dump's reservation below can
+    # use it too): `resource_ledger` is attached by gate_runner.
+    # _run_one_scenario() (never required -- calling this scenario
+    # directly, as scripts.tests.test_release_gate_backup_restore.py's
+    # own baseline test does, is still fully supported without a ledger
+    # present).
+    #
+    # Disposal of the two restore databases acquired further below is
+    # NOT this scenario's own responsibility any more (Section 15/16:
+    # "restore disposal must execute under lifecycle stage CLEANUP") --
+    # see gate_runner._run_one_scenario()'s own restore-database cleanup
+    # step, which always runs after this function returns OR raises,
+    # regardless of outcome.
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+
     central_dump_path = deployment.tmp_dir / "central.dump"
     node_dump_path = deployment.tmp_dir / "node.dump"
+    # Task 15 Task 11 corrective v10, Section 15 (hardened by corrective
+    # v11, Section 22-27): each dump's reservation is acquired BEFORE
+    # its own dump_database() call (the actual pg_dump producer) --
+    # never only after BOTH succeed -- so a partial dump file left by a
+    # producer that raises partway through is already ledger-owned,
+    # closing the partial-write window. Registered as the workspace's
+    # explicit structural child (corrective v11, Section 13/15).
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "temp_dump", str(central_dump_path), parent_kind="workspace", parent_safe_id=str(deployment.tmp_dir)
+        )
     dump_database(deployment.db_admin, deployment.gate_names, "central", central_dump_path)
-    dump_database(deployment.db_admin, deployment.gate_names, "node", node_dump_path)
     assert central_dump_path.stat().st_size > 0
+
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "temp_dump", str(node_dump_path), parent_kind="workspace", parent_safe_id=str(deployment.tmp_dir)
+        )
+    dump_database(deployment.db_admin, deployment.gate_names, "node", node_dump_path)
     assert node_dump_path.stat().st_size > 0
 
-    # Task 15 Task 11 corrective v8, Section 9-11 (resource_ledger lookup
-    # itself hoisted here by corrective v10, Section 15, so the dump
-    # files acquired immediately below share it too): acquire ownership
-    # of each restore database in the shared resource-ownership ledger
+    # Task 15 Task 11 corrective v8, Section 9-11: acquire ownership of
+    # each restore database in the shared resource-ownership ledger
     # IMMEDIATELY once it is successfully created -- restore_central is
     # already ledger-owned before restore_node is even attempted, so a
     # partial-creation failure (restore_node's create raising after
     # restore_central's succeeded) can never leave a physically-created
-    # database the ledger doesn't yet know about. `resource_ledger` is
-    # attached by gate_runner._run_one_scenario() (never required --
-    # calling this scenario directly, as scripts.tests.
-    # test_release_gate_backup_restore.py's own baseline test does, is
-    # still fully supported without a ledger present).
-    #
-    # Disposal of these two databases is NOT this scenario's own
-    # responsibility any more (Section 15/16: "restore disposal must
-    # execute under lifecycle stage CLEANUP") -- see gate_runner.
-    # _run_one_scenario()'s own restore-database cleanup step, which
-    # always runs after this function returns OR raises, regardless of
-    # outcome.
-    resource_ledger = getattr(deployment, "resource_ledger", None)
-
-    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
-    # each dump file is confirmed physically present (the asserts above
-    # already proved it) -- never only implicitly covered by the
-    # enclosing workspace's own ledger entry.
-    if resource_ledger is not None:
-        resource_ledger.acquire("temp_dump", str(central_dump_path))
-        resource_ledger.acquire("temp_dump", str(node_dump_path))
-
+    # database the ledger doesn't yet know about.
     create_database(deployment.db_admin, deployment.gate_names, "restore_central")
     if resource_ledger is not None:
         resource_ledger.acquire("restore_central_db", deployment.gate_names.restore_central)

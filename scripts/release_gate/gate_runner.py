@@ -239,10 +239,26 @@ _RESOURCE_CLASS = {
 class ResourceRef:
     """One concrete owned resource: its category plus a SAFE identity
     (a database name or filesystem path -- never a credential, DSN,
-    private-key, or payload; Section 17)."""
+    private-key, or payload; Section 17).
+
+    `parent_kind`/`parent_safe_id` (Task 15 Task 11 corrective v11,
+    Section 13): the EXPLICIT, STRUCTURAL parent this resource was
+    registered under at acquisition time (or relocated to later --
+    see `ResourceLedger.relocate()`), never inferred from a path-string
+    prefix (Section 14 bans that outright: `/tmp/run` and
+    `/tmp/run-outside/file.dump` share a string prefix but are not
+    parent/child). `compare=False` -- a resource's IDENTITY (used by
+    every existing `acquire()`/`release()`/`contains()` call site
+    throughout this codebase, none of which know or care about parent
+    info) remains exactly `(kind, safe_id)`, exactly as before this
+    corrective; parent info is carried metadata, not part of equality/
+    hashing, so an existing bare `ResourceRef(kind=k, safe_id=s)` probe
+    still matches a stored entry that happens to carry parent fields."""
 
     kind: str
     safe_id: str
+    parent_kind: str | None = field(default=None, compare=False)
+    parent_safe_id: str | None = field(default=None, compare=False)
 
 
 class ResourceLedger:
@@ -256,14 +272,110 @@ class ResourceLedger:
     def __init__(self):
         self._owned: set[ResourceRef] = set()
 
-    def acquire(self, kind: str, safe_id: str) -> None:
-        self._owned.add(ResourceRef(kind=kind, safe_id=safe_id))
+    def acquire(self, kind: str, safe_id: str, *, parent_kind: str | None = None, parent_safe_id: str | None = None) -> None:
+        self._owned.add(ResourceRef(kind=kind, safe_id=safe_id, parent_kind=parent_kind, parent_safe_id=parent_safe_id))
 
     def release(self, kind: str, safe_id: str) -> None:
         self._owned.discard(ResourceRef(kind=kind, safe_id=safe_id))
 
     def contains(self, kind: str, safe_id: str) -> bool:
         return ResourceRef(kind=kind, safe_id=safe_id) in self._owned
+
+    def relocate(
+        self,
+        kind: str,
+        old_safe_id: str,
+        new_safe_id: str,
+        *,
+        parent_kind: str | None = None,
+        parent_safe_id: str | None = None,
+    ) -> None:
+        """Task 15 Task 11 corrective v11, Section 19: updates the
+        ledger explicitly when gate code moves/renames an owned
+        resource to a new physical locator -- the resource must never
+        move physically while the ledger continues to point only at
+        its stale old locator. The old (kind, old_safe_id) entry is
+        released and a new one is acquired under `new_safe_id`, with
+        whatever parent (if any) is given -- defaulting to no parent,
+        so a resource relocated OUTSIDE its original parent (Section
+        21's own adversarial case) is correctly no longer that parent's
+        child at all."""
+        self.release(kind, old_safe_id)
+        self.acquire(kind, new_safe_id, parent_kind=parent_kind, parent_safe_id=parent_safe_id)
+
+    def children_of(self, parent_kind: str, parent_safe_id: str) -> tuple:
+        """Task 15 Task 11 corrective v11, Section 13/16: every
+        currently-owned resource whose recorded parent is EXACTLY this
+        (kind, safe_id) pair -- structural identity, never a path-
+        string prefix match."""
+        return tuple(
+            sorted(
+                (
+                    ref
+                    for ref in self._owned
+                    if ref.parent_kind == parent_kind and ref.parent_safe_id == parent_safe_id
+                ),
+                key=lambda ref: (ref.kind, ref.safe_id),
+            )
+        )
+
+    def reconcile_verified_parent_removal(self, parent_kind: str, parent_safe_id: str) -> None:
+        """Task 15 Task 11 corrective v11, Section 16/17/20/21: called
+        ONLY after the caller has already independently verified that
+        the parent resource's own physical removal succeeded. Releases
+        each registered child of this EXACT parent (matched structurally
+        via `children_of()`, never a path-string prefix) whose OWN
+        locator is independently re-confirmed absent here -- recursing
+        into any further descendants of a released child (Section 15's
+        WORKSPACE -> TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG nesting, and
+        the deeper OUTER_ROOT -> WORKSPACE -> ... chain), so a
+        grandchild is released once its own parent chain up to the
+        removed root is confirmed gone. A child whose locator still
+        physically exists (Section 19/21: it was relocated outside the
+        parent, or the parent's own removal did not actually reach it)
+        remains owned, together with everything still registered
+        beneath IT -- never a blind release of an entire subtree merely
+        because the top-level parent path was removed (Section 17: "no
+        blind descendant release").
+
+        A resource that carries no matching structural parent at all
+        (e.g. one a test/caller registered directly without ever going
+        through the real acquisition path that would have set one) is
+        still reconciled here via a SECONDARY, genuine-path-containment
+        check (Section 14: "If path containment is ever needed for
+        verification, use true normalized path semantics... and only as
+        a secondary check, not as ownership source-of-truth") --
+        `Path.resolve()` + `relative_to()`, never a string-prefix match.
+        This is never used AS a substitute for structural identity on
+        its own: it only ever releases a resource that is BOTH genuinely
+        (not merely string-) contained within the removed parent's own
+        locator AND independently confirmed physically absent, exactly
+        the same two-part proof required of an explicit child. A same-
+        prefix SIBLING such as `/tmp/run-outside/file.dump` against
+        parent `/tmp/run` fails the genuine-containment test (`relative_
+        to()` raises `ValueError` -- it is not actually a subpath) and
+        so is never touched by this fallback either."""
+        explicit_children = self.children_of(parent_kind, parent_safe_id)
+        for child in explicit_children:
+            if not os.path.exists(child.safe_id):
+                self.release(child.kind, child.safe_id)
+                self.reconcile_verified_parent_removal(child.kind, child.safe_id)
+
+        try:
+            resolved_parent = Path(parent_safe_id).resolve()
+        except (OSError, ValueError):
+            return
+        explicit_child_keys = {(child.kind, child.safe_id) for child in explicit_children}
+        for ref in self.all_retained_resources():
+            if (ref.kind, ref.safe_id) in explicit_child_keys:
+                continue
+            try:
+                Path(ref.safe_id).resolve().relative_to(resolved_parent)
+            except (OSError, ValueError):
+                continue
+            if not os.path.exists(ref.safe_id):
+                self.release(ref.kind, ref.safe_id)
+                self.reconcile_verified_parent_removal(ref.kind, ref.safe_id)
 
     def retained_execution_resources(self) -> tuple:
         """Task 15 Task 11 corrective v10, Section 13: every resource
@@ -678,7 +790,19 @@ def _run_one_scenario(
         # factory in a fast orchestration test -- still finds a working
         # ledger reference at `deployment.resource_ledger`).
         with dual_deployment_factory(
-            scenario_tmp_dir, run_id=child_run_id, resource_ledger=state.resources
+            scenario_tmp_dir,
+            run_id=child_run_id,
+            resource_ledger=state.resources,
+            # Task 15 Task 11 corrective v11, Section 13/15: the real
+            # dual_deployment() registers its own workspace as this
+            # EXACT parent's structural child (never inferred from a
+            # path prefix) -- `scenario_tmp_dir.parent` is always the
+            # run's own outer temp root (see the `tmp_root_path / name`
+            # construction just above this function's own caller). A
+            # fake/test dual_deployment_factory that does not accept or
+            # use these kwargs still works unchanged (`**kwargs`).
+            parent_kind=ResourceKind.OUTER_ROOT,
+            parent_safe_id=str(scenario_tmp_dir.parent),
         ) as deployment:
             # STARTUP covers deployment context entry AND every post-
             # enter setup step before the scenario callable itself --
@@ -1285,24 +1409,23 @@ def _run_release_gate(
             # ever registered at all).
             state.resources.release(ResourceKind.OUTER_ROOT, str(tmp_root_path))
             # Task 15 Task 11 corrective v7, Section 15 (broadened by
-            # corrective v10, Section 19): outer-root removal succeeding
-            # means every scenario workspace nested inside it -- and
-            # every workspace-contained artifact within THAT (.llpkg,
-            # dump, runtime log; Section 16/18) -- is now ALSO gone,
-            # even if an earlier per-scenario cleanup attempt failed to
-            # remove it individually. Path-PREFIX reconciliation (never
-            # kind-name-matching) releases any still-owned ref whose
-            # safe_id lives under this exact verified-removed root --
-            # `all_retained_resources()` (unfiltered by resource class)
-            # is used here since this is about PHYSICAL proof of
-            # disposal, not PASS-gating classification. A resource with
-            # a non-path safe_id (a database name, or the fixed literal
-            # "evidence_staging") can never spuriously match a real
-            # filesystem path prefix.
-            root_prefix = str(tmp_root_path)
-            for ref in state.resources.all_retained_resources():
-                if ref.safe_id.startswith(root_prefix):
-                    state.resources.release(ref.kind, ref.safe_id)
+            # corrective v10, Section 19; hardened by corrective v11,
+            # Section 14/16/20): outer-root removal succeeding means
+            # every scenario workspace nested inside it -- and every
+            # workspace-contained artifact within THAT (.llpkg, dump,
+            # runtime log; Section 16/18) -- is now ALSO gone, even if
+            # an earlier per-scenario cleanup attempt failed to remove
+            # it individually. Structural parent/child reconciliation
+            # (never a path-string PREFIX match -- corrective v11,
+            # Section 14 forbids that outright: two unrelated paths can
+            # share a string prefix without one containing the other)
+            # releases only a resource explicitly registered as this
+            # exact root's descendant, and only once ITS OWN locator is
+            # independently re-verified absent, cascading through
+            # however many levels of nesting (OUTER_ROOT -> WORKSPACE ->
+            # TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG) are actually
+            # registered.
+            state.resources.reconcile_verified_parent_removal(ResourceKind.OUTER_ROOT, str(tmp_root_path))
         except FileNotFoundError:
             # Already gone -- verified absence is itself verified
             # disposal (Section 20), so the outer root is released here

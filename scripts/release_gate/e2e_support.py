@@ -132,7 +132,16 @@ class DualDeployment:
 
 
 @contextmanager
-def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None, resource_ledger=None):
+def dual_deployment(
+    tmp_path,
+    *,
+    sync_enabled=True,
+    start_node=True,
+    run_id=None,
+    resource_ledger=None,
+    parent_kind=None,
+    parent_safe_id=None,
+):
     """Stand up two real ephemeral PostgreSQL databases and (unless
     `start_node=False`, for scenarios that need Node offline/absent) two
     real Gunicorn processes, with a real issued Node sync credential
@@ -200,7 +209,22 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
     behavior (no ledger involvement at all) for every existing caller
     that does not pass one -- also set as `deployment.resource_ledger`
     on the yielded object, since scenario code (e.g.
-    scenarios.run_backup_restore_smoke()) reads it from there."""
+    scenarios.run_backup_restore_smoke()) reads it from there.
+
+    `parent_kind`/`parent_safe_id` (Task 15 Task 11 corrective v11,
+    Section 13/15): when given (gate_runner._run_one_scenario() always
+    supplies its own outer temp root here), the workspace resource is
+    registered as this EXACT resource's explicit structural child --
+    never inferred from a path-string prefix (Section 14). Every
+    workspace-contained artifact this function itself acquires below
+    (both raw runtime logs) is in turn registered as the WORKSPACE's own
+    child, so a verified-successful removal at ANY level can cascade
+    release correctly (see ResourceLedger.reconcile_verified_parent_
+    removal()) without ever matching on path strings. Defaults to None,
+    preserving plain top-level (unparented) workspace registration for
+    every caller that does not supply an enclosing parent (e.g. a test
+    calling dual_deployment() directly with no outer-root concept at
+    all)."""
     run_id = run_id if run_id is not None else generate_run_id()
     gate_names = GateDatabaseNames.for_run(run_id)
     db_admin = db_admin_from_env()
@@ -213,7 +237,9 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
     try:
         workspace.mkdir(parents=True)
         if resource_ledger is not None:
-            resource_ledger.acquire("workspace", str(workspace))
+            resource_ledger.acquire(
+                "workspace", str(workspace), parent_kind=parent_kind, parent_safe_id=parent_safe_id
+            )
 
         create_database(db_admin, gate_names, "central")
         if resource_ledger is not None:
@@ -235,14 +261,18 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
             "DJANGO_SETTINGS_MODULE": "linuxlab.settings.central",
             "POSTGRES_DB": gate_names.central,
         }
-        central = start_gunicorn(central_profile_env, central_listener, workspace / "central.log")
-        # Task 15 Task 11 corrective v10, Section 15: acquired the
-        # INSTANT start_gunicorn() returns -- Gunicorn opens its log
-        # file handle at process startup, before it can ever become
-        # ready, so this is the honest "physically exists" point,
-        # strictly before wait_ready()'s own readiness probe.
+        central_log_path = workspace / "central.log"
+        # Task 15 Task 11 corrective v10, Section 15 (hardened by
+        # corrective v11, Section 22/27): reserved BEFORE start_gunicorn
+        # (the actual log-file producer) is even called -- never only
+        # after it returns -- so the ledger owns this obligation across
+        # the entire window Gunicorn could partially create/write the
+        # file, not just from the instant the call happens to succeed.
         if resource_ledger is not None:
-            resource_ledger.acquire("raw_runtime_log", str(workspace / "central.log"))
+            resource_ledger.acquire(
+                "raw_runtime_log", str(central_log_path), parent_kind="workspace", parent_safe_id=str(workspace)
+            )
+        central = start_gunicorn(central_profile_env, central_listener, central_log_path)
         wait_ready(central, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         credential = run_action(
@@ -261,9 +291,14 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
 
         if start_node:
             node_listener = reserve_listener()
-            node = start_gunicorn(node_profile_env, node_listener, workspace / "node.log")
+            node_log_path = workspace / "node.log"
+            # Reserved before start_gunicorn() is called -- see the
+            # matching central_log_path comment above.
             if resource_ledger is not None:
-                resource_ledger.acquire("raw_runtime_log", str(workspace / "node.log"))
+                resource_ledger.acquire(
+                    "raw_runtime_log", str(node_log_path), parent_kind="workspace", parent_safe_id=str(workspace)
+                )
+            node = start_gunicorn(node_profile_env, node_listener, node_log_path)
             wait_ready(node, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         # Kept as a local reference (not just yielded) so `finally` below
@@ -327,24 +362,24 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
         def _remove_workspace_and_release():
             remove_workspace(workspace)
             if resource_ledger is not None:
-                # Task 15 Task 11 corrective v10, Section 16-18: verified
-                # successful workspace removal means every gate-owned
-                # artifact it physically contained (.llpkg, dump, raw
-                # runtime log) is now ALSO gone, even if any of them was
-                # never independently disposed of on its own -- release
-                # every still-owned ref whose safe_id is a path
-                # CONTAINED WITHIN this exact workspace (path-prefix
-                # reconciliation, mirroring the outer-root's own
-                # analogous sweep in gate_runner._run_release_gate())
-                # before releasing the workspace itself. If workspace
-                # removal above raised instead, none of this runs --
-                # surviving descendants correctly remain ledger-owned
-                # (Section 18's failure case).
-                workspace_prefix = str(workspace)
-                for ref in resource_ledger.all_retained_resources():
-                    if ref.safe_id.startswith(workspace_prefix):
-                        resource_ledger.release(ref.kind, ref.safe_id)
-                resource_ledger.release("workspace", workspace_prefix)
+                # Task 15 Task 11 corrective v10, Section 16-18
+                # (hardened by corrective v11, Section 14/16/20):
+                # verified successful workspace removal means every
+                # gate-owned artifact it physically contained (.llpkg,
+                # dump, raw runtime log) is now ALSO gone, even if any
+                # of them was never independently disposed of on its
+                # own -- release every resource explicitly registered as
+                # this exact workspace's structural child (never a
+                # path-string prefix match; corrective v11 Section 14
+                # forbids that -- two unrelated paths can share a string
+                # prefix without one containing the other) whose OWN
+                # locator is independently re-verified absent, before
+                # releasing the workspace itself. If workspace removal
+                # above raised instead, none of this runs -- surviving
+                # descendants correctly remain ledger-owned (Section
+                # 18's failure case).
+                resource_ledger.reconcile_verified_parent_removal("workspace", str(workspace))
+                resource_ledger.release("workspace", str(workspace))
 
         def _drop_node_database_and_release():
             drop_database(db_admin, gate_names, "node")
@@ -382,6 +417,19 @@ def author_and_package(deployment, *, prompt, options, correct_option_id, max_sc
     )
 
     package_path = deployment.tmp_dir / f"package-{authored['source_public_id']}-v{authored['package_version']}.llpkg"
+    # Task 15 Task 11 corrective v10, Section 15 (hardened by corrective
+    # v11, Section 22/27): reserved BEFORE the build-and-sign-package
+    # action (the actual .llpkg producer) is even invoked -- never only
+    # after it returns -- so the ledger owns this obligation across the
+    # entire window that CLI action could partially create the file
+    # before failing, not just from the instant it happens to succeed.
+    # Registered as the enclosing workspace's explicit structural child
+    # (never inferred from a path prefix; corrective v11 Section 13/15).
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+    if resource_ledger is not None:
+        resource_ledger.acquire(
+            "temp_llpkg", str(package_path), parent_kind="workspace", parent_safe_id=str(deployment.tmp_dir)
+        )
     run_action(
         deployment.central_profile_env,
         "build-and-sign-package",
@@ -394,14 +442,6 @@ def author_and_package(deployment, *, prompt, options, correct_option_id, max_sc
         "--output-file",
         str(package_path),
     )
-    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
-    # the physical .llpkg file is confirmed created (the preceding
-    # run_action() call is what actually creates it on disk) -- never
-    # only implicitly covered by the enclosing workspace's own ledger
-    # entry.
-    resource_ledger = getattr(deployment, "resource_ledger", None)
-    if resource_ledger is not None:
-        resource_ledger.acquire("temp_llpkg", str(package_path))
 
     return authored, package_path
 

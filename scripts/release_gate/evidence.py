@@ -519,14 +519,43 @@ class UnsupportedEvidenceValueError(Exception):
     evidence."""
 
 
-# Task 15 Task 11 corrective v10, Section 8/9: the closed set of leaf
-# value types `deep_freeze()` ever returns unchanged -- every real call
-# site in this codebase (FailureRecord.to_dict(), scenario details,
-# proof/assertion values, environment/validation metadata) only ever
-# produces these plus the recursively-handled container types, so this
-# check is a narrowly-scoped defensive backstop, not a general-purpose
-# type system.
+# Task 15 Task 11 corrective v10, Section 8/9 (hardened by corrective
+# v11, Section 5): the closed set of leaf value types `deep_freeze()`
+# ever returns unchanged -- every real call site in this codebase
+# (FailureRecord.to_dict(), scenario details, proof/assertion values,
+# environment/validation metadata) only ever produces these plus the
+# recursively-handled container types, so this check is a narrowly-
+# scoped defensive backstop, not a general-purpose type system.
 _SAFE_LEAF_TYPES = (str, int, float, bool, type(None), bytes)
+
+
+def _is_exact_safe_leaf(value) -> bool:
+    """Task 15 Task 11 corrective v11, Section 5: `type(value) in
+    _SAFE_LEAF_TYPES`, never `isinstance(value, _SAFE_LEAF_TYPES)` -- a
+    `str`/`int` SUBCLASS (e.g. a `MutableString(str)` carrying hidden
+    mutable attributes or overridden `__eq__`/`__hash__`/`__str__`
+    behavior) satisfies `isinstance` while still comparing/printing as
+    if it were the plain builtin, so only an EXACT type match closes
+    this -- `type(x)` is the subclass itself, never `in` the fixed
+    tuple of real builtin type objects."""
+    return type(value) in _SAFE_LEAF_TYPES
+
+
+def _validate_canonical_mapping_key(key) -> None:
+    """Task 15 Task 11 corrective v11, Section 6/8: every terminal
+    mapping key must be an exact canonical `str` -- never a `str`
+    subclass, a custom hashable object, or any other caller-controlled
+    key object. Rejected outright rather than normalized with
+    `str(key)`, which would silently discard the distinction between a
+    genuine string key and an attacker-supplied stand-in whose
+    `__hash__`/`__eq__` could still be mutated by the caller after this
+    call returns (the key-analogue of corrective v10's value-alias
+    attack -- Section 8's "mapping-key alias attack must fail")."""
+    if type(key) is not str:
+        raise UnsupportedEvidenceValueError(
+            f"deep_freeze() encountered a mapping key of type {type(key).__name__!r} "
+            "that is not an exact canonical str"
+        )
 
 
 def deep_freeze(value):
@@ -564,14 +593,29 @@ def deep_freeze(value):
     detached/frozen -- rather than returning it unchanged as if it were
     safe, this raises UnsupportedEvidenceValueError so snapshot
     construction fails closed instead of silently retaining an opaque
-    mutable reference."""
+    mutable reference.
+
+    Task 15 Task 11 corrective v11, Section 5/6/8/9: hardened further --
+    every mapping KEY is validated as an exact canonical `str` before
+    its value is even recursed into (_validate_canonical_mapping_key(),
+    rejecting a `str` subclass or a custom/mutable hashable key exactly
+    like the ORIGINAL v10 value-alias attack, but for keys), and every
+    scalar LEAF is required to be an EXACT builtin type
+    (_is_exact_safe_leaf(), never `isinstance`) -- a `str`/`int`
+    subclass carrying hidden mutable attributes or overridden behavior
+    is rejected here rather than silently retained as if it were the
+    plain builtin it merely resembles."""
     if isinstance(value, Mapping):
-        return types.MappingProxyType({key: deep_freeze(item) for key, item in value.items()})
+        frozen_items = {}
+        for key, item in value.items():
+            _validate_canonical_mapping_key(key)
+            frozen_items[key] = deep_freeze(item)
+        return types.MappingProxyType(frozen_items)
     if isinstance(value, (list, tuple)):
         return tuple(deep_freeze(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(deep_freeze(item) for item in value)
-    if isinstance(value, _SAFE_LEAF_TYPES):
+    if _is_exact_safe_leaf(value):
         return value
     raise UnsupportedEvidenceValueError(
         f"deep_freeze() encountered an unsupported mutable value of type "
