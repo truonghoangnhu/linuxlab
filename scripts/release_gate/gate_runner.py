@@ -86,7 +86,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -237,6 +238,19 @@ _RESOURCE_CLASS = {
 }
 
 
+class ResourceOwnershipError(Exception):
+    """Task 15 Task 11 corrective v12, Section 18: raised when `acquire()`
+    is called for a `(kind, safe_id)` pair that is already ACTIVELY
+    owned. Before this corrective, a duplicate acquire was silently
+    accepted (a Python `set.add()` of an already-equal element is a
+    no-op that keeps the ORIGINAL stored element, discarding whatever
+    new parent metadata the second call carried) -- a caller could
+    believe a resource's parent had just been updated when it had not
+    been. Rejecting outright makes this fail loudly instead. A resource
+    that has been genuinely released is free to be re-acquired -- this
+    only ever fires against a currently-active resource."""
+
+
 @dataclass(frozen=True)
 class ResourceRef:
     """One concrete owned resource: its category plus a SAFE identity
@@ -255,33 +269,106 @@ class ResourceRef:
     info) remains exactly `(kind, safe_id)`, exactly as before this
     corrective; parent info is carried metadata, not part of equality/
     hashing, so an existing bare `ResourceRef(kind=k, safe_id=s)` probe
-    still matches a stored entry that happens to carry parent fields."""
+    still matches a stored entry that happens to carry parent fields.
+
+    `resource_id`/`parent_resource_id` (Task 15 Task 11 corrective v12,
+    Section 14-19): a STABLE, opaque identity assigned once at
+    `acquire()` and preserved across `relocate()` -- unlike `(kind,
+    safe_id)`, which changes the instant a resource's locator changes,
+    `resource_id` never does. `parent_resource_id` is the acquiring/
+    relocating call's best-effort resolution of `parent_kind`/
+    `parent_safe_id` to whatever resource_id was actively registered
+    under that (kind, safe_id) pair at that moment (`None` if nothing
+    matched -- e.g. a caller that registers structural parent-info
+    metadata without the parent itself ever being a real ledger entry,
+    same as `parent_kind`/`parent_safe_id` always tolerated). Also
+    `compare=False`, for the same reason as the two fields above."""
 
     kind: str
     safe_id: str
     parent_kind: str | None = field(default=None, compare=False)
     parent_safe_id: str | None = field(default=None, compare=False)
+    resource_id: str = field(default="", compare=False)
+    parent_resource_id: str | None = field(default=None, compare=False)
 
 
 class ResourceLedger:
-    """Task 15 Task 11 corrective v7, Section 10: the ONE authoritative
-    resource-ownership ledger. A resource enters the ledger when
-    ownership acquisition is attempted and leaves it ONLY once cleanup
-    of that EXACT resource has been verified successful (Section 12) --
-    never optimistically assumed clean. `RunState.resources` is the only
-    instance of this that exists for a given run."""
+    """Task 15 Task 11 corrective v7, Section 10 (hardened by corrective
+    v12, Section 14-23): the ONE authoritative resource-ownership
+    ledger. A resource enters the ledger when ownership acquisition is
+    attempted and leaves it ONLY once cleanup of that EXACT resource has
+    been verified successful (Section 12) -- never optimistically
+    assumed clean. `RunState.resources` is the only instance of this
+    that exists for a given run.
+
+    Internally keyed by the stable `resource_id` corrective v12
+    introduces (`_records`), with `_locator_index` as a secondary,
+    non-authoritative `(kind, safe_id) -> resource_id` lookup -- every
+    existing call site in this codebase (and every v7-v11 regression
+    test) addresses resources by `(kind, safe_id)` exactly as before;
+    this class resolves that to the stable record underneath without
+    requiring any caller to change."""
 
     def __init__(self):
-        self._owned: set[ResourceRef] = set()
+        self._records: dict[str, ResourceRef] = {}
+        self._locator_index: dict[tuple[str, str], str] = {}
 
-    def acquire(self, kind: str, safe_id: str, *, parent_kind: str | None = None, parent_safe_id: str | None = None) -> None:
-        self._owned.add(ResourceRef(kind=kind, safe_id=safe_id, parent_kind=parent_kind, parent_safe_id=parent_safe_id))
+    def acquire(self, kind: str, safe_id: str, *, parent_kind: str | None = None, parent_safe_id: str | None = None) -> str:
+        """Registers a new resource and returns its stable `resource_id`
+        (Task 15 Task 11 corrective v12, Section 17). Raises
+        `ResourceOwnershipError` if `(kind, safe_id)` is already
+        actively owned (Section 18) -- never silently keeps the
+        original entry's now-stale parent metadata."""
+        locator_key = (kind, safe_id)
+        if locator_key in self._locator_index:
+            raise ResourceOwnershipError(
+                f"resource already actively owned for kind={kind!r} safe_id={safe_id!r} -- "
+                "duplicate acquisition is rejected rather than silently preserving or "
+                "updating parent metadata"
+            )
+        parent_ref = (
+            self._locator_index.get((parent_kind, parent_safe_id))
+            if parent_kind is not None and parent_safe_id is not None
+            else None
+        )
+        resource_id = uuid.uuid4().hex
+        ref = ResourceRef(
+            kind=kind,
+            safe_id=safe_id,
+            parent_kind=parent_kind,
+            parent_safe_id=parent_safe_id,
+            resource_id=resource_id,
+            parent_resource_id=parent_ref,
+        )
+        self._records[resource_id] = ref
+        self._locator_index[locator_key] = resource_id
+        return resource_id
 
     def release(self, kind: str, safe_id: str) -> None:
-        self._owned.discard(ResourceRef(kind=kind, safe_id=safe_id))
+        resource_id = self._locator_index.pop((kind, safe_id), None)
+        if resource_id is not None:
+            self._records.pop(resource_id, None)
 
     def contains(self, kind: str, safe_id: str) -> bool:
-        return ResourceRef(kind=kind, safe_id=safe_id) in self._owned
+        return (kind, safe_id) in self._locator_index
+
+    def get(self, resource_id: str) -> ResourceRef | None:
+        """Task 15 Task 11 corrective v12, Section 16/31: stable lookup
+        by `resource_id` -- returns `None` once that exact resource has
+        been released (there is deliberately no way to look up a
+        released resource_id; a released resource is simply gone, same
+        as `contains()` already treats a released `(kind, safe_id))`."""
+        return self._records.get(resource_id)
+
+    def set_parent(self, resource_id: str, parent_resource_id: str | None) -> None:
+        """Task 15 Task 11 corrective v12, Section 18: explicit,
+        deterministic parent metadata update through a dedicated API --
+        never as a side effect of a second `acquire()` call on the same
+        locator (which `acquire()` now rejects outright)."""
+        ref = self._records.get(resource_id)
+        if ref is None:
+            raise ResourceOwnershipError(f"no active resource for resource_id={resource_id!r}")
+        self._records[resource_id] = replace(ref, parent_resource_id=parent_resource_id)
 
     def relocate(
         self,
@@ -292,18 +379,43 @@ class ResourceLedger:
         parent_kind: str | None = None,
         parent_safe_id: str | None = None,
     ) -> None:
-        """Task 15 Task 11 corrective v11, Section 19: updates the
-        ledger explicitly when gate code moves/renames an owned
-        resource to a new physical locator -- the resource must never
-        move physically while the ledger continues to point only at
-        its stale old locator. The old (kind, old_safe_id) entry is
-        released and a new one is acquired under `new_safe_id`, with
-        whatever parent (if any) is given -- defaulting to no parent,
-        so a resource relocated OUTSIDE its original parent (Section
-        21's own adversarial case) is correctly no longer that parent's
-        child at all."""
-        self.release(kind, old_safe_id)
-        self.acquire(kind, new_safe_id, parent_kind=parent_kind, parent_safe_id=parent_safe_id)
+        """Task 15 Task 11 corrective v11, Section 19 (hardened by
+        corrective v12, Section 20): updates the ledger explicitly when
+        gate code moves/renames an owned resource to a new physical
+        locator -- the resource must never move physically while the
+        ledger continues to point only at its stale old locator.
+
+        Task 15 Task 11 corrective v12, Section 20: this is now an
+        in-place update of the existing record -- never `release(old) +
+        acquire(new)` -- so the resource's stable `resource_id` (and
+        therefore any child's already-captured `parent_resource_id`
+        pointing at it) survives the move unchanged; only `safe_id`
+        (and, explicitly, `parent_kind`/`parent_safe_id`/
+        `parent_resource_id`) are updated. Parent defaults to none, so a
+        resource relocated OUTSIDE its original parent (Section 21's
+        own adversarial case) is correctly no longer that parent's
+        child at all unless a new parent is explicitly given."""
+        old_locator_key = (kind, old_safe_id)
+        resource_id = self._locator_index.pop(old_locator_key, None)
+        if resource_id is None:
+            raise ResourceOwnershipError(
+                f"cannot relocate an unowned resource: kind={kind!r} safe_id={old_safe_id!r}"
+            )
+        old_ref = self._records[resource_id]
+        parent_ref = (
+            self._locator_index.get((parent_kind, parent_safe_id))
+            if parent_kind is not None and parent_safe_id is not None
+            else None
+        )
+        new_ref = replace(
+            old_ref,
+            safe_id=new_safe_id,
+            parent_kind=parent_kind,
+            parent_safe_id=parent_safe_id,
+            parent_resource_id=parent_ref,
+        )
+        self._records[resource_id] = new_ref
+        self._locator_index[(kind, new_safe_id)] = resource_id
 
     def children_of(self, parent_kind: str, parent_safe_id: str) -> tuple:
         """Task 15 Task 11 corrective v11, Section 13/16: every
@@ -314,7 +426,7 @@ class ResourceLedger:
             sorted(
                 (
                     ref
-                    for ref in self._owned
+                    for ref in self._records.values()
                     if ref.parent_kind == parent_kind and ref.parent_safe_id == parent_safe_id
                 ),
                 key=lambda ref: (ref.kind, ref.safe_id),
@@ -392,7 +504,7 @@ class ResourceLedger:
         execution-resource retention."""
         return tuple(
             sorted(
-                (ref for ref in self._owned if _RESOURCE_CLASS.get(ref.kind) == ResourceClass.EXECUTION),
+                (ref for ref in self._records.values() if _RESOURCE_CLASS.get(ref.kind) == ResourceClass.EXECUTION),
                 key=lambda ref: (ref.kind, ref.safe_id),
             )
         )
@@ -405,10 +517,10 @@ class ResourceLedger:
         directory, regardless of its class) rather than for PASS-gating
         logic, which must always go through `retained_execution_
         resources()` instead."""
-        return tuple(sorted(self._owned, key=lambda ref: (ref.kind, ref.safe_id)))
+        return tuple(sorted(self._records.values(), key=lambda ref: (ref.kind, ref.safe_id)))
 
     def is_empty(self) -> bool:
-        return not self._owned
+        return not self._records
 
 
 @dataclass
