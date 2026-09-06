@@ -498,6 +498,17 @@ class FailureRecord:
     code: str  # exception type name
     safe_message: str
 
+    def __post_init__(self):
+        # Task 15 Task 11 corrective v12, Section 7: every field here is
+        # authoritative terminal-evidence content once embedded in
+        # ReleaseEvidence.{primary,cleanup,finalization}_failure -- sealed
+        # at construction, independent of whether/how it is later
+        # embedded, exactly like ReleaseEvidence's own top-level scalars.
+        _validate_exact_type(self.category, str, field_name="FailureRecord.category")
+        _validate_exact_type(self.stage, str, field_name="FailureRecord.stage")
+        _validate_exact_type(self.code, str, field_name="FailureRecord.code")
+        _validate_exact_type(self.safe_message, str, field_name="FailureRecord.safe_message")
+
     def to_dict(self) -> dict:
         return {
             "category": self.category,
@@ -527,6 +538,25 @@ class UnsupportedEvidenceValueError(Exception):
 # recursively-handled container types, so this check is a narrowly-
 # scoped defensive backstop, not a general-purpose type system.
 _SAFE_LEAF_TYPES = (str, int, float, bool, type(None), bytes)
+
+
+def _validate_exact_type(value, expected_type: type, *, field_name: str):
+    """Task 15 Task 11 corrective v12, Section 5/6/7: rejects anything
+    that is not an EXACT instance of `expected_type` -- never
+    `isinstance()`, which a subclass (carrying hidden mutable state or
+    overridden `__eq__`/`__str__` behavior while still comparing/
+    printing as the plain builtin it merely resembles) would satisfy.
+    `expected_type is int` also correctly rejects `bool` (a `True`/
+    `False` passed where an exact `int` is required) since `type(True)
+    is bool`, never `int`, even though `isinstance(True, int)` is True.
+    Never coerces via `str(value)`/`int(value)` -- an unsupported value
+    fails construction rather than being silently normalized."""
+    if type(value) is not expected_type:
+        raise UnsupportedEvidenceValueError(
+            f"{field_name} must be an exact {expected_type.__name__}, "
+            f"got {type(value).__name__!r}"
+        )
+    return value
 
 
 def _is_exact_safe_leaf(value) -> bool:
@@ -682,6 +712,15 @@ class ReleaseEvidence:
     exit_code: int
 
     def __post_init__(self):
+        # Task 15 Task 11 corrective v12, Section 5/8: top-level terminal
+        # scalar fields are never dict/Mapping-shaped, so they never went
+        # through deep_freeze() below at all -- sealed here, first,
+        # BEFORE any nested field is touched, so a construction failure
+        # on one of these never depends on nested-field processing order.
+        _validate_exact_type(self.schema_version, int, field_name="ReleaseEvidence.schema_version")
+        _validate_exact_type(self.cleanup_status, str, field_name="ReleaseEvidence.cleanup_status")
+        _validate_exact_type(self.overall, str, field_name="ReleaseEvidence.overall")
+        _validate_exact_type(self.exit_code, int, field_name="ReleaseEvidence.exit_code")
         # object.__setattr__ is required here -- the dataclass itself is
         # frozen, so ordinary attribute assignment (even from inside
         # __post_init__) would raise dataclasses.FrozenInstanceError.

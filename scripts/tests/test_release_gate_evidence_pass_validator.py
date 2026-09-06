@@ -526,9 +526,13 @@ def test_rejects_candidate_with_malformed_node_profile(bad_value):
 def test_rejects_candidate_with_schema_version_true():
     """`True == 1` in Python, so a naive `!=` comparison against
     SCHEMA_VERSION (1) would wrongly accept the bool True as a valid
-    schema_version."""
-    decision = validate_for_pass(_make_candidate(schema_version=True))
-    assert decision.eligible is False
+    schema_version. Task 15 Task 11 corrective v12, Section 6: this is
+    now caught even earlier, at ReleaseEvidence construction itself
+    (constructor-sealed terminal scalars), rather than only later by
+    validate_for_pass() -- a candidate with a bool schema_version can no
+    longer be constructed at all."""
+    with pytest.raises(UnsupportedEvidenceValueError):
+        _make_candidate(schema_version=True)
 
 
 @pytest.mark.parametrize("bad_value", [True, False, 12345, None, "", "unknown"])
