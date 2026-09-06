@@ -507,34 +507,76 @@ class FailureRecord:
         }
 
 
-def deep_freeze(value):
-    """Task 15 Task 11 corrective v9, Section 5/6: recursively converts
-    a value into an immutable, fully-DETACHED equivalent -- a `dict`
-    becomes a `types.MappingProxyType` wrapping a BRAND NEW dict whose
-    values are each recursively frozen (this both deep-copies/detaches
-    from the original mutable input AND makes item assignment raise
-    `TypeError`); `list`/`tuple` become a tuple of recursively-frozen
-    items; `set` becomes a `frozenset`; anything else (str/int/float/
-    bool/None, and an already-frozen/immutable value) is returned
-    unchanged. Idempotent and safe to call on an already-frozen value
-    (e.g. re-freezing a field copied from a previously-built
-    ReleaseEvidence): a `MappingProxyType`/tuple/frozenset simply falls
-    through the final `return value` branch unmodified, since it is
-    already immutable and already detached from whatever mutable
-    structure it may once have come from.
+class UnsupportedEvidenceValueError(Exception):
+    """Task 15 Task 11 corrective v10, Section 9: raised when
+    `deep_freeze()` encounters a value that is neither a known-safe
+    immutable scalar (str/int/float/bool/None/bytes) nor one of the
+    recursively-handled container types (any `collections.abc.Mapping`,
+    `list`/`tuple`, `set`/`frozenset`) -- e.g. a custom class instance
+    with mutable attributes. Such a value cannot be safely detached/
+    frozen, so snapshot construction is rejected rather than silently
+    admitting an opaque mutable reference into supposedly-immutable
+    evidence."""
 
-    A read-only wrapper over an ALIASED mutable dict would be
-    insufficient (spec Section 5) -- the dict COMPREHENSION below
-    builds a genuinely new backing dict for every nested mapping, so
-    mutating the ORIGINAL input after this call can never be reflected
-    here."""
-    if isinstance(value, dict):
+
+# Task 15 Task 11 corrective v10, Section 8/9: the closed set of leaf
+# value types `deep_freeze()` ever returns unchanged -- every real call
+# site in this codebase (FailureRecord.to_dict(), scenario details,
+# proof/assertion values, environment/validation metadata) only ever
+# produces these plus the recursively-handled container types, so this
+# check is a narrowly-scoped defensive backstop, not a general-purpose
+# type system.
+_SAFE_LEAF_TYPES = (str, int, float, bool, type(None), bytes)
+
+
+def deep_freeze(value):
+    """Task 15 Task 11 corrective v9, Section 5/6 (hardened by
+    corrective v10, Section 7-9): recursively converts a value into an
+    immutable, fully-DETACHED equivalent -- any `collections.abc.
+    Mapping` (a plain `dict`, a `types.MappingProxyType`, or a custom
+    Mapping implementation alike) becomes a `types.MappingProxyType`
+    wrapping a BRAND NEW dict whose values are each recursively frozen
+    (this both deep-copies/detaches from the original mutable input AND
+    makes item assignment raise `TypeError`, regardless of what kind of
+    Mapping it started life as -- `.items()` is part of the Mapping ABC
+    contract); `list`/`tuple` become a tuple of recursively-frozen
+    items; `set`/`frozenset` become a `frozenset`; a known-safe scalar
+    (str/int/float/bool/None/bytes) is returned unchanged. Idempotent
+    and safe to call on an already-frozen value (e.g. re-freezing a
+    field copied from a previously-built ReleaseEvidence): a
+    `MappingProxyType` is itself a Mapping, so it is simply rebuilt into
+    a new, equivalent, still-detached one -- redundant but harmless.
+
+    A read-only wrapper over an ALIASED mutable dict is NOT sufficient
+    on its own (spec Section 7/11) -- `isinstance(value, dict)` alone
+    would miss a `types.MappingProxyType` (it is not a `dict` subclass),
+    letting that exact aliased, caller-owned backing dict flow through
+    unchanged. Checking `isinstance(value, Mapping)` (the ABC) instead,
+    and always rebuilding via the dict COMPREHENSION below, guarantees a
+    genuinely new backing dict for every nested mapping regardless of
+    its concrete type, so mutating the ORIGINAL input (or its backing
+    dict, if it was a proxy) after this call can never be reflected
+    here.
+
+    Task 15 Task 11 corrective v10, Section 9: a value that is neither a
+    Mapping/list/tuple/set/frozenset nor a known-safe scalar (e.g. a
+    custom class instance with mutable attributes) cannot be safely
+    detached/frozen -- rather than returning it unchanged as if it were
+    safe, this raises UnsupportedEvidenceValueError so snapshot
+    construction fails closed instead of silently retaining an opaque
+    mutable reference."""
+    if isinstance(value, Mapping):
         return types.MappingProxyType({key: deep_freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(deep_freeze(item) for item in value)
-    if isinstance(value, set):
+    if isinstance(value, (set, frozenset)):
         return frozenset(deep_freeze(item) for item in value)
-    return value
+    if isinstance(value, _SAFE_LEAF_TYPES):
+        return value
+    raise UnsupportedEvidenceValueError(
+        f"deep_freeze() encountered an unsupported mutable value of type "
+        f"{type(value).__name__!r} that cannot be safely detached/frozen"
+    )
 
 
 def _thaw(value):

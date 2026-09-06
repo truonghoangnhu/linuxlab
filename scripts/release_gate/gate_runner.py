@@ -115,6 +115,7 @@ from scripts.release_gate.evidence import (
     StagingCleanupError,
     build_typed_assertions,
     build_typed_proofs,
+    deep_freeze,
     publish_evidence,
     validate_for_pass,
 )
@@ -169,12 +170,19 @@ class PublicationOutcome:
 
 
 class ResourceKind:
-    """Task 15 Task 11 corrective v7, Section 10/11: the closed set of
-    execution-resource categories the ledger tracks. Restore Central/
-    Node databases are first-class members here -- never inferred only
-    from a cleanup-exception's action name (Section 11: "Restore DBs
-    are first-class resources, not inferred from cleanup error
-    names")."""
+    """Task 15 Task 11 corrective v7, Section 10/11 (extended by
+    corrective v10, Section 12/15): the closed set of resource
+    categories the ledger tracks. Restore Central/Node databases are
+    first-class members here -- never inferred only from a cleanup-
+    exception's action name (Section 11: "Restore DBs are first-class
+    resources, not inferred from cleanup error names"). TEMP_LLPKG/
+    TEMP_DUMP/RAW_RUNTIME_LOG (corrective v10, Section 15) give the
+    generated `.llpkg` package, backup/restore dump files, and owned
+    Gunicorn runtime logs individual live ownership entries while they
+    physically exist, even though their physical disposal remains
+    delegated to the enclosing workspace's own cleanup (Section 16-18:
+    "do not require redundant per-file delete operations merely for
+    ledger bookkeeping")."""
 
     CENTRAL_DB = "central_db"
     NODE_DB = "node_db"
@@ -183,6 +191,48 @@ class ResourceKind:
     WORKSPACE = "workspace"
     OUTER_ROOT = "outer_root"
     STAGING_DIR = "staging_dir"
+    TEMP_LLPKG = "temp_llpkg"
+    TEMP_DUMP = "temp_dump"
+    RAW_RUNTIME_LOG = "raw_runtime_log"
+
+
+class ResourceClass:
+    """Task 15 Task 11 corrective v10, Section 12: a closed resource-
+    class taxonomy separating genuine EXECUTION residue (databases,
+    workspace, and the workspace-contained artifacts within it) from
+    PUBLICATION residue (the evidence staging directory) and
+    INFRASTRUCTURE residue (the run's own outer temp root) -- so a
+    retained INFRASTRUCTURE/PUBLICATION-only resource is never
+    misreported as retained EXECUTION state (Section 13/14: "this
+    separates semantic retention reporting from overall release-gate
+    success" -- PASS remains blocked through the co-occurring cleanup/
+    publication failure that every real code path leaving one of these
+    retained already records, never through this field)."""
+
+    EXECUTION = "EXECUTION"
+    PUBLICATION = "PUBLICATION"
+    INFRASTRUCTURE = "INFRASTRUCTURE"
+
+
+# Task 15 Task 11 corrective v10, Section 12: every ResourceKind maps to
+# EXACTLY one ResourceClass. Exact enum names/mapping shape may differ
+# from the design spec's own illustrative suggestion (Section 12 says
+# so explicitly) -- this is the smallest closed mapping that satisfies
+# it: every workspace-contained resource (including the three new
+# artifact kinds) is EXECUTION, the evidence staging directory is
+# PUBLICATION, and the run's own outer temp root is INFRASTRUCTURE.
+_RESOURCE_CLASS = {
+    ResourceKind.CENTRAL_DB: ResourceClass.EXECUTION,
+    ResourceKind.NODE_DB: ResourceClass.EXECUTION,
+    ResourceKind.RESTORE_CENTRAL_DB: ResourceClass.EXECUTION,
+    ResourceKind.RESTORE_NODE_DB: ResourceClass.EXECUTION,
+    ResourceKind.WORKSPACE: ResourceClass.EXECUTION,
+    ResourceKind.TEMP_LLPKG: ResourceClass.EXECUTION,
+    ResourceKind.TEMP_DUMP: ResourceClass.EXECUTION,
+    ResourceKind.RAW_RUNTIME_LOG: ResourceClass.EXECUTION,
+    ResourceKind.STAGING_DIR: ResourceClass.PUBLICATION,
+    ResourceKind.OUTER_ROOT: ResourceClass.INFRASTRUCTURE,
+}
 
 
 @dataclass(frozen=True)
@@ -216,9 +266,31 @@ class ResourceLedger:
         return ResourceRef(kind=kind, safe_id=safe_id) in self._owned
 
     def retained_execution_resources(self) -> tuple:
-        """Every resource still owned, in a fixed (kind, safe_id) order
-        -- never sensitive to insertion order, since a `set` carries
-        none worth relying on."""
+        """Task 15 Task 11 corrective v10, Section 13: every resource
+        still owned WHOSE KIND CLASSIFIES AS EXECUTION, in a fixed
+        (kind, safe_id) order -- never sensitive to insertion order,
+        since a `set` carries none worth relying on. A retained
+        PUBLICATION (evidence staging) or INFRASTRUCTURE (outer root)
+        resource is deliberately excluded here (Section 13/14): it
+        remains fully tracked -- see `all_retained_resources()` -- and
+        can still block PASS through its own cleanup/publication
+        failure state, but must never be conflated with genuine
+        execution-resource retention."""
+        return tuple(
+            sorted(
+                (ref for ref in self._owned if _RESOURCE_CLASS.get(ref.kind) == ResourceClass.EXECUTION),
+                key=lambda ref: (ref.kind, ref.safe_id),
+            )
+        )
+
+    def all_retained_resources(self) -> tuple:
+        """Task 15 Task 11 corrective v10, Section 14: the FULL retained
+        set, unfiltered by resource class -- for audit/diagnostic use
+        and for cross-resource reconciliation (Section 19: releasing
+        every still-owned ref contained within a verified-removed
+        directory, regardless of its class) rather than for PASS-gating
+        logic, which must always go through `retained_execution_
+        resources()` instead."""
         return tuple(sorted(self._owned, key=lambda ref: (ref.kind, ref.safe_id)))
 
     def is_empty(self) -> bool:
@@ -409,8 +481,20 @@ DEFAULT_SCENARIO_SPECS = (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GateRunResult:
+    """Task 15 Task 11 corrective v10, Section 4-6: the entire returned
+    terminal result graph must be immutable, not only `ReleaseEvidence`
+    nested inside it -- a cached emergency result (see
+    `_EMERGENCY_RESULTS` below) is a module-level global returned BY
+    REFERENCE on every call that hits that path, so if this dataclass
+    were mutable, a caller mutating one field (e.g. `overall = "PASS"`)
+    would PERMANENTLY corrupt that cached global for every subsequent
+    run for the rest of the process's lifetime. Frozen at the top level
+    (blocking field reassignment) AND with `terminal_failure` deep-
+    frozen in `__post_init__` (blocking nested item mutation) closes
+    both vectors."""
+
     overall: str
     exit_code: int
     evidence: ReleaseEvidence | None
@@ -431,6 +515,16 @@ class GateRunResult:
     # (PASS, any ordinary failure category, or the emergency path
     # alike) -- there is no other value a caller ever observes.
     stage: str = Stage.DONE
+
+    def __post_init__(self):
+        # object.__setattr__ is required here -- the dataclass itself is
+        # frozen, so ordinary attribute assignment (even from inside
+        # __post_init__) would raise dataclasses.FrozenInstanceError.
+        # `evidence`/`evidence_dir`/`json_path`/`markdown_path` need no
+        # special handling: `evidence` is already deeply immutable via
+        # ReleaseEvidence's own __post_init__, and a `Path` has no
+        # mutating methods.
+        object.__setattr__(self, "terminal_failure", deep_freeze(self.terminal_failure))
 
 
 def _build_emergency_results() -> None:
@@ -1190,16 +1284,24 @@ def _run_release_gate(
             # below, which used to be the ONLY place this resource was
             # ever registered at all).
             state.resources.release(ResourceKind.OUTER_ROOT, str(tmp_root_path))
-            # Task 15 Task 11 corrective v7, Section 15: outer-root
-            # removal succeeding means every scenario workspace nested
-            # inside it is now ALSO gone, even if an earlier per-
-            # scenario cleanup attempt failed to remove it individually
-            # -- release any such historically-retained workspace entry
-            # now that real end-state confirms it no longer exists,
-            # rather than leaving retention truth stuck at a stale,
-            # more-pessimistic historical value.
-            for ref in state.resources.retained_execution_resources():
-                if ref.kind == ResourceKind.WORKSPACE:
+            # Task 15 Task 11 corrective v7, Section 15 (broadened by
+            # corrective v10, Section 19): outer-root removal succeeding
+            # means every scenario workspace nested inside it -- and
+            # every workspace-contained artifact within THAT (.llpkg,
+            # dump, runtime log; Section 16/18) -- is now ALSO gone,
+            # even if an earlier per-scenario cleanup attempt failed to
+            # remove it individually. Path-PREFIX reconciliation (never
+            # kind-name-matching) releases any still-owned ref whose
+            # safe_id lives under this exact verified-removed root --
+            # `all_retained_resources()` (unfiltered by resource class)
+            # is used here since this is about PHYSICAL proof of
+            # disposal, not PASS-gating classification. A resource with
+            # a non-path safe_id (a database name, or the fixed literal
+            # "evidence_staging") can never spuriously match a real
+            # filesystem path prefix.
+            root_prefix = str(tmp_root_path)
+            for ref in state.resources.all_retained_resources():
+                if ref.safe_id.startswith(root_prefix):
                     state.resources.release(ref.kind, ref.safe_id)
         except FileNotFoundError:
             # Already gone -- verified absence is itself verified

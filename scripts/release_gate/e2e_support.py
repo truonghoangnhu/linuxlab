@@ -236,6 +236,13 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
             "POSTGRES_DB": gate_names.central,
         }
         central = start_gunicorn(central_profile_env, central_listener, workspace / "central.log")
+        # Task 15 Task 11 corrective v10, Section 15: acquired the
+        # INSTANT start_gunicorn() returns -- Gunicorn opens its log
+        # file handle at process startup, before it can ever become
+        # ready, so this is the honest "physically exists" point,
+        # strictly before wait_ready()'s own readiness probe.
+        if resource_ledger is not None:
+            resource_ledger.acquire("raw_runtime_log", str(workspace / "central.log"))
         wait_ready(central, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         credential = run_action(
@@ -255,6 +262,8 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
         if start_node:
             node_listener = reserve_listener()
             node = start_gunicorn(node_profile_env, node_listener, workspace / "node.log")
+            if resource_ledger is not None:
+                resource_ledger.acquire("raw_runtime_log", str(workspace / "node.log"))
             wait_ready(node, timeout_seconds=READY_TIMEOUT_SECONDS)
 
         # Kept as a local reference (not just yielded) so `finally` below
@@ -318,7 +327,24 @@ def dual_deployment(tmp_path, *, sync_enabled=True, start_node=True, run_id=None
         def _remove_workspace_and_release():
             remove_workspace(workspace)
             if resource_ledger is not None:
-                resource_ledger.release("workspace", str(workspace))
+                # Task 15 Task 11 corrective v10, Section 16-18: verified
+                # successful workspace removal means every gate-owned
+                # artifact it physically contained (.llpkg, dump, raw
+                # runtime log) is now ALSO gone, even if any of them was
+                # never independently disposed of on its own -- release
+                # every still-owned ref whose safe_id is a path
+                # CONTAINED WITHIN this exact workspace (path-prefix
+                # reconciliation, mirroring the outer-root's own
+                # analogous sweep in gate_runner._run_release_gate())
+                # before releasing the workspace itself. If workspace
+                # removal above raised instead, none of this runs --
+                # surviving descendants correctly remain ledger-owned
+                # (Section 18's failure case).
+                workspace_prefix = str(workspace)
+                for ref in resource_ledger.all_retained_resources():
+                    if ref.safe_id.startswith(workspace_prefix):
+                        resource_ledger.release(ref.kind, ref.safe_id)
+                resource_ledger.release("workspace", workspace_prefix)
 
         def _drop_node_database_and_release():
             drop_database(db_admin, gate_names, "node")
@@ -368,6 +394,14 @@ def author_and_package(deployment, *, prompt, options, correct_option_id, max_sc
         "--output-file",
         str(package_path),
     )
+    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
+    # the physical .llpkg file is confirmed created (the preceding
+    # run_action() call is what actually creates it on disk) -- never
+    # only implicitly covered by the enclosing workspace's own ledger
+    # entry.
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+    if resource_ledger is not None:
+        resource_ledger.acquire("temp_llpkg", str(package_path))
 
     return authored, package_path
 

@@ -430,6 +430,12 @@ def run_n1_tampered_replacement(deployment) -> dict:
         "--output-file",
         str(package_b_path),
     )
+    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
+    # this second physical .llpkg is confirmed created, mirroring
+    # e2e_support.author_and_package()'s own acquisition of its package.
+    resource_ledger = getattr(deployment, "resource_ledger", None)
+    if resource_ledger is not None:
+        resource_ledger.acquire("temp_llpkg", str(package_b_path))
     tampered_b_path = _tamper_signature(package_b_path)
 
     with pytest.raises(ActionError, match="PackageImportError") as exc_info:
@@ -976,8 +982,10 @@ def run_backup_restore_smoke(deployment) -> dict:
     assert central_dump_path.stat().st_size > 0
     assert node_dump_path.stat().st_size > 0
 
-    # Task 15 Task 11 corrective v8, Section 9-11: acquire ownership of
-    # each restore database in the shared resource-ownership ledger
+    # Task 15 Task 11 corrective v8, Section 9-11 (resource_ledger lookup
+    # itself hoisted here by corrective v10, Section 15, so the dump
+    # files acquired immediately below share it too): acquire ownership
+    # of each restore database in the shared resource-ownership ledger
     # IMMEDIATELY once it is successfully created -- restore_central is
     # already ledger-owned before restore_node is even attempted, so a
     # partial-creation failure (restore_node's create raising after
@@ -995,6 +1003,14 @@ def run_backup_restore_smoke(deployment) -> dict:
     # always runs after this function returns OR raises, regardless of
     # outcome.
     resource_ledger = getattr(deployment, "resource_ledger", None)
+
+    # Task 15 Task 11 corrective v10, Section 15: acquired the instant
+    # each dump file is confirmed physically present (the asserts above
+    # already proved it) -- never only implicitly covered by the
+    # enclosing workspace's own ledger entry.
+    if resource_ledger is not None:
+        resource_ledger.acquire("temp_dump", str(central_dump_path))
+        resource_ledger.acquire("temp_dump", str(node_dump_path))
 
     create_database(deployment.db_admin, deployment.gate_names, "restore_central")
     if resource_ledger is not None:
