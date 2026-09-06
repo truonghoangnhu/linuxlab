@@ -360,6 +360,15 @@ class ResourceLedger:
         as `contains()` already treats a released `(kind, safe_id))`."""
         return self._records.get(resource_id)
 
+    def get_by_locator(self, kind: str, safe_id: str) -> ResourceRef | None:
+        """Task 15 Task 11 corrective v12, Section 15/17: the secondary,
+        non-authoritative `(kind, safe_id) -> resource_id` lookup,
+        exposed directly for a caller that already has a locator and
+        wants the stable record it currently resolves to -- `locator`
+        changes are never identity; this is lookup convenience only."""
+        resource_id = self._locator_index.get((kind, safe_id))
+        return self._records.get(resource_id) if resource_id is not None else None
+
     def set_parent(self, resource_id: str, parent_resource_id: str | None) -> None:
         """Task 15 Task 11 corrective v12, Section 18: explicit,
         deterministic parent metadata update through a dedicated API --

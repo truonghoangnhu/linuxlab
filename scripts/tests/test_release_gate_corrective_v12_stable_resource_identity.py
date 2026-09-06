@@ -53,6 +53,22 @@ def test_two_distinct_locators_get_distinct_resource_ids():
     assert first_id != second_id
 
 
+def test_get_by_locator_resolves_the_same_stable_record_as_get(tmp_path):
+    ledger = gate_runner.ResourceLedger()
+    locator = str(tmp_path / "workspace")
+    resource_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, locator)
+
+    by_locator = ledger.get_by_locator(gate_runner.ResourceKind.WORKSPACE, locator)
+    assert by_locator is not None
+    assert by_locator.resource_id == resource_id
+    assert by_locator is ledger.get(resource_id)
+
+
+def test_get_by_locator_returns_none_for_unknown_locator():
+    ledger = gate_runner.ResourceLedger()
+    assert ledger.get_by_locator(gate_runner.ResourceKind.WORKSPACE, "/never/acquired") is None
+
+
 # --- Section 32: stable parent IDs -------------------------------------------
 
 
