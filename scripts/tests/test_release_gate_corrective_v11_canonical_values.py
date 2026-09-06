@@ -234,7 +234,12 @@ def test_deep_freeze_still_accepts_exact_builtin_scalars_unchanged():
     assert deep_freeze(1.5) == 1.5
     assert deep_freeze(True) is True
     assert deep_freeze(None) is None
-    assert deep_freeze(b"raw-bytes") == b"raw-bytes"
+    # Task 15 Task 11 corrective v12, Section 4/10: `bytes` was removed
+    # from the canonical terminal scalar algebra -- it is no longer a
+    # safe leaf, and now raises like any other unsupported value (see
+    # test_release_gate_corrective_v12_export_algebra.py).
+    with pytest.raises(UnsupportedEvidenceValueError):
+        deep_freeze(b"raw-bytes")
 
 
 # --- RED test 32.4: renderer exact-leaf export -------------------------------

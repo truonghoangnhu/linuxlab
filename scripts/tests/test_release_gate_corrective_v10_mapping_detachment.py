@@ -213,7 +213,11 @@ def test_deep_freeze_still_accepts_every_known_safe_scalar_and_container_type():
     assert deep_freeze(1.5) == 1.5
     assert deep_freeze(True) is True
     assert deep_freeze(None) is None
-    assert deep_freeze(b"raw-bytes") == b"raw-bytes"
+    # Task 15 Task 11 corrective v12, Section 4/10: `bytes` was removed
+    # from the canonical terminal scalar algebra -- see
+    # test_release_gate_corrective_v12_export_algebra.py.
+    with pytest.raises(UnsupportedEvidenceValueError):
+        deep_freeze(b"raw-bytes")
 
     frozen = deep_freeze({"a": [1, 2], "b": (3, 4), "c": {5, 6}})
     assert isinstance(frozen, types.MappingProxyType)

@@ -504,10 +504,10 @@ class FailureRecord:
         # ReleaseEvidence.{primary,cleanup,finalization}_failure -- sealed
         # at construction, independent of whether/how it is later
         # embedded, exactly like ReleaseEvidence's own top-level scalars.
-        _validate_exact_type(self.category, str, field_name="FailureRecord.category")
-        _validate_exact_type(self.stage, str, field_name="FailureRecord.stage")
-        _validate_exact_type(self.code, str, field_name="FailureRecord.code")
-        _validate_exact_type(self.safe_message, str, field_name="FailureRecord.safe_message")
+        validate_exact_type(self.category, str, field_name="FailureRecord.category")
+        validate_exact_type(self.stage, str, field_name="FailureRecord.stage")
+        validate_exact_type(self.code, str, field_name="FailureRecord.code")
+        validate_exact_type(self.safe_message, str, field_name="FailureRecord.safe_message")
 
     def to_dict(self) -> dict:
         return {
@@ -531,16 +531,21 @@ class UnsupportedEvidenceValueError(Exception):
 
 
 # Task 15 Task 11 corrective v10, Section 8/9 (hardened by corrective
-# v11, Section 5): the closed set of leaf value types `deep_freeze()`
-# ever returns unchanged -- every real call site in this codebase
-# (FailureRecord.to_dict(), scenario details, proof/assertion values,
-# environment/validation metadata) only ever produces these plus the
-# recursively-handled container types, so this check is a narrowly-
-# scoped defensive backstop, not a general-purpose type system.
-_SAFE_LEAF_TYPES = (str, int, float, bool, type(None), bytes)
+# v11, Section 5; narrowed by corrective v12, Section 4/10): the closed
+# set of leaf value types `deep_freeze()` ever returns unchanged --
+# every real call site in this codebase (FailureRecord.to_dict(),
+# scenario details, proof/assertion values, environment/validation
+# metadata) only ever produces these plus the recursively-handled
+# container types, so this check is a narrowly-scoped defensive
+# backstop, not a general-purpose type system. `bytes` was removed here
+# by corrective v12 -- it was never part of the canonical terminal
+# scalar algebra (Section 4: str/int/float/bool/None only) and no real
+# call site ever actually produced it; retaining it as "safe" would
+# have let raw bytes reach published JSON/Markdown evidence unnoticed.
+_SAFE_LEAF_TYPES = (str, int, float, bool, type(None))
 
 
-def _validate_exact_type(value, expected_type: type, *, field_name: str):
+def validate_exact_type(value, expected_type: type, *, field_name: str):
     """Task 15 Task 11 corrective v12, Section 5/6/7: rejects anything
     that is not an EXACT instance of `expected_type` -- never
     `isinstance()`, which a subclass (carrying hidden mutable state or
@@ -655,18 +660,33 @@ def deep_freeze(value):
 
 def _thaw(value):
     """The renderer-conversion counterpart to deep_freeze() (spec
-    Section 9): recursively converts a deep-frozen value back into
-    fresh, disposable, genuinely JSON-serializable plain data --
-    `types.MappingProxyType` -> a brand new plain `dict`, `tuple`/
-    `frozenset` -> a brand new plain `list`. The result shares no
-    mutable container with the frozen snapshot it was built from, so
-    mutating it can never mutate the snapshot back (Section 9: "those
-    plain structures are disposable and non-authoritative")."""
+    Section 9, hardened by corrective v12 Section 11): recursively
+    converts a deep-frozen value back into fresh, disposable, genuinely
+    JSON-serializable plain data -- `types.MappingProxyType` -> a brand
+    new plain `dict`, `tuple`/`frozenset` -> a brand new plain `list`.
+    The result shares no mutable container with the frozen snapshot it
+    was built from, so mutating it can never mutate the snapshot back
+    (Section 9: "those plain structures are disposable and
+    non-authoritative").
+
+    Task 15 Task 11 corrective v12, Section 11: fails closed -- every
+    value reaching this function was itself produced by deep_freeze(),
+    so it can only ever be a MappingProxyType, a tuple/frozenset, or an
+    exact safe scalar; anything else indicates a value that bypassed
+    deep_freeze() entirely (e.g. a field assigned after construction via
+    object.__setattr__, or a future field that forgets to route through
+    it) and is rejected here rather than passed through unchanged --
+    there is no `return value` fallback for an unrecognized type."""
     if isinstance(value, types.MappingProxyType):
         return {key: _thaw(item) for key, item in value.items()}
     if isinstance(value, (tuple, frozenset)):
         return [_thaw(item) for item in value]
-    return value
+    if _is_exact_safe_leaf(value):
+        return value
+    raise UnsupportedEvidenceValueError(
+        f"_thaw() encountered an unsupported terminal export value of type "
+        f"{type(value).__name__!r}"
+    )
 
 
 @dataclass(frozen=True)
@@ -717,10 +737,10 @@ class ReleaseEvidence:
         # through deep_freeze() below at all -- sealed here, first,
         # BEFORE any nested field is touched, so a construction failure
         # on one of these never depends on nested-field processing order.
-        _validate_exact_type(self.schema_version, int, field_name="ReleaseEvidence.schema_version")
-        _validate_exact_type(self.cleanup_status, str, field_name="ReleaseEvidence.cleanup_status")
-        _validate_exact_type(self.overall, str, field_name="ReleaseEvidence.overall")
-        _validate_exact_type(self.exit_code, int, field_name="ReleaseEvidence.exit_code")
+        validate_exact_type(self.schema_version, int, field_name="ReleaseEvidence.schema_version")
+        validate_exact_type(self.cleanup_status, str, field_name="ReleaseEvidence.cleanup_status")
+        validate_exact_type(self.overall, str, field_name="ReleaseEvidence.overall")
+        validate_exact_type(self.exit_code, int, field_name="ReleaseEvidence.exit_code")
         # object.__setattr__ is required here -- the dataclass itself is
         # frozen, so ordinary attribute assignment (even from inside
         # __post_init__) would raise dataclasses.FrozenInstanceError.

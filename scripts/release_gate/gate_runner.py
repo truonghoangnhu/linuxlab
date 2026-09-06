@@ -113,10 +113,12 @@ from scripts.release_gate.evidence import (
     ScenarioResult,
     SecretRegistry,
     StagingCleanupError,
+    UnsupportedEvidenceValueError,
     build_typed_assertions,
     build_typed_proofs,
     deep_freeze,
     publish_evidence,
+    validate_exact_type,
     validate_for_pass,
 )
 
@@ -629,13 +631,40 @@ class GateRunResult:
     stage: str = Stage.DONE
 
     def __post_init__(self):
+        # Task 15 Task 11 corrective v12, Section 6: GateRunResult seals
+        # its OWN top-level terminal scalars independently of
+        # ReleaseEvidence -- it must not trust that a nested
+        # ReleaseEvidence (when present) is sufficient, since `evidence`
+        # is None on every emergency/no-destination path, and `overall`/
+        # `exit_code`/`stage` are separately-constructible fields even
+        # when it is not.
+        validate_exact_type(self.overall, str, field_name="GateRunResult.overall")
+        validate_exact_type(self.exit_code, int, field_name="GateRunResult.exit_code")
+        validate_exact_type(self.stage, str, field_name="GateRunResult.stage")
+        for path_field_name in ("evidence_dir", "json_path", "markdown_path"):
+            value = getattr(self, path_field_name)
+            # `isinstance`, never `validate_exact_type()`'s exact-type
+            # match, is deliberate here: `pathlib.Path` is a factory --
+            # `Path("/x")` actually returns a `PosixPath`/`WindowsPath`
+            # instance, so `type(value) is Path` is False for every real
+            # Path this codebase ever constructs. These three fields are
+            # plain runtime file-reference metadata, never part of the
+            # published terminal evidence algebra itself (Section 4 does
+            # not include Path at all), so the concern that motivates
+            # exact-type matching elsewhere (a scalar subclass silently
+            # carrying hidden behavior) does not apply the same way --
+            # what must be rejected is a non-Path stand-in (a bare str,
+            # an arbitrary object), which `isinstance` already does.
+            if value is not None and not isinstance(value, Path):
+                raise UnsupportedEvidenceValueError(
+                    f"GateRunResult.{path_field_name} must be a pathlib.Path or None, "
+                    f"got {type(value).__name__!r}"
+                )
         # object.__setattr__ is required here -- the dataclass itself is
         # frozen, so ordinary attribute assignment (even from inside
         # __post_init__) would raise dataclasses.FrozenInstanceError.
-        # `evidence`/`evidence_dir`/`json_path`/`markdown_path` need no
-        # special handling: `evidence` is already deeply immutable via
-        # ReleaseEvidence's own __post_init__, and a `Path` has no
-        # mutating methods.
+        # `evidence` needs no special handling here: it is already
+        # deeply immutable via ReleaseEvidence's own __post_init__.
         object.__setattr__(self, "terminal_failure", deep_freeze(self.terminal_failure))
 
 
