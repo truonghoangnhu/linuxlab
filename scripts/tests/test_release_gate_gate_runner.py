@@ -282,9 +282,9 @@ def test_precheck_failure_after_environment_resolved_still_publishes_evidence(tm
     assert result.overall == "PRECHECK_FAILURE"
     assert result.evidence_dir is not None
     assert result.json_path is not None
-    assert result.json_path.exists()
+    assert Path(result.json_path).exists()
     assert result.markdown_path is not None
-    assert result.markdown_path.exists()
+    assert Path(result.markdown_path).exists()
 
 
 def test_scenario_body_failure_is_exit_4(tmp_path):
@@ -483,7 +483,7 @@ def test_evidence_json_has_schema_version_1_and_required_fields(tmp_path):
         repo_root=tmp_path,
         environment_builder=_fake_environment_builder(run_id="rschematest01"),
     )
-    doc = json.loads(result.json_path.read_text())
+    doc = json.loads(Path(result.json_path).read_text())
     assert doc["schema_version"] == 1
     assert doc["run"]["run_id"] == "rschematest01"
     assert doc["run"]["git_sha"] == _FAKE_VALID_GIT_SHA
@@ -542,8 +542,8 @@ def test_evidence_proofs_extracted_and_typed_from_scenario_details(tmp_path):
 
 def test_evidence_markdown_is_generated(tmp_path):
     result = _run(repo_root=tmp_path)
-    assert result.markdown_path.exists()
-    text = result.markdown_path.read_text()
+    assert Path(result.markdown_path).exists()
+    text = Path(result.markdown_path).read_text()
     assert "happy_path" in text
     assert "PASS" in text
     assert "Validation" in text
@@ -577,8 +577,8 @@ def test_evidence_never_serializes_raw_exception_text_only_type_name(tmp_path):
     result = _run(repo_root=tmp_path, scenario_specs=(("leaky", leaky_scenario),))
 
     assert result.overall == "SCENARIO_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert SENTINEL_ANSWER_KEY not in json_text
     assert SENTINEL_ANSWER_KEY not in markdown_text
     # The only exception-derived content ever admitted is the type name.
@@ -592,8 +592,8 @@ def test_evidence_never_serializes_sensitive_stdin_payload_from_exception_text(t
 
     result = _run(repo_root=tmp_path, scenario_specs=(("leaky", leaky_scenario),))
 
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert SENTINEL_STDIN_PAYLOAD not in json_text
     assert SENTINEL_STDIN_PAYLOAD not in markdown_text
 
@@ -610,8 +610,8 @@ def test_evidence_never_serializes_a_sentinel_from_a_startup_failure_message(tmp
         dual_deployment_factory=_make_factory(raise_on_enter=StartupError(f"readiness probe failed: {sentinel}")),
     )
     assert result.overall == "STARTUP_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert sentinel not in json_text
     assert sentinel not in markdown_text
     assert result.evidence.primary_failure["code"] == "StartupError"
@@ -629,8 +629,8 @@ def test_evidence_never_serializes_a_sentinel_from_a_cleanup_only_failure_messag
         ),
     )
     assert result.overall == "CLEANUP_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert sentinel not in json_text
     assert sentinel not in markdown_text
     assert result.evidence.cleanup_failure["code"] == "CleanupAggregateError"
@@ -646,8 +646,8 @@ def test_node_secret_in_exception_text_is_redacted_from_evidence(tmp_path):
         scenario_specs=(("leaky", leaky_scenario),),
     )
     assert result.overall == "SCENARIO_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert SENTINEL_NODE_SECRET not in json_text
     assert SENTINEL_NODE_SECRET not in markdown_text
 
@@ -667,8 +667,8 @@ def test_private_key_pem_content_in_exception_text_is_redacted_from_evidence(tmp
         scenario_specs=(("leaky", leaky_scenario),),
     )
     assert result.overall == "SCENARIO_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert SENTINEL_PRIVATE_KEY_PEM not in json_text
     assert "sentinel-pem-body" not in json_text
     assert SENTINEL_PRIVATE_KEY_PEM not in markdown_text
@@ -702,8 +702,8 @@ def test_db_admin_password_in_exception_text_is_redacted_from_evidence(tmp_path)
 
     result = _run(repo_root=tmp_path, environment_builder=builder, scenario_specs=(("leaky", leaky_scenario),))
     assert result.overall == "SCENARIO_FAILURE"
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert sentinel_password not in json_text
     assert sentinel_password not in markdown_text
 
@@ -751,7 +751,7 @@ def test_published_scenario_failure_json_agrees_with_returned_evidence(tmp_path)
         scenario_specs=(("n2", _always_fail("simulated failure")),),
     )
     assert result.overall == "SCENARIO_FAILURE"
-    persisted = json.loads(result.json_path.read_text())
+    persisted = json.loads(Path(result.json_path).read_text())
     returned = result.evidence.to_dict()
     assert persisted["retention"]["sanitized_debug_bundle_retained"] is True
     assert persisted["retention"] == returned["retention"]
@@ -770,7 +770,7 @@ def test_published_finalization_failure_json_agrees_with_returned_evidence(tmp_p
     with patch.object(gate_runner, "build_typed_proofs", side_effect=RuntimeError(_FINALIZE_SENTINEL)):
         result = _run(repo_root=tmp_path, scenario_specs=(("fake_ok", _always_pass()),))
     assert result.overall == "CLEANUP_FAILURE"
-    persisted = json.loads(result.json_path.read_text())
+    persisted = json.loads(Path(result.json_path).read_text())
     returned = result.evidence.to_dict()
     assert persisted["finalization_failure"] is not None
     assert persisted["retention"]["sanitized_debug_bundle_retained"] is True
@@ -799,7 +799,7 @@ def test_successful_run_never_claims_execution_resources_retained_even_with_flag
 
 def test_evidence_never_carries_a_retained_resources_field_any_more(tmp_path):
     result = _run(repo_root=tmp_path)
-    doc = json.loads(result.json_path.read_text())
+    doc = json.loads(Path(result.json_path).read_text())
     assert "retained_resources" not in doc
 
 
@@ -919,7 +919,7 @@ def test_finalization_failure_from_malformed_proof_is_cleanup_failure_exit_5(tmp
     assert result.exit_code == 5
     assert result.evidence.finalization_failure is not None
     assert result.evidence.finalization_failure["code"] == "InvalidProofError"
-    json_text = result.json_path.read_text()
+    json_text = Path(result.json_path).read_text()
     assert "NOT-A-VALID-SHA256" not in json_text
 
 

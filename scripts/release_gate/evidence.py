@@ -105,11 +105,25 @@ class OutboxInboxProof:
     duplicate_idempotent: bool
 
     def __post_init__(self):
+        # Task 15 Task 11 corrective v13, Section 9/13: `event_uuid`
+        # must already be an exact canonical str -- never a raw
+        # `uuid.UUID` object (which the prior `str(self.event_uuid)`
+        # coercion silently accepted AND retained by identity, since
+        # only the coerced COPY was validated, not the field itself).
+        if type(self.event_uuid) is not str:
+            raise InvalidProofError("OutboxInboxProof.event_uuid must be an exact canonical str")
         try:
-            uuid_module.UUID(str(self.event_uuid))
-        except (ValueError, AttributeError, TypeError) as exc:
+            uuid_module.UUID(self.event_uuid)
+        except ValueError as exc:
             raise InvalidProofError("OutboxInboxProof.event_uuid must be a valid UUID") from exc
-        if not isinstance(self.inbox_count, int) or isinstance(self.inbox_count, bool) or self.inbox_count < 0:
+        # Task 15 Task 11 corrective v13, Section 8: exact `type(x) is
+        # int`, never `isinstance`, so an int SUBCLASS (carrying hidden
+        # mutable state or overridden behavior while still comparing as
+        # a plain int) is rejected rather than silently accepted --
+        # `type(x) is int` also correctly rejects `bool` on its own
+        # (`type(True) is bool`, never `int`), so the separate isinstance
+        # bool check this replaces is no longer needed.
+        if type(self.inbox_count) is not int or self.inbox_count < 0:
             raise InvalidProofError("OutboxInboxProof.inbox_count must be a non-negative int")
         # Task 15 Task 11 corrective v7, Section 23/24: exact `type(x) is
         # str`, never `isinstance`, for canonical strings.
@@ -117,7 +131,7 @@ class OutboxInboxProof:
             raise InvalidProofError(
                 f"OutboxInboxProof.node_state must be one of {_VALID_DELIVERY_STATES}"
             )
-        if not isinstance(self.duplicate_idempotent, bool):
+        if type(self.duplicate_idempotent) is not bool:
             raise InvalidProofError("OutboxInboxProof.duplicate_idempotent must be a bool")
 
     def to_dict(self) -> dict:
@@ -471,11 +485,30 @@ class SecretRegistry:
 
 @dataclass(frozen=True)
 class ScenarioResult:
+    """Task 15 Task 11 corrective v13, Section 7/12: constructor-sealed
+    like every other terminal record reachable from `ReleaseEvidence`/
+    `GateRunResult` -- no scalar subclass, bytes, Path, or opaque
+    custom object may enter `evidence.scenarios[name]` by identity, and
+    `assertions` is deep-frozen/detached the instant an instance is
+    constructed (never only later, when it happens to be embedded in a
+    `ReleaseEvidence` snapshot)."""
+
     name: str
     status: str  # "PASS" | "FAIL"
     assertions: dict = field(default_factory=dict)
     duration_ms: float = 0.0
-    detail: str = ""
+    detail: str | None = ""
+
+    def __post_init__(self):
+        validate_exact_type(self.name, str, field_name="ScenarioResult.name")
+        validate_exact_type(self.status, str, field_name="ScenarioResult.status")
+        validate_exact_type(self.duration_ms, float, field_name="ScenarioResult.duration_ms")
+        if self.detail is not None:
+            validate_exact_type(self.detail, str, field_name="ScenarioResult.detail")
+        # object.__setattr__ is required here -- the dataclass itself is
+        # frozen, so ordinary attribute assignment (even from inside
+        # __post_init__) would raise dataclasses.FrozenInstanceError.
+        object.__setattr__(self, "assertions", deep_freeze(self.assertions))
 
 
 @dataclass(frozen=True)
@@ -803,14 +836,26 @@ class EvidenceInvariantError(Exception):
 
 @dataclass(frozen=True)
 class PassDecision:
-    """Task 15 Task 11 corrective v3, Section 3/15: the ONLY kind of
-    value that may certify an EvidenceV1 candidate as PASS-worthy.
-    `reasons` is a tuple of fixed, safe, short reason codes (never raw
-    candidate content) describing every mandatory invariant that was
-    NOT satisfied; empty iff `eligible` is True."""
+    """Task 15 Task 11 corrective v3, Section 3/15 (sealed by corrective
+    v13, Section 7/11): the ONLY kind of value that may certify an
+    EvidenceV1 candidate as PASS-worthy. `reasons` is a tuple of fixed,
+    safe, short reason codes (never raw candidate content) describing
+    every mandatory invariant that was NOT satisfied; empty iff
+    `eligible` is True -- validated at construction independently of
+    `ReleaseEvidence`, never relying on it as the only boundary."""
 
     eligible: bool
     reasons: tuple
+
+    def __post_init__(self):
+        validate_exact_type(self.eligible, bool, field_name="PassDecision.eligible")
+        validate_exact_type(self.reasons, tuple, field_name="PassDecision.reasons")
+        for reason in self.reasons:
+            validate_exact_type(reason, str, field_name="PassDecision.reasons[]")
+        if self.eligible and self.reasons:
+            raise UnsupportedEvidenceValueError(
+                "PassDecision.reasons must be empty when eligible is True"
+            )
 
 
 def _is_valid_iso8601_timestamp(value) -> bool:

@@ -125,6 +125,16 @@ from scripts.release_gate.evidence import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Task 15 Task 11 corrective v13, Section 4: captured once, at import
+# time, so GateRunResult.__post_init__'s exact-type evidence check
+# below is never affected by an existing test's own
+# `patch.object(gate_runner, "ReleaseEvidence", ...)` (used to simulate
+# a raising *constructor call site* inside _build_snapshot()) --
+# that patch only reassigns the module-level `ReleaseEvidence` NAME
+# gate_runner.py's own call sites resolve against, never this
+# separately-bound reference to the real class object itself.
+_RELEASE_EVIDENCE_TYPE = ReleaseEvidence
+
 CENTRAL_SETTINGS_MODULE = "linuxlab.settings.central"
 NODE_SETTINGS_MODULE = "linuxlab.settings.node"
 
@@ -370,13 +380,36 @@ class ResourceLedger:
         return self._records.get(resource_id) if resource_id is not None else None
 
     def set_parent(self, resource_id: str, parent_resource_id: str | None) -> None:
-        """Task 15 Task 11 corrective v12, Section 18: explicit,
-        deterministic parent metadata update through a dedicated API --
-        never as a side effect of a second `acquire()` call on the same
-        locator (which `acquire()` now rejects outright)."""
+        """Task 15 Task 11 corrective v12, Section 18 (hardened by
+        corrective v13, Section 21/22): explicit, deterministic parent
+        metadata update through a dedicated API -- never as a side
+        effect of a second `acquire()` call on the same locator (which
+        `acquire()` now rejects outright). Validates that both the
+        child and the given parent are active resources, rejects
+        self-parenting outright, and rejects a parent whose OWN
+        ancestor chain already leads back to `resource_id` (a bounded
+        walk, never a generic cycle-detection subsystem -- Section 22:
+        "do not build a generic graph subsystem")."""
         ref = self._records.get(resource_id)
         if ref is None:
             raise ResourceOwnershipError(f"no active resource for resource_id={resource_id!r}")
+        if parent_resource_id is not None:
+            if parent_resource_id == resource_id:
+                raise ResourceOwnershipError("a resource cannot be set as its own parent")
+            if parent_resource_id not in self._records:
+                raise ResourceOwnershipError(f"no active resource for parent_resource_id={parent_resource_id!r}")
+            ancestor_id = parent_resource_id
+            visited: set[str] = set()
+            while ancestor_id is not None:
+                if ancestor_id == resource_id:
+                    raise ResourceOwnershipError(
+                        f"set_parent({resource_id!r}, {parent_resource_id!r}) would create a cycle"
+                    )
+                if ancestor_id in visited:
+                    break
+                visited.add(ancestor_id)
+                ancestor_ref = self._records.get(ancestor_id)
+                ancestor_id = ancestor_ref.parent_resource_id if ancestor_ref is not None else None
         self._records[resource_id] = replace(ref, parent_resource_id=parent_resource_id)
 
     def relocate(
@@ -426,71 +459,79 @@ class ResourceLedger:
         self._records[resource_id] = new_ref
         self._locator_index[(kind, new_safe_id)] = resource_id
 
-    def children_of(self, parent_kind: str, parent_safe_id: str) -> tuple:
-        """Task 15 Task 11 corrective v11, Section 13/16: every
-        currently-owned resource whose recorded parent is EXACTLY this
-        (kind, safe_id) pair -- structural identity, never a path-
-        string prefix match."""
+    def children_of(self, parent_resource_id: str) -> tuple:
+        """Task 15 Task 11 corrective v11, Section 13/16 (rewritten by
+        corrective v13, Section 17/18: `parent_resource_id` is now the
+        SOLE authoritative parent relation): every currently-owned
+        resource whose `parent_resource_id` is EXACTLY this stable
+        resource ID -- never the legacy `(parent_kind, parent_safe_id)`
+        locator tuple, and never a path-string prefix match. A stale
+        legacy tuple (Section 23/24: mirror/recovery metadata only) has
+        no bearing on this result."""
         return tuple(
             sorted(
-                (
-                    ref
-                    for ref in self._records.values()
-                    if ref.parent_kind == parent_kind and ref.parent_safe_id == parent_safe_id
-                ),
+                (ref for ref in self._records.values() if ref.parent_resource_id == parent_resource_id),
                 key=lambda ref: (ref.kind, ref.safe_id),
             )
         )
 
-    def reconcile_verified_parent_removal(self, parent_kind: str, parent_safe_id: str) -> None:
-        """Task 15 Task 11 corrective v11, Section 16/17/20/21: called
-        ONLY after the caller has already independently verified that
-        the parent resource's own physical removal succeeded. Releases
-        each registered child of this EXACT parent (matched structurally
-        via `children_of()`, never a path-string prefix) whose OWN
-        locator is independently re-confirmed absent here -- recursing
-        into any further descendants of a released child (Section 15's
-        WORKSPACE -> TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG nesting, and
-        the deeper OUTER_ROOT -> WORKSPACE -> ... chain), so a
-        grandchild is released once its own parent chain up to the
-        removed root is confirmed gone. A child whose locator still
-        physically exists (Section 19/21: it was relocated outside the
-        parent, or the parent's own removal did not actually reach it)
-        remains owned, together with everything still registered
-        beneath IT -- never a blind release of an entire subtree merely
-        because the top-level parent path was removed (Section 17: "no
-        blind descendant release").
+    def reconcile_verified_parent_removal(self, parent_resource_id: str | None, parent_safe_id: str) -> None:
+        """Task 15 Task 11 corrective v11, Section 16/17/20/21
+        (rewritten by corrective v13, Section 17-20/30: `parent_
+        resource_id` is now the SOLE authoritative relation driving
+        explicit-child traversal). Called ONLY after the caller has
+        already independently verified that the parent resource's own
+        physical removal succeeded, passing that parent's stable
+        `resource_id` (captured before it was released, if it already
+        has been -- release() does not affect any child's already-
+        captured `parent_resource_id`) alongside its locator (`parent_
+        safe_id`, still needed for the genuine-path-containment
+        recovery fallback below). Releases each registered child of
+        this EXACT parent ID (matched via `children_of()`, never a
+        legacy tuple or a path-string prefix) whose OWN locator is
+        independently re-confirmed absent here -- recursing into any
+        further descendants of a released child (Section 15's WORKSPACE
+        -> TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG nesting, and the deeper
+        OUTER_ROOT -> WORKSPACE -> ... chain) BY THAT CHILD'S OWN stable
+        `resource_id`, so a grandchild is released once its own parent
+        chain up to the removed root is confirmed gone. A child whose
+        locator still physically exists (Section 19/21/29: it was
+        relocated outside the parent, or the parent's own removal did
+        not actually reach it) remains owned, together with everything
+        still registered beneath IT -- never a blind release of an
+        entire subtree merely because the top-level parent path was
+        removed (Section 17: "no blind descendant release").
 
-        A resource that carries no matching structural parent at all
+        `parent_resource_id=None` (Section 30: recovery-only path) skips
+        the explicit-ID traversal entirely -- there is no real parent
+        identity to query children_of() by -- and falls straight through
+        to the SECONDARY, genuine-path-containment recovery check below,
+        for a resource that carries no matching structural parent at all
         (e.g. one a test/caller registered directly without ever going
-        through the real acquisition path that would have set one) is
-        still reconciled here via a SECONDARY, genuine-path-containment
-        check (Section 14: "If path containment is ever needed for
-        verification, use true normalized path semantics... and only as
-        a secondary check, not as ownership source-of-truth") --
-        `Path.resolve()` + `relative_to()`, never a string-prefix match.
-        This is never used AS a substitute for structural identity on
-        its own: it only ever releases a resource that is BOTH genuinely
-        (not merely string-) contained within the removed parent's own
-        locator AND independently confirmed physically absent, exactly
-        the same two-part proof required of an explicit child. A same-
-        prefix SIBLING such as `/tmp/run-outside/file.dump` against
-        parent `/tmp/run` fails the genuine-containment test (`relative_
-        to()` raises `ValueError` -- it is not actually a subpath) and
-        so is never touched by this fallback either."""
-        explicit_children = self.children_of(parent_kind, parent_safe_id)
+        through the real acquisition path that would have set one):
+        `Path.resolve()` + `relative_to()`, never a string-prefix match,
+        and never used to create or override authoritative parentage
+        (Section 30) -- only ever to release a resource that is BOTH
+        genuinely (not merely string-) contained within the removed
+        parent's own locator AND independently confirmed physically
+        absent, exactly the same two-part proof required of an explicit
+        child. A same-prefix SIBLING such as `/tmp/run-outside/file.dump`
+        against parent `/tmp/run` fails the genuine-containment test
+        (`relative_to()` raises `ValueError` -- it is not actually a
+        subpath) and so is never touched by this fallback either."""
+        explicit_children = self.children_of(parent_resource_id) if parent_resource_id else ()
         for child in explicit_children:
             if not os.path.exists(child.safe_id):
                 self.release(child.kind, child.safe_id)
-                self.reconcile_verified_parent_removal(child.kind, child.safe_id)
+                self.reconcile_verified_parent_removal(child.resource_id, child.safe_id)
 
         try:
             resolved_parent = Path(parent_safe_id).resolve()
         except (OSError, ValueError):
             return
-        explicit_child_keys = {(child.kind, child.safe_id) for child in explicit_children}
+        explicit_child_ids = {child.resource_id for child in explicit_children}
         for ref in self.all_retained_resources():
-            if (ref.kind, ref.safe_id) in explicit_child_keys:
+            if ref.resource_id in explicit_child_ids:
                 continue
             try:
                 Path(ref.safe_id).resolve().relative_to(resolved_parent)
@@ -498,7 +539,7 @@ class ResourceLedger:
                 continue
             if not os.path.exists(ref.safe_id):
                 self.release(ref.kind, ref.safe_id)
-                self.reconcile_verified_parent_removal(ref.kind, ref.safe_id)
+                self.reconcile_verified_parent_removal(ref.resource_id, ref.safe_id)
 
     def retained_execution_resources(self) -> tuple:
         """Task 15 Task 11 corrective v10, Section 13: every resource
@@ -752,33 +793,40 @@ class GateRunResult:
     stage: str = Stage.DONE
 
     def __post_init__(self):
-        # Task 15 Task 11 corrective v12, Section 6: GateRunResult seals
-        # its OWN top-level terminal scalars independently of
-        # ReleaseEvidence -- it must not trust that a nested
-        # ReleaseEvidence (when present) is sufficient, since `evidence`
-        # is None on every emergency/no-destination path, and `overall`/
-        # `exit_code`/`stage` are separately-constructible fields even
-        # when it is not.
+        # Task 15 Task 11 corrective v12, Section 6 (hardened by
+        # corrective v13, Section 4/6): GateRunResult seals its OWN
+        # top-level terminal scalars independently of ReleaseEvidence --
+        # it must not trust that a nested ReleaseEvidence (when present)
+        # is sufficient, since `evidence` is None on every emergency/
+        # no-destination path, and `overall`/`exit_code`/`stage` are
+        # separately-constructible fields even when it is not.
         validate_exact_type(self.overall, str, field_name="GateRunResult.overall")
         validate_exact_type(self.exit_code, int, field_name="GateRunResult.exit_code")
         validate_exact_type(self.stage, str, field_name="GateRunResult.stage")
+        # Task 15 Task 11 corrective v13, Section 4: `evidence` is a
+        # closed union -- exact `ReleaseEvidence` or `None`, never a
+        # dict/Mapping/MappingProxyType/subclass/duck-typed stand-in. A
+        # frozen OUTER result is insufficient on its own if it still
+        # retains a mutable/custom evidence reference by identity.
+        if self.evidence is not None and type(self.evidence) is not _RELEASE_EVIDENCE_TYPE:
+            raise UnsupportedEvidenceValueError(
+                f"GateRunResult.evidence must be an exact ReleaseEvidence or None, "
+                f"got {type(self.evidence).__name__!r}"
+            )
+        # Task 15 Task 11 corrective v13, Section 6: terminal paths are
+        # canonical `str` or `None` -- no `Path`/`PosixPath`/
+        # `WindowsPath`/custom `Path` subclass/arbitrary `os.PathLike`
+        # identity may survive into terminal result truth (supersedes
+        # corrective v12's own Path-exactness requirement for these
+        # three fields). A trusted filesystem `Path` must be converted
+        # to `str` at the orchestration boundary BEFORE constructing
+        # this result -- this constructor never calls a caller-supplied
+        # `__fspath__()` itself.
         for path_field_name in ("evidence_dir", "json_path", "markdown_path"):
             value = getattr(self, path_field_name)
-            # `isinstance`, never `validate_exact_type()`'s exact-type
-            # match, is deliberate here: `pathlib.Path` is a factory --
-            # `Path("/x")` actually returns a `PosixPath`/`WindowsPath`
-            # instance, so `type(value) is Path` is False for every real
-            # Path this codebase ever constructs. These three fields are
-            # plain runtime file-reference metadata, never part of the
-            # published terminal evidence algebra itself (Section 4 does
-            # not include Path at all), so the concern that motivates
-            # exact-type matching elsewhere (a scalar subclass silently
-            # carrying hidden behavior) does not apply the same way --
-            # what must be rejected is a non-Path stand-in (a bare str,
-            # an arbitrary object), which `isinstance` already does.
-            if value is not None and not isinstance(value, Path):
+            if value is not None and type(value) is not str:
                 raise UnsupportedEvidenceValueError(
-                    f"GateRunResult.{path_field_name} must be a pathlib.Path or None, "
+                    f"GateRunResult.{path_field_name} must be a canonical str or None, "
                     f"got {type(value).__name__!r}"
                 )
         # object.__setattr__ is required here -- the dataclass itself is
@@ -1360,13 +1408,16 @@ def _finalize(
         )
 
     state.stage = Stage.DONE
+    # Task 15 Task 11 corrective v13, Section 6: converted to canonical
+    # str HERE, at the orchestration boundary -- the only place a
+    # trusted filesystem Path is turned into terminal result truth.
     return GateRunResult(
         overall=evidence.overall,
         exit_code=evidence.exit_code,
         evidence=evidence,
-        evidence_dir=evidence_dir,
-        json_path=json_path,
-        markdown_path=markdown_path,
+        evidence_dir=str(evidence_dir) if evidence_dir is not None else None,
+        json_path=str(json_path) if json_path is not None else None,
+        markdown_path=str(markdown_path) if markdown_path is not None else None,
         stage=Stage.DONE,
     )
 
@@ -1527,7 +1578,13 @@ def _run_release_gate(
     # fail. Every scenario that runs after this point (and therefore
     # every resource IT acquires) does so while the outer root is
     # already ledger-owned.
-    state.resources.acquire(ResourceKind.OUTER_ROOT, str(tmp_root_path))
+    #
+    # Task 15 Task 11 corrective v13, Section 25: the returned stable
+    # resource_id is captured HERE, before release() below pops this
+    # exact record out of the ledger, so reconcile_verified_parent_
+    # removal() can still query children_of() by parent ID afterward --
+    # release() never affects an already-captured resource_id.
+    outer_root_id = state.resources.acquire(ResourceKind.OUTER_ROOT, str(tmp_root_path))
     try:
         for name, scenario_func in scenario_specs:
             state.stage = name
@@ -1575,7 +1632,7 @@ def _run_release_gate(
             # however many levels of nesting (OUTER_ROOT -> WORKSPACE ->
             # TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG) are actually
             # registered.
-            state.resources.reconcile_verified_parent_removal(ResourceKind.OUTER_ROOT, str(tmp_root_path))
+            state.resources.reconcile_verified_parent_removal(outer_root_id, str(tmp_root_path))
         except FileNotFoundError:
             # Already gone -- verified absence is itself verified
             # disposal (Section 20), so the outer root is released here

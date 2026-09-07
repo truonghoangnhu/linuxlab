@@ -8,6 +8,7 @@ only the sanitized evidence pair persists.
 """
 
 import subprocess
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -89,11 +90,11 @@ def test_keep_on_failure_integration_destroys_execution_resources_and_retains_on
     assert retention["execution_resources_retained"] is False
     assert retention["sanitized_debug_bundle_retained"] is True
 
-    assert result.json_path.exists()
-    assert result.markdown_path.exists()
+    assert Path(result.json_path).exists()
+    assert Path(result.markdown_path).exists()
 
     # Zero plaintext secrets anywhere in the written evidence.
-    json_text = result.json_path.read_text()
-    markdown_text = result.markdown_path.read_text()
+    json_text = Path(result.json_path).read_text()
+    markdown_text = Path(result.markdown_path).read_text()
     assert "BEGIN" not in json_text and "PRIVATE KEY" not in json_text
     assert "BEGIN" not in markdown_text and "PRIVATE KEY" not in markdown_text

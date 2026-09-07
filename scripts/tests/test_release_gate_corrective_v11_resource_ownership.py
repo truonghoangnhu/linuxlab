@@ -32,12 +32,12 @@ def test_same_prefix_sibling_is_not_released_by_parent_removal(tmp_path):
     assert str(sibling_file).startswith(str(parent_dir))  # genuine string-prefix collision
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
     # Registered WITHOUT parent=parent_dir -- it is not this parent's child.
     ledger.acquire(gate_runner.ResourceKind.TEMP_DUMP, str(sibling_file))
 
     shutil.rmtree(parent_dir)
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    ledger.reconcile_verified_parent_removal(parent_id, str(parent_dir))
     ledger.release(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
 
     assert sibling_file.exists() is True
@@ -55,7 +55,7 @@ def test_explicit_child_released_after_verified_parent_removal(tmp_path):
     child_file.write_bytes(b"data")
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
     ledger.acquire(
         gate_runner.ResourceKind.TEMP_LLPKG,
         str(child_file),
@@ -64,7 +64,7 @@ def test_explicit_child_released_after_verified_parent_removal(tmp_path):
     )
 
     shutil.rmtree(parent_dir)
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    ledger.reconcile_verified_parent_removal(parent_id, str(parent_dir))
     ledger.release(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
 
     assert ledger.is_empty()
@@ -83,7 +83,7 @@ def test_reconcile_cascades_through_grandchildren(tmp_path):
     llpkg.write_bytes(b"data")
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.OUTER_ROOT, str(outer_root))
+    outer_root_id = ledger.acquire(gate_runner.ResourceKind.OUTER_ROOT, str(outer_root))
     ledger.acquire(
         gate_runner.ResourceKind.WORKSPACE,
         str(workspace),
@@ -98,7 +98,7 @@ def test_reconcile_cascades_through_grandchildren(tmp_path):
     )
 
     shutil.rmtree(outer_root)
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.OUTER_ROOT, str(outer_root))
+    ledger.reconcile_verified_parent_removal(outer_root_id, str(outer_root))
     ledger.release(gate_runner.ResourceKind.OUTER_ROOT, str(outer_root))
 
     assert ledger.is_empty()
@@ -115,7 +115,7 @@ def test_moved_external_child_survives_parent_removal_via_relocate(tmp_path):
     external_file = tmp_path / "external.dump"
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
     ledger.acquire(
         gate_runner.ResourceKind.TEMP_DUMP,
         str(child_file),
@@ -127,7 +127,7 @@ def test_moved_external_child_survives_parent_removal_via_relocate(tmp_path):
     ledger.relocate(gate_runner.ResourceKind.TEMP_DUMP, str(child_file), str(external_file))
 
     shutil.rmtree(parent_dir)
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    ledger.reconcile_verified_parent_removal(parent_id, str(parent_dir))
     ledger.release(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
 
     assert external_file.exists() is True
@@ -177,7 +177,7 @@ def test_reconcile_does_not_release_children_whose_locator_still_exists(tmp_path
     child_file.write_bytes(b"data")
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
     ledger.acquire(
         gate_runner.ResourceKind.RAW_RUNTIME_LOG,
         str(child_file),
@@ -185,7 +185,7 @@ def test_reconcile_does_not_release_children_whose_locator_still_exists(tmp_path
         parent_safe_id=str(parent_dir),
     )
 
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    ledger.reconcile_verified_parent_removal(parent_id, str(parent_dir))
 
     assert child_file.exists() is True
     assert ledger.contains(gate_runner.ResourceKind.RAW_RUNTIME_LOG, str(child_file)) is True

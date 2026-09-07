@@ -208,11 +208,15 @@ def test_gate_run_result_rejects_str_subclass_stage():
         GateRunResult(**kwargs)
 
 
-def test_gate_run_result_rejects_str_path_for_evidence_dir():
-    """A plain str standing in for a Path must be rejected -- exact type
-    only, never something merely path-like."""
+def test_gate_run_result_rejects_path_object_for_evidence_dir():
+    """Task 15 Task 11 corrective v13, Section 6/49: supersedes this
+    file's own prior `test_gate_run_result_rejects_str_path_for_
+    evidence_dir` -- terminal path fields are now canonical `str`, not
+    `pathlib.Path` (no Path/PathLike identity may survive into terminal
+    result truth), so a `Path` object is what must be rejected now, and
+    a plain `str` is exactly what is required."""
     kwargs = _valid_gate_run_result_kwargs()
-    kwargs["evidence_dir"] = "/tmp/not-a-path-object"
+    kwargs["evidence_dir"] = Path("/tmp/not-a-str")
     with pytest.raises(UnsupportedEvidenceValueError):
         GateRunResult(**kwargs)
 

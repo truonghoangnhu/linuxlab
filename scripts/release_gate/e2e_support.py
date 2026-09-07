@@ -234,10 +234,15 @@ def dual_deployment(
     node = None
     deployment = None
     private_key_path = None
+    # Task 15 Task 11 corrective v13, Section 25: captured here (`None`
+    # when there is no ledger at all) so `_remove_workspace_and_release()`
+    # below can reconcile by stable parent ID -- release() in that same
+    # closure never affects this already-captured resource_id.
+    workspace_id = None
     try:
         workspace.mkdir(parents=True)
         if resource_ledger is not None:
-            resource_ledger.acquire(
+            workspace_id = resource_ledger.acquire(
                 "workspace", str(workspace), parent_kind=parent_kind, parent_safe_id=parent_safe_id
             )
 
@@ -378,7 +383,7 @@ def dual_deployment(
                 # above raised instead, none of this runs -- surviving
                 # descendants correctly remain ledger-owned (Section
                 # 18's failure case).
-                resource_ledger.reconcile_verified_parent_removal("workspace", str(workspace))
+                resource_ledger.reconcile_verified_parent_removal(workspace_id, str(workspace))
                 resource_ledger.release("workspace", str(workspace))
 
         def _drop_node_database_and_release():

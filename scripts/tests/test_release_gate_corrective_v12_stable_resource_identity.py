@@ -218,11 +218,11 @@ def test_same_prefix_sibling_keeps_its_own_stable_id_after_parent_removal(tmp_pa
     sibling_file.write_bytes(b"data")
 
     ledger = gate_runner.ResourceLedger()
-    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
     sibling_id = ledger.acquire(gate_runner.ResourceKind.TEMP_DUMP, str(sibling_file))
 
     shutil.rmtree(parent_dir)
-    ledger.reconcile_verified_parent_removal(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
+    ledger.reconcile_verified_parent_removal(parent_id, str(parent_dir))
     ledger.release(gate_runner.ResourceKind.WORKSPACE, str(parent_dir))
 
     assert ledger.get(sibling_id) is not None
