@@ -51,8 +51,21 @@ def test_central_and_node_backup_restore_smoke(tmp_path):
     assert detail["restored_sync_can_resume"] is True
 
 
-def _new_state_and_run_id():
-    return gate_runner.RunState(), "r" + uuid.uuid4().hex[:10]
+def _new_state_and_run_id(tmp_path):
+    """Task 15 Task 11 corrective v14, Section 6.3: `_run_one_scenario()`
+    always passes `parent_kind=OUTER_ROOT, parent_safe_id=str(scenario_
+    tmp_dir.parent)` into its `dual_deployment_factory` call -- in real
+    production use, `_run_release_gate()` always registers that exact
+    outer root before any scenario runs, so it always resolves. This
+    file calls `_run_one_scenario()` directly (bypassing
+    `_run_release_gate()`) to test scenario-level behavior in
+    isolation, passing `tmp_path` itself as the scenario's own tmp dir
+    -- so `tmp_path.parent` is registered here the same way, matching
+    real usage rather than relying on tolerant half-parented
+    acquisition (which corrective v14 correctly closed)."""
+    state = gate_runner.RunState()
+    state.resources.acquire(gate_runner.ResourceKind.OUTER_ROOT, str(tmp_path.parent))
+    return state, "r" + uuid.uuid4().hex[:10]
 
 
 def _cleanup_leaked_restore_db(outer_run_id, member):
@@ -82,7 +95,7 @@ def test_partial_restore_database_creation_is_tracked_even_when_the_second_creat
     real database's continued existence is what proves the ledger
     genuinely tracked it -- not merely that cleanup happened to
     succeed."""
-    state, outer_run_id = _new_state_and_run_id()
+    state, outer_run_id = _new_state_and_run_id(tmp_path)
     secrets = gate_runner.SecretRegistry()
 
     original_create_database = scenarios.create_database
@@ -127,7 +140,7 @@ def test_partial_restore_creation_with_successful_cleanup_leaves_no_retained_res
     THIS time the cleanup drop of restore_central succeeds for real --
     the database must actually be gone, and the ledger must correctly
     show nothing retained."""
-    state, outer_run_id = _new_state_and_run_id()
+    state, outer_run_id = _new_state_and_run_id(tmp_path)
     secrets = gate_runner.SecretRegistry()
 
     original_create_database = scenarios.create_database
@@ -162,7 +175,7 @@ def test_restore_database_cleanup_failure_is_classified_under_cleanup_not_scenar
     drop to fail deliberately leaks the real `restore_central` database
     for the duration of the test -- cleaned up for real in `finally`,
     independent of assertion outcome."""
-    state, outer_run_id = _new_state_and_run_id()
+    state, outer_run_id = _new_state_and_run_id(tmp_path)
     secrets = gate_runner.SecretRegistry()
 
     original_drop_database = gate_runner.drop_database
@@ -198,7 +211,7 @@ def test_restore_database_cleanup_failure_never_overrides_an_earlier_scenario_pr
     remains authoritative even though restore-database disposal ALSO
     fails afterward -- the disposal failure is still recorded, just
     never as (or in place of) the primary failure."""
-    state, outer_run_id = _new_state_and_run_id()
+    state, outer_run_id = _new_state_and_run_id(tmp_path)
     secrets = gate_runner.SecretRegistry()
 
     def _broken_scenario(deployment):

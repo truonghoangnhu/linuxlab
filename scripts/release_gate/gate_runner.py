@@ -268,31 +268,37 @@ class ResourceRef:
     private-key, or payload; Section 17).
 
     `parent_kind`/`parent_safe_id` (Task 15 Task 11 corrective v11,
-    Section 13): the EXPLICIT, STRUCTURAL parent this resource was
-    registered under at acquisition time (or relocated to later --
-    see `ResourceLedger.relocate()`), never inferred from a path-string
-    prefix (Section 14 bans that outright: `/tmp/run` and
-    `/tmp/run-outside/file.dump` share a string prefix but are not
-    parent/child). `compare=False` -- a resource's IDENTITY (used by
-    every existing `acquire()`/`release()`/`contains()` call site
-    throughout this codebase, none of which know or care about parent
-    info) remains exactly `(kind, safe_id)`, exactly as before this
+    Section 13; demoted to non-authoritative mirror/diagnostic metadata
+    by corrective v14, Section 6.1/6.3): the legacy STRUCTURAL parent
+    locator pair this resource was registered under at acquisition time
+    -- resolved ONLY there, never re-resolved or otherwise touched by
+    `ResourceLedger.relocate()` again afterward, and never inferred
+    from a path-string prefix (Section 14 bans that outright: `/tmp/run`
+    and `/tmp/run-outside/file.dump` share a string prefix but are not
+    parent/child). These two fields may become STALE the moment the
+    real parent is itself relocated (its own `safe_id` changes, but
+    this mirror does not) -- `parent_resource_id` below is the sole
+    field release-critical traversal/reconciliation/PASS may ever
+    consult. `compare=False` -- a resource's IDENTITY (used by every
+    existing `acquire()`/`release()`/`contains()` call site throughout
+    this codebase, none of which know or care about parent info)
+    remains exactly `(kind, safe_id)`, exactly as before this
     corrective; parent info is carried metadata, not part of equality/
     hashing, so an existing bare `ResourceRef(kind=k, safe_id=s)` probe
     still matches a stored entry that happens to carry parent fields.
 
     `resource_id`/`parent_resource_id` (Task 15 Task 11 corrective v12,
-    Section 14-19): a STABLE, opaque identity assigned once at
-    `acquire()` and preserved across `relocate()` -- unlike `(kind,
-    safe_id)`, which changes the instant a resource's locator changes,
-    `resource_id` never does. `parent_resource_id` is the acquiring/
-    relocating call's best-effort resolution of `parent_kind`/
-    `parent_safe_id` to whatever resource_id was actively registered
-    under that (kind, safe_id) pair at that moment (`None` if nothing
-    matched -- e.g. a caller that registers structural parent-info
-    metadata without the parent itself ever being a real ledger entry,
-    same as `parent_kind`/`parent_safe_id` always tolerated). Also
-    `compare=False`, for the same reason as the two fields above."""
+    Section 14-19; corrective v14, Section 6.1/6.4: the SOLE
+    authoritative structural-ownership relation): a STABLE, opaque
+    identity assigned once at `acquire()` and preserved across
+    `relocate()` -- unlike `(kind, safe_id)`, which changes the instant
+    a resource's locator changes, `resource_id` never does.
+    `parent_resource_id` is resolved from `parent_kind`/`parent_safe_id`
+    ONLY at `acquire()` time (failing closed there if a supplied pair
+    doesn't resolve -- Section 6.3) or set explicitly via `set_parent()`
+    afterward; `relocate()` never touches it, so it survives the
+    parent's own later relocation unchanged. Also `compare=False`, for
+    the same reason as the two fields above."""
 
     kind: str
     safe_id: str
@@ -328,7 +334,19 @@ class ResourceLedger:
         (Task 15 Task 11 corrective v12, Section 17). Raises
         `ResourceOwnershipError` if `(kind, safe_id)` is already
         actively owned (Section 18) -- never silently keeps the
-        original entry's now-stale parent metadata."""
+        original entry's now-stale parent metadata.
+
+        Task 15 Task 11 corrective v14, Section 6.3: legacy `parent_
+        kind`/`parent_safe_id` resolution happens ONLY here, exactly
+        once, at acquisition -- the resulting `parent_resource_id`
+        becomes authoritative immediately (relocate() can no longer
+        touch it at all; only set_parent() can, afterward). When BOTH
+        `parent_kind` and `parent_safe_id` are supplied, they must
+        resolve to a genuinely active parent -- failing to resolve now
+        fails CLOSED (raises) rather than silently creating a half-
+        parented record with a legacy tuple pointing at nothing.
+        Omitting both (the default) remains the legitimate, explicit
+        "no parent" case."""
         locator_key = (kind, safe_id)
         if locator_key in self._locator_index:
             raise ResourceOwnershipError(
@@ -336,11 +354,16 @@ class ResourceLedger:
                 "duplicate acquisition is rejected rather than silently preserving or "
                 "updating parent metadata"
             )
-        parent_ref = (
-            self._locator_index.get((parent_kind, parent_safe_id))
-            if parent_kind is not None and parent_safe_id is not None
-            else None
-        )
+        if parent_kind is not None and parent_safe_id is not None:
+            parent_ref = self._locator_index.get((parent_kind, parent_safe_id))
+            if parent_ref is None:
+                raise ResourceOwnershipError(
+                    f"cannot acquire kind={kind!r} safe_id={safe_id!r}: supplied legacy parent "
+                    f"parent_kind={parent_kind!r} parent_safe_id={parent_safe_id!r} does not "
+                    "resolve to an active resource"
+                )
+        else:
+            parent_ref = None
         resource_id = uuid.uuid4().hex
         ref = ResourceRef(
             kind=kind,
@@ -412,52 +435,54 @@ class ResourceLedger:
                 ancestor_id = ancestor_ref.parent_resource_id if ancestor_ref is not None else None
         self._records[resource_id] = replace(ref, parent_resource_id=parent_resource_id)
 
-    def relocate(
-        self,
-        kind: str,
-        old_safe_id: str,
-        new_safe_id: str,
-        *,
-        parent_kind: str | None = None,
-        parent_safe_id: str | None = None,
-    ) -> None:
+    def relocate(self, kind: str, old_safe_id: str, new_safe_id: str) -> str:
         """Task 15 Task 11 corrective v11, Section 19 (hardened by
-        corrective v12, Section 20): updates the ledger explicitly when
-        gate code moves/renames an owned resource to a new physical
-        locator -- the resource must never move physically while the
-        ledger continues to point only at its stale old locator.
+        corrective v12, Section 20; hardened again by corrective v14,
+        Section 6.4/6.5): updates the ledger explicitly when gate code
+        moves/renames an owned resource to a new physical locator -- the
+        resource must never move physically while the ledger continues
+        to point only at its stale old locator.
 
-        Task 15 Task 11 corrective v12, Section 20: this is now an
-        in-place update of the existing record -- never `release(old) +
-        acquire(new)` -- so the resource's stable `resource_id` (and
-        therefore any child's already-captured `parent_resource_id`
-        pointing at it) survives the move unchanged; only `safe_id`
-        (and, explicitly, `parent_kind`/`parent_safe_id`/
-        `parent_resource_id`) are updated. Parent defaults to none, so a
-        resource relocated OUTSIDE its original parent (Section 21's
-        own adversarial case) is correctly no longer that parent's
-        child at all unless a new parent is explicitly given."""
+        Task 15 Task 11 corrective v14, Section 6.4: relocation and
+        reparenting are now STRICTLY separate operations -- this method
+        changes ONLY locator state (`safe_id`); `resource_id` and
+        `parent_resource_id` are never touched here, and this method no
+        longer accepts any parent argument at all (the prior `parent_
+        kind`/`parent_safe_id` keyword arguments, which used to
+        silently RE-RESOLVE and overwrite `parent_resource_id` as a
+        side effect of a pure locator move, are removed -- no production
+        call site ever used them). `set_parent()` is the ONLY operation
+        that may ever change structural parentage.
+
+        Task 15 Task 11 corrective v14, Section 6.5: fully atomic --
+        every precondition (source exists and is active; the target
+        locator is not already owned by a DIFFERENT active resource) is
+        validated BEFORE any mutation of `_records` or the locator
+        index. A rejected relocation (an unowned source, or a collision
+        with another resource's active locator) raises
+        `ResourceOwnershipError` and leaves the ledger in EXACTLY the
+        state it was in before the call -- never a partial update."""
         old_locator_key = (kind, old_safe_id)
-        resource_id = self._locator_index.pop(old_locator_key, None)
-        if resource_id is None:
+        source_id = self._locator_index.get(old_locator_key)
+        if source_id is None:
             raise ResourceOwnershipError(
                 f"cannot relocate an unowned resource: kind={kind!r} safe_id={old_safe_id!r}"
             )
-        old_ref = self._records[resource_id]
-        parent_ref = (
-            self._locator_index.get((parent_kind, parent_safe_id))
-            if parent_kind is not None and parent_safe_id is not None
-            else None
-        )
-        new_ref = replace(
-            old_ref,
-            safe_id=new_safe_id,
-            parent_kind=parent_kind,
-            parent_safe_id=parent_safe_id,
-            parent_resource_id=parent_ref,
-        )
-        self._records[resource_id] = new_ref
-        self._locator_index[(kind, new_safe_id)] = resource_id
+        if new_safe_id == old_safe_id:
+            return source_id
+        new_locator_key = (kind, new_safe_id)
+        collision_id = self._locator_index.get(new_locator_key)
+        if collision_id is not None and collision_id != source_id:
+            raise ResourceOwnershipError(
+                f"cannot relocate onto an already-active locator: kind={kind!r} safe_id={new_safe_id!r}"
+            )
+        new_ref = replace(self._records[source_id], safe_id=new_safe_id)
+        # Every precondition above has succeeded -- only now does this
+        # method mutate either the record or either locator-index entry.
+        del self._locator_index[old_locator_key]
+        self._records[source_id] = new_ref
+        self._locator_index[new_locator_key] = source_id
+        return source_id
 
     def children_of(self, parent_resource_id: str) -> tuple:
         """Task 15 Task 11 corrective v11, Section 13/16 (rewritten by
@@ -477,69 +502,58 @@ class ResourceLedger:
 
     def reconcile_verified_parent_removal(self, parent_resource_id: str | None, parent_safe_id: str) -> None:
         """Task 15 Task 11 corrective v11, Section 16/17/20/21
-        (rewritten by corrective v13, Section 17-20/30: `parent_
-        resource_id` is now the SOLE authoritative relation driving
-        explicit-child traversal). Called ONLY after the caller has
-        already independently verified that the parent resource's own
-        physical removal succeeded, passing that parent's stable
-        `resource_id` (captured before it was released, if it already
-        has been -- release() does not affect any child's already-
-        captured `parent_resource_id`) alongside its locator (`parent_
-        safe_id`, still needed for the genuine-path-containment
-        recovery fallback below). Releases each registered child of
-        this EXACT parent ID (matched via `children_of()`, never a
-        legacy tuple or a path-string prefix) whose OWN locator is
-        independently re-confirmed absent here -- recursing into any
-        further descendants of a released child (Section 15's WORKSPACE
-        -> TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG nesting, and the deeper
-        OUTER_ROOT -> WORKSPACE -> ... chain) BY THAT CHILD'S OWN stable
-        `resource_id`, so a grandchild is released once its own parent
-        chain up to the removed root is confirmed gone. A child whose
-        locator still physically exists (Section 19/21/29: it was
-        relocated outside the parent, or the parent's own removal did
-        not actually reach it) remains owned, together with everything
-        still registered beneath IT -- never a blind release of an
-        entire subtree merely because the top-level parent path was
-        removed (Section 17: "no blind descendant release").
+        (rewritten by corrective v13, Section 17-20; hardened by
+        corrective v14, Section 6.1/6.2: the genuine-path-containment
+        RECOVERY fallback this method used to fall through to has been
+        REMOVED entirely -- `parent_resource_id` is now the sole
+        authority for descendant traversal, full stop, never a
+        secondary locator-containment inference). Called ONLY after the
+        caller has already independently verified that the parent
+        resource's own physical removal succeeded, passing that
+        parent's stable `resource_id` (captured before it was released,
+        if it already has been -- release() does not affect any
+        child's already-captured `parent_resource_id`). Releases each
+        registered child of this EXACT parent ID (matched via
+        `children_of()`, never a legacy tuple or a path-string prefix)
+        whose OWN locator is independently re-confirmed absent here --
+        recursing into any further descendants of a released child
+        (Section 15's WORKSPACE -> TEMP_LLPKG/TEMP_DUMP/RAW_RUNTIME_LOG
+        nesting, and the deeper OUTER_ROOT -> WORKSPACE -> ... chain) BY
+        THAT CHILD'S OWN stable `resource_id`, so a grandchild is
+        released once its own parent chain up to the removed root is
+        confirmed gone. A child whose locator still physically exists
+        (Section 19/21/29: it was relocated outside the parent, or the
+        parent's own removal did not actually reach it) remains owned,
+        together with everything still registered beneath IT -- never a
+        blind release of an entire subtree merely because the top-level
+        parent path was removed (Section 17: "no blind descendant
+        release").
 
-        `parent_resource_id=None` (Section 30: recovery-only path) skips
-        the explicit-ID traversal entirely -- there is no real parent
-        identity to query children_of() by -- and falls straight through
-        to the SECONDARY, genuine-path-containment recovery check below,
-        for a resource that carries no matching structural parent at all
-        (e.g. one a test/caller registered directly without ever going
-        through the real acquisition path that would have set one):
-        `Path.resolve()` + `relative_to()`, never a string-prefix match,
-        and never used to create or override authoritative parentage
-        (Section 30) -- only ever to release a resource that is BOTH
-        genuinely (not merely string-) contained within the removed
-        parent's own locator AND independently confirmed physically
-        absent, exactly the same two-part proof required of an explicit
-        child. A same-prefix SIBLING such as `/tmp/run-outside/file.dump`
-        against parent `/tmp/run` fails the genuine-containment test
-        (`relative_to()` raises `ValueError` -- it is not actually a
-        subpath) and so is never touched by this fallback either."""
-        explicit_children = self.children_of(parent_resource_id) if parent_resource_id else ()
-        for child in explicit_children:
+        Task 15 Task 11 corrective v14, Section 6.2: a resource that is
+        EXPLICITLY parented to a different resource (Q) but whose
+        locator happens to be physically underneath THIS parent (P)
+        must never be released by reconciling P -- `children_of()`
+        already guarantees this (it matches only `parent_resource_id`,
+        never a locator). A resource that carries NO structural parent
+        at all, even if its locator lies underneath P, is likewise
+        never inferred to be P's child and never auto-released here --
+        when ownership is uncertain, this fails closed: the record
+        stays retained, and (if it is an EXECUTION-class resource) that
+        retention truthfully blocks PASS through `retained_execution_
+        resources()`, rather than this method trying to resolve the
+        uncertainty on its own via locator containment. `parent_
+        resource_id=None` therefore now means exactly what it says --
+        no explicit children to reconcile -- with no further fallback
+        behavior. `parent_safe_id` is retained in this signature only
+        because it remains meaningful diagnostic/compatibility context
+        for a caller; it no longer participates in this method's own
+        traversal logic at all."""
+        if not parent_resource_id:
+            return
+        for child in self.children_of(parent_resource_id):
             if not os.path.exists(child.safe_id):
                 self.release(child.kind, child.safe_id)
                 self.reconcile_verified_parent_removal(child.resource_id, child.safe_id)
-
-        try:
-            resolved_parent = Path(parent_safe_id).resolve()
-        except (OSError, ValueError):
-            return
-        explicit_child_ids = {child.resource_id for child in explicit_children}
-        for ref in self.all_retained_resources():
-            if ref.resource_id in explicit_child_ids:
-                continue
-            try:
-                Path(ref.safe_id).resolve().relative_to(resolved_parent)
-            except (OSError, ValueError):
-                continue
-            if not os.path.exists(ref.safe_id):
-                self.release(ref.kind, ref.safe_id)
-                self.reconcile_verified_parent_removal(ref.resource_id, ref.safe_id)
 
     def retained_execution_resources(self) -> tuple:
         """Task 15 Task 11 corrective v10, Section 13: every resource
@@ -774,9 +788,9 @@ class GateRunResult:
     overall: str
     exit_code: int
     evidence: ReleaseEvidence | None
-    evidence_dir: Path | None
-    json_path: Path | None
-    markdown_path: Path | None
+    evidence_dir: str | None
+    json_path: str | None
+    markdown_path: str | None
     # Populated ONLY by the last-resort emergency terminal path, when
     # the normal FINALIZE machinery itself failed -- a safe
     # FailureRecord.to_dict() describing that failure, since `evidence`
@@ -829,6 +843,92 @@ class GateRunResult:
                     f"GateRunResult.{path_field_name} must be a canonical str or None, "
                     f"got {type(value).__name__!r}"
                 )
+
+        # Task 15 Task 11 corrective v14, Section 5.1/5.2: GateRunResult
+        # is terminal TRUTH, not a loosely typed transport object -- it
+        # must reject internally CONTRADICTORY combinations even if the
+        # normal runner never currently produces them, independent of
+        # whether every individual field already passed its own exact-
+        # type check above.
+        expected_exit_code = EXIT_CODE.get(self.overall)
+        if expected_exit_code is None or self.exit_code != expected_exit_code:
+            raise UnsupportedEvidenceValueError(
+                f"GateRunResult.overall={self.overall!r} does not match "
+                f"GateRunResult.exit_code={self.exit_code!r}"
+            )
+
+        # Task 15 Task 11 corrective v14, Section 5.2: `evidence_dir`
+        # (the INTENDED/reserved destination) is legitimately known
+        # before, and independent of, whether publication itself ever
+        # succeeds -- _finalize() always resolves it early, but
+        # `json_path`/`markdown_path` are populated ONLY by a genuinely
+        # successful publish_evidence() call. So `evidence_dir` alone,
+        # with `json_path`/`markdown_path` both absent, is a real,
+        # already-tested failure shape (a known destination whose
+        # publication attempt failed) -- never treated as "partial."
+        # `json_path`/`markdown_path` themselves, however, are written
+        # together atomically and must always move as a pair, and
+        # neither can exist without `evidence_dir` (they live inside
+        # it) or without `evidence` itself.
+        json_present = self.json_path is not None
+        markdown_present = self.markdown_path is not None
+        if json_present != markdown_present:
+            raise UnsupportedEvidenceValueError(
+                "GateRunResult.json_path and GateRunResult.markdown_path must be both present or both absent"
+            )
+        published = json_present
+        if published and self.evidence_dir is None:
+            raise UnsupportedEvidenceValueError("GateRunResult published paths require evidence_dir")
+        if self.evidence is None and (self.evidence_dir is not None or published):
+            raise UnsupportedEvidenceValueError(
+                "GateRunResult publication paths require evidence to be present"
+            )
+        if published:
+            if os.path.dirname(self.json_path) != self.evidence_dir:
+                raise UnsupportedEvidenceValueError("GateRunResult.json_path must be inside evidence_dir")
+            if os.path.dirname(self.markdown_path) != self.evidence_dir:
+                raise UnsupportedEvidenceValueError("GateRunResult.markdown_path must be inside evidence_dir")
+            if os.path.basename(self.json_path) != "release-evidence.json":
+                raise UnsupportedEvidenceValueError("GateRunResult.json_path has an unexpected filename")
+            if os.path.basename(self.markdown_path) != "release-evidence.md":
+                raise UnsupportedEvidenceValueError("GateRunResult.markdown_path has an unexpected filename")
+
+        if self.evidence is not None:
+            if self.overall != self.evidence.overall:
+                raise UnsupportedEvidenceValueError("GateRunResult.overall disagrees with evidence.overall")
+            if self.exit_code != self.evidence.exit_code:
+                raise UnsupportedEvidenceValueError("GateRunResult.exit_code disagrees with evidence.exit_code")
+
+        # Task 15 Task 11 corrective v14, Section 4.5/5.1: the evidence-
+        # before-PASS principle -- a PASS result must be backed by a
+        # coherent, PUBLISHED, independently PASS-eligible ReleaseEvidence
+        # instance. No alternate/reconstructed authority may supersede
+        # that object, so every one of these conditions is required
+        # SIMULTANEOUSLY; any single one failing makes PASS impossible.
+        if self.overall == "PASS":
+            if self.evidence is None:
+                raise UnsupportedEvidenceValueError("PASS requires an exact ReleaseEvidence instance")
+            if self.stage != Stage.DONE:
+                raise UnsupportedEvidenceValueError("PASS requires stage DONE")
+            if self.terminal_failure is not None:
+                raise UnsupportedEvidenceValueError("PASS cannot carry a terminal_failure")
+            if not published:
+                raise UnsupportedEvidenceValueError("PASS requires published evidence paths")
+
+            evidence = self.evidence
+            if evidence.primary_failure is not None:
+                raise UnsupportedEvidenceValueError("PASS cannot carry evidence.primary_failure")
+            if evidence.cleanup_failure is not None:
+                raise UnsupportedEvidenceValueError("PASS cannot carry evidence.cleanup_failure")
+            if evidence.finalization_failure is not None:
+                raise UnsupportedEvidenceValueError("PASS cannot carry evidence.finalization_failure")
+            if evidence.cleanup_status != "clean":
+                raise UnsupportedEvidenceValueError("PASS requires evidence.cleanup_status == 'clean'")
+            if evidence.retention["execution_resources_retained"] is not False:
+                raise UnsupportedEvidenceValueError("PASS cannot retain execution resources")
+            if not validate_for_pass(evidence).eligible:
+                raise UnsupportedEvidenceValueError("PASS evidence is not independently PASS-eligible")
+
         # object.__setattr__ is required here -- the dataclass itself is
         # frozen, so ordinary attribute assignment (even from inside
         # __post_init__) would raise dataclasses.FrozenInstanceError.
@@ -1185,7 +1285,17 @@ def _build_snapshot(
             "git_sha": git_sha,
             "started_at": started_at,
             "finished_at": finished_at,
-            "authority": authority.__dict__,
+            # Task 15 Task 11 corrective v14, Section 5.4: an explicit
+            # canonical mapping built from already-validated Authority
+            # fields -- `authority.__dict__` is never treated as a
+            # canonicalization mechanism (it would happily reflect
+            # whatever attributes a hand-built/duck-typed stand-in
+            # object carried, regardless of Authority's own sealing).
+            "authority": {
+                "authoritative": authority.authoritative,
+                "platform": authority.platform,
+                "reason": authority.reason,
+            },
         },
         environment=environment,
         profiles={"central": CENTRAL_SETTINGS_MODULE, "node": NODE_SETTINGS_MODULE},

@@ -141,6 +141,7 @@ def test_moved_external_child_survives_parent_removal_via_relocate(tmp_path):
 
 def test_direct_child_delete_releases_only_that_child():
     ledger = gate_runner.ResourceLedger()
+    ledger.acquire(gate_runner.ResourceKind.WORKSPACE, "/tmp/gate-workspace-x")
     ledger.acquire(
         gate_runner.ResourceKind.TEMP_LLPKG,
         "/tmp/gate-workspace-x/package.llpkg",

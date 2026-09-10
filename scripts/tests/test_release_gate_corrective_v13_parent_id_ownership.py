@@ -46,42 +46,33 @@ def test_children_of_uses_parent_resource_id(tmp_path):
 
 
 def test_children_of_finds_child_even_with_stale_legacy_tuple(tmp_path):
-    workspace = tmp_path / "workspace"
-    other_parent = tmp_path / "someone-elses-root"
-    dump = workspace / "x.dump"
+    """Task 15 Task 11 corrective v14, Section 6.4: `relocate()` no
+    longer accepts parent arguments at all (silent reparenting through
+    a pure locator move is forbidden), so a stale legacy tuple now
+    arises the same way it does in real production use -- relocating
+    the PARENT changes only the parent's own `safe_id`; a child's own
+    `parent_safe_id` field (captured once, at the child's own
+    acquisition) is never touched by that and so becomes a stale
+    mirror of the parent's OLD locator, while `parent_resource_id`
+    (never touched by relocate() either) remains correct throughout."""
+    old_workspace = tmp_path / "workspace"
+    new_workspace = tmp_path / "workspace-relocated"
+    dump = old_workspace / "x.dump"
 
     ledger = gate_runner.ResourceLedger()
-    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(workspace))
+    parent_id = ledger.acquire(gate_runner.ResourceKind.WORKSPACE, str(old_workspace))
     child_id = ledger.acquire(
         gate_runner.ResourceKind.TEMP_DUMP,
         str(dump),
         parent_kind=gate_runner.ResourceKind.WORKSPACE,
-        parent_safe_id=str(workspace),
+        parent_safe_id=str(old_workspace),
     )
-    # Deliberately stale legacy tuple, disagreeing with the real
-    # (correct) parent_resource_id captured above -- set directly via
-    # relocate()'s own in-place record replacement, the lowest-level
-    # supported mechanism for changing a record's stored fields,
-    # without releasing/re-acquiring (which would mint a NEW
-    # resource_id and defeat the point of this test).
-    ledger.relocate(
-        gate_runner.ResourceKind.TEMP_DUMP,
-        str(dump),
-        str(dump),
-        parent_kind=gate_runner.ResourceKind.WORKSPACE,
-        parent_safe_id=str(other_parent),
-    )
-    # relocate() re-resolves parent_resource_id from the given legacy
-    # tuple, which does not match any active resource here -- so the
-    # record now carries a stale/absent legacy tuple. Restore the
-    # correct parent_resource_id directly through set_parent(), exactly
-    # as spec Section 24 describes ("parent_resource_id -> P1, legacy
-    # tuple -> stale P0 locator").
-    ledger.set_parent(child_id, parent_id)
+
+    ledger.relocate(gate_runner.ResourceKind.WORKSPACE, str(old_workspace), str(new_workspace))
 
     record = ledger.get(child_id)
     assert record.parent_resource_id == parent_id
-    assert record.parent_safe_id == str(other_parent)  # legacy tuple stays stale
+    assert record.parent_safe_id == str(old_workspace)  # legacy tuple stays stale
 
     children = ledger.children_of(parent_id)
     assert {ref.resource_id for ref in children} == {child_id}

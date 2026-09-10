@@ -187,6 +187,22 @@ class Authority:
     platform: str
     reason: str | None
 
+    def __post_init__(self) -> None:
+        # Task 15 Task 11 corrective v14, Section 5.4: Authority directly
+        # participates in constructing the terminal `run["authority"]`
+        # mapping, so it belongs to the authority-producing chain and is
+        # sealed the same way every other terminal/authority dataclass
+        # is -- exact builtin types only, never `isinstance()` (which a
+        # scalar subclass or an object with an overridden `__class__`
+        # property could satisfy while still carrying hidden/overridden
+        # behavior), and never coerced with `bool()`/`str()`.
+        if type(self.authoritative) is not bool:
+            raise PreflightError("Authority.authoritative must be an exact bool")
+        if type(self.platform) is not str:
+            raise PreflightError("Authority.platform must be an exact str")
+        if self.reason is not None and type(self.reason) is not str:
+            raise PreflightError("Authority.reason must be an exact str or None")
+
 
 def compute_authority(*, platform_name: str) -> Authority:
     is_linux = platform_name == "Linux"

@@ -52,48 +52,130 @@ def _valid_run_kwargs() -> dict:
     }
 
 
-def valid_evidence() -> ReleaseEvidence:
-    return ReleaseEvidence(
-        schema_version=1,
-        run=_valid_run_kwargs(),
-        environment={
+def _base_evidence_kwargs() -> dict:
+    return {
+        "schema_version": 1,
+        "run": _valid_run_kwargs(),
+        "environment": {
             "platform": "linux",
             "python_version": "3.12.0",
             "django_version": "5.2",
             "postgres_version": "180000",
         },
-        profiles={"central": "linuxlab.settings.central", "node": "linuxlab.settings.node"},
-        validation={
+        "profiles": {"central": "linuxlab.settings.central", "node": "linuxlab.settings.node"},
+        "validation": {
             "clean_tree": True,
             "central_check": "ok",
             "node_check": "ok",
             "central_migration_drift": "none",
             "node_migration_drift": "none",
         },
-        scenarios={},
-        proofs={},
-        retention={
+        "scenarios": {},
+        "proofs": {},
+        "retention": {
             "keep_on_failure_requested": False,
             "execution_resources_retained": False,
             "sanitized_debug_bundle_retained": True,
         },
-        primary_failure=None,
-        cleanup_failure=None,
-        finalization_failure=None,
-        cleanup_status="clean",
+        "primary_failure": None,
+        "cleanup_failure": None,
+        "finalization_failure": None,
+        "cleanup_status": "clean",
+    }
+
+
+def valid_evidence() -> ReleaseEvidence:
+    """Task 15 Task 11 corrective v14, Section 5.1: a non-PASS-shaped
+    evidence instance -- `GateRunResult`'s own coherence gate now
+    requires `evidence.overall`/`evidence.exit_code` to agree with the
+    RESULT's `overall`/`exit_code` whenever evidence is present at all
+    (not only for PASS), so this file's evidence-IDENTITY tests (is it
+    an exact ReleaseEvidence, never a dict/proxy/subclass?) use a
+    result shape that never has to satisfy the full PASS-coherence
+    matrix -- see `pass_eligible_evidence()` below for the one that
+    does."""
+    kwargs = _base_evidence_kwargs()
+    kwargs.update(overall="CLEANUP_FAILURE", exit_code=5, cleanup_status="failed")
+    return ReleaseEvidence(**kwargs)
+
+
+def pass_eligible_evidence() -> ReleaseEvidence:
+    """Genuinely `validate_for_pass()`-eligible -- required for any test
+    exercising `GateRunResult`'s PASS-coherence matrix (spec Section
+    5.1), as opposed to `valid_evidence()` above, which deliberately is
+    not PASS-shaped."""
+    from scripts.release_gate.evidence import REQUIRED_SCENARIO_ASSERTIONS, REQUIRED_SCENARIOS
+
+    def _pass_worthy_assertions_for(name):
+        assertions = {}
+        for key in REQUIRED_SCENARIO_ASSERTIONS[name]:
+            if key == "final_inbox_count":
+                assertions[key] = 1
+            elif key == "final_node_state":
+                assertions[key] = "DELIVERED"
+            elif key == "central_inbox_mutated":
+                assertions[key] = False
+            else:
+                assertions[key] = True
+        return assertions
+
+    kwargs = _base_evidence_kwargs()
+    kwargs.update(
         overall="PASS",
         exit_code=0,
+        scenarios={
+            name: {
+                "name": name,
+                "status": "PASS",
+                "assertions": _pass_worthy_assertions_for(name),
+                "duration_ms": 1.0,
+                "detail": "",
+            }
+            for name in REQUIRED_SCENARIOS
+        },
+        proofs={
+            "package_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+            "public_key_fingerprint": "c" * 64,
+            "signature": {"verified": True},
+            "outbox_to_inbox": {
+                "event_uuid": "12345678-1234-5678-1234-567812345678",
+                "inbox_count": 1,
+                "node_state": "DELIVERED",
+                "duplicate_idempotent": True,
+            },
+        },
     )
+    return ReleaseEvidence(**kwargs)
 
 
 def valid_gate_result_kwargs() -> dict:
+    """A minimal, coherent NON-PASS shape with no evidence and no
+    publication paths -- the base every evidence-IDENTITY and terminal-
+    path-TYPE test below starts from and overrides exactly one field
+    of, without also having to satisfy the PASS-coherence matrix."""
     return {
-        "overall": "PASS",
-        "exit_code": 0,
+        "overall": "CLEANUP_FAILURE",
+        "exit_code": 5,
         "evidence": None,
         "evidence_dir": None,
         "json_path": None,
         "markdown_path": None,
+        "terminal_failure": None,
+        "stage": Stage.DONE,
+    }
+
+
+def valid_pass_result_kwargs() -> dict:
+    """A genuinely coherent, published PASS -- satisfies every
+    simultaneous condition in the v14 PASS-coherence matrix."""
+    return {
+        "overall": "PASS",
+        "exit_code": 0,
+        "evidence": pass_eligible_evidence(),
+        "evidence_dir": "/tmp/evidence-dir",
+        "json_path": "/tmp/evidence-dir/release-evidence.json",
+        "markdown_path": "/tmp/evidence-dir/release-evidence.md",
         "terminal_failure": None,
         "stage": Stage.DONE,
     }
@@ -152,11 +234,7 @@ def test_gate_result_rejects_release_evidence_subclass():
 
 
 def test_gate_result_accepts_canonical_path_strings():
-    kwargs = valid_gate_result_kwargs()
-    kwargs["evidence_dir"] = "/tmp/evidence-dir"
-    kwargs["json_path"] = "/tmp/evidence-dir/release-evidence.json"
-    kwargs["markdown_path"] = "/tmp/evidence-dir/release-evidence.md"
-    result = GateRunResult(**kwargs)
+    result = GateRunResult(**valid_pass_result_kwargs())
     assert type(result.evidence_dir) is str
     assert type(result.json_path) is str
     assert type(result.markdown_path) is str
@@ -202,15 +280,7 @@ def test_gate_result_rejects_bytes_path_for_terminal_path_fields(field_name):
 
 
 def test_gate_result_pass_shape_with_evidence_and_paths_is_valid():
-    evidence = valid_evidence()
-    kwargs = valid_gate_result_kwargs()
-    kwargs.update(
-        evidence=evidence,
-        evidence_dir="/tmp/evidence-dir",
-        json_path="/tmp/evidence-dir/release-evidence.json",
-        markdown_path="/tmp/evidence-dir/release-evidence.md",
-    )
-    result = GateRunResult(**kwargs)
+    result = GateRunResult(**valid_pass_result_kwargs())
     assert result.overall == "PASS"
 
 

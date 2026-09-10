@@ -133,42 +133,57 @@ def test_real_run_stale_legacy_tuple_does_not_affect_real_reconciliation(tmp_pat
     a REAL scenario: a real child resource whose `parent_resource_id`
     is correct but whose legacy `(parent_kind, parent_safe_id)` tuple
     is deliberately stale must still be found and released by the real
-    production reconciliation call path, which is ID-native only."""
+    production reconciliation call path, which is ID-native only.
 
-    def _register_child_with_stale_legacy_tuple(deployment):
+    Task 15 Task 11 corrective v14, Section 6.4: `relocate()` no longer
+    accepts parent arguments at all, so staleness is produced the same
+    way it arises in real production use -- relocating a real PARENT
+    resource (here a synthetic sub-parent nested under the actual
+    deployment workspace, so the real workspace/Gunicorn/log lifecycle
+    is never disturbed) leaves a child's own legacy `parent_safe_id`
+    mirror stale (still the parent's OLD locator) while `parent_
+    resource_id` remains correct throughout."""
+
+    def _register_child_under_a_relocated_real_sub_parent(deployment):
         ledger = deployment.resource_ledger
         workspace = deployment.tmp_dir
-        workspace_id = ledger.get_by_locator("workspace", str(workspace)).resource_id
 
-        child_file = workspace / "artifact.dump"
+        sub_parent_old = workspace / "relocatable-sub-parent"
+        sub_parent_new = workspace / "relocatable-sub-parent-moved"
+        sub_parent_old.mkdir()
+        child_file = sub_parent_old / "artifact.dump"
         child_file.write_bytes(b"real-artifact-bytes")
+
+        sub_parent_id = ledger.acquire(
+            "workspace", str(sub_parent_old), parent_kind="workspace", parent_safe_id=str(workspace)
+        )
         child_id = ledger.acquire(
-            "temp_dump",
-            str(child_file),
-            parent_kind="workspace",
-            parent_safe_id=str(workspace),
+            "temp_dump", str(child_file), parent_kind="workspace", parent_safe_id=str(sub_parent_old)
         )
-        # Deliberately stale legacy tuple (never touching the real,
-        # correct parent_resource_id already captured above by
-        # acquire()'s own locator resolution).
-        stale_parent_safe_id = str(workspace) + "-stale-legacy-locator"
-        ledger.relocate(
-            "temp_dump",
-            str(child_file),
-            str(child_file),
-            parent_kind="workspace",
-            parent_safe_id=stale_parent_safe_id,
-        )
-        ledger.set_parent(child_id, workspace_id)
-        assert ledger.get(child_id).parent_safe_id == stale_parent_safe_id
-        assert ledger.get(child_id).parent_resource_id == workspace_id
+
+        sub_parent_old.rename(sub_parent_new)
+        ledger.relocate("workspace", str(sub_parent_old), str(sub_parent_new))
+
+        record = ledger.get(child_id)
+        assert record.parent_resource_id == sub_parent_id
+        assert record.parent_safe_id == str(sub_parent_old)  # legacy tuple stays stale
+        assert {ref.resource_id for ref in ledger.children_of(sub_parent_id)} == {child_id}
+
+        # This synthetic sub-hierarchy is not part of dual_deployment()'s
+        # own real teardown -- dispose of it explicitly here so the run's
+        # overall execution-resource retention stays truthful.
+        shutil.rmtree(sub_parent_new)
+        ledger.reconcile_verified_parent_removal(sub_parent_id, str(sub_parent_new))
+        ledger.release("workspace", str(sub_parent_new))
+        assert ledger.get(child_id) is None
+        assert ledger.get(sub_parent_id) is None
 
     result = gate_runner.run_release_gate(
         repo_root=gate_runner.REPO_ROOT,
         check_platform=False,
         keep_on_failure=False,
         scenario_specs=(
-            ("integration_real_lifecycle_stale_legacy_tuple", _register_child_with_stale_legacy_tuple),
+            ("integration_real_lifecycle_stale_legacy_tuple", _register_child_under_a_relocated_real_sub_parent),
         ),
         run_validation=lambda env: dict(_OK_VALIDATION),
         tmp_root=tmp_path,

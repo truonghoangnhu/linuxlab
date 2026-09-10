@@ -77,6 +77,28 @@ def validate_sha256_hex(value, *, field_name: str) -> str:
     return value
 
 
+def _is_canonical_uuid_string(value) -> bool:
+    """Task 15 Task 11 corrective v14, Section 5.3: a non-coercing
+    canonical-UUID-string predicate for the FINAL PASS validator
+    (`_validate_for_pass_proofs()` below), which must independently
+    revalidate proof representation rather than merely trusting
+    `OutboxInboxProof.__post_init__()` already ran. `type(value) is str`
+    is required FIRST -- never `UUID(str(value))`, which would happily
+    coerce a raw `uuid.UUID` object, an int, bytes, or any other
+    stringifiable object into a well-formed-looking UUID instead of
+    rejecting it outright. `str(parsed) == value` then confirms `value`
+    was already in `UUID`'s own canonical lowercase-hyphenated textual
+    form, not merely SOME string `UUID()` could parse (e.g. a
+    braced/uppercase/urn-prefixed variant)."""
+    if type(value) is not str:
+        return False
+    try:
+        parsed = uuid_module.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return str(parsed) == value
+
+
 @dataclass(frozen=True)
 class SignatureProof:
     """Section 7.2: a signature proof is a typed boolean, never an
@@ -85,8 +107,13 @@ class SignatureProof:
     verified: bool
 
     def __post_init__(self):
-        if not isinstance(self.verified, bool):
-            raise InvalidProofError("SignatureProof.verified must be a bool")
+        # Task 15 Task 11 corrective v14, Section 5.4: exact `type(x) is
+        # bool`, never `isinstance()` -- `isinstance()` consults an
+        # object's `__class__` attribute, which a crafted object can
+        # override via a `__class__` property to report `bool` while
+        # still not actually being one; `type(x)` is immune to that.
+        if type(self.verified) is not bool:
+            raise InvalidProofError("SignatureProof.verified must be an exact bool")
 
     def to_dict(self) -> dict:
         return {"verified": self.verified}
@@ -711,7 +738,23 @@ def _thaw(value):
     it) and is rejected here rather than passed through unchanged --
     there is no `return value` fallback for an unrecognized type."""
     if isinstance(value, types.MappingProxyType):
-        return {key: _thaw(item) for key, item in value.items()}
+        # Task 15 Task 11 corrective v14, Section 7.2: _thaw() is the
+        # SYMMETRIC counterpart to deep_freeze()'s own mapping-key
+        # sealing (_validate_canonical_mapping_key()) -- it must not
+        # merely ASSUME every key reaching here already went through
+        # that check, since a value can reach _thaw() via any call
+        # site, not only one that first passed through deep_freeze().
+        # Every key must be an exact canonical `str`, never a `str`
+        # subclass or a custom hashable stand-in.
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise UnsupportedEvidenceValueError(
+                    f"_thaw() encountered a mapping key of type {type(key).__name__!r} "
+                    "that is not an exact canonical str"
+                )
+            result[key] = _thaw(item)
+        return result
     if isinstance(value, (tuple, frozenset)):
         return [_thaw(item) for item in value]
     if _is_exact_safe_leaf(value):
@@ -1058,12 +1101,11 @@ def _validate_for_pass_proofs(candidate: ReleaseEvidence, reasons: list) -> None
     if not isinstance(outbox, Mapping) or set(outbox.keys()) != _OUTBOX_TO_INBOX_REQUIRED_KEYS:
         reasons.append("proof_outbox_to_inbox_malformed")
     else:
-        try:
-            uuid_module.UUID(str(outbox.get("event_uuid")))
-            event_uuid_valid = True
-        except (ValueError, AttributeError, TypeError):
-            event_uuid_valid = False
-        if not event_uuid_valid:
+        # Task 15 Task 11 corrective v14, Section 5.3: non-coercing --
+        # `UUID(str(value))` would silently accept a raw `uuid.UUID`
+        # object, an int, or bytes by stringifying them first instead of
+        # rejecting the non-canonical representation outright.
+        if not _is_canonical_uuid_string(outbox.get("event_uuid")):
             reasons.append("proof_outbox_event_uuid_invalid")
         if type(outbox.get("inbox_count")) is not int or outbox.get("inbox_count") != 1:
             reasons.append("proof_outbox_inbox_count_not_1")

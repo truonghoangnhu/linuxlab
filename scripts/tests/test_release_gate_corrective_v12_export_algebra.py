@@ -163,9 +163,16 @@ def test_mutating_to_dict_export_never_mutates_the_frozen_snapshot():
 
 
 def _valid_gate_run_result_kwargs() -> dict:
+    # Task 15 Task 11 corrective v14, Section 5.1: "PASS" now requires
+    # a full coherent, published, PASS-eligible ReleaseEvidence (see
+    # GateRunResult's own PASS-coherence matrix) -- this file's field-
+    # matrix tests below are about per-field TYPE sealing, not PASS
+    # coherence, so the base uses a simple, self-consistent non-PASS
+    # shape (evidence/paths both absent, matching the exit contract)
+    # instead.
     return {
-        "overall": "PASS",
-        "exit_code": 0,
+        "overall": "CLEANUP_FAILURE",
+        "exit_code": 5,
         "evidence": None,
         "evidence_dir": None,
         "json_path": None,
@@ -177,7 +184,7 @@ def _valid_gate_run_result_kwargs() -> dict:
 
 def test_gate_run_result_accepts_exact_builtin_fields():
     result = GateRunResult(**_valid_gate_run_result_kwargs())
-    assert result.overall == "PASS"
+    assert result.overall == "CLEANUP_FAILURE"
 
 
 def test_gate_run_result_rejects_str_subclass_overall():

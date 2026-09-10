@@ -820,9 +820,27 @@ def test_evidence_never_carries_a_retained_resources_field_any_more(tmp_path):
 # exception's action happens to be named.
 
 
-def _scenario_that_acquires(kind, safe_id_from_deployment):
+def _scenario_that_acquires(kind, safe_id_from_deployment, *, parented_to_outer_root=False):
+    """`parented_to_outer_root=True` registers the resource as this
+    scenario's own outer-root's explicit structural child -- matching
+    exactly what the REAL e2e_support.dual_deployment() always does for
+    a real workspace (Task 15 Task 11 corrective v11, Section 13/15).
+    Task 15 Task 11 corrective v14, Section 6.1/6.2: reconciliation no
+    longer infers ownership from physical locator containment, so a
+    fake scenario that wants outer-root reconciliation to find and
+    release its resource must register that real parent link itself,
+    the same way this codebase's own real dual_deployment() already
+    does -- an unparented resource genuinely stays retained now, even
+    if its locator happens to sit underneath the removed root."""
+
     def scenario(deployment):
-        deployment.resource_ledger.acquire(kind, safe_id_from_deployment(deployment))
+        kwargs = {}
+        if parented_to_outer_root:
+            kwargs = {
+                "parent_kind": gate_runner.ResourceKind.OUTER_ROOT,
+                "parent_safe_id": str(deployment.tmp_dir.parent),
+            }
+        deployment.resource_ledger.acquire(kind, safe_id_from_deployment(deployment), **kwargs)
         return {}
 
     return scenario
@@ -853,7 +871,12 @@ def test_workspace_cleanup_failure_reconciled_by_later_successful_outer_cleanup(
     result = _run(
         repo_root=tmp_path,
         scenario_specs=(
-            ("leaky", _scenario_that_acquires(gate_runner.ResourceKind.WORKSPACE, lambda d: str(d.tmp_dir))),
+            (
+                "leaky",
+                _scenario_that_acquires(
+                    gate_runner.ResourceKind.WORKSPACE, lambda d: str(d.tmp_dir), parented_to_outer_root=True
+                ),
+            ),
         ),
         dual_deployment_factory=_make_factory(
             raise_on_exit=CleanupAggregateError([("remove_workspace", OSError("simulated leak"))])
