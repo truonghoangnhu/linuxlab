@@ -1,0 +1,14 @@
+# Task 15 Task 12 (spec section 20): reference Caddy reverse-proxy config
+# for a LinuxLab Node classroom deployment. Caddy is the Phase 1 reference
+# reverse proxy (ADR-008); Gunicorn is never exposed directly to the
+# classroom LAN.
+#
+# Node classroom traffic may be HTTP or HTTPS depending on local
+# infrastructure. This example uses a bare port (plain HTTP, no automatic
+# TLS) for a LAN with no local DNS/certificate authority; replace :8080
+# with a real hostname to get Caddy's automatic HTTPS instead, matching
+# Caddyfile.central.example.
+
+:8080 {
+	reverse_proxy 127.0.0.1:8000
+}

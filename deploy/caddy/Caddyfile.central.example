@@ -1,0 +1,12 @@
+# Task 15 Task 12 (spec section 20): reference Caddy reverse-proxy config
+# for LinuxLab Central. Caddy is the Phase 1 reference reverse proxy
+# (ADR-008); Gunicorn is never exposed directly to the Internet.
+#
+# Central production traffic is HTTPS. Using a real hostname (rather than a
+# bare ":port" address) makes Caddy provision and renew TLS certificates
+# automatically -- replace central.example.org with the real public
+# hostname for the deployment.
+
+central.example.org {
+	reverse_proxy 127.0.0.1:8000
+}

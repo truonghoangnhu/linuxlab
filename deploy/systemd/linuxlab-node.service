@@ -1,0 +1,35 @@
+# Task 15 Task 12 (spec section 20): reference systemd unit for a LinuxLab
+# Node classroom deployment. systemd is the Linux reference process manager
+# (ADR-008); this unit is deployment reference material, never a runtime
+# dependency of the application itself.
+#
+# Install: copy to /etc/systemd/system/linuxlab-node.service, adjust
+# User/Group/WorkingDirectory/paths for the target host, then:
+#   systemctl daemon-reload
+#   systemctl enable --now linuxlab-node
+
+[Unit]
+Description=LinuxLab Node (Gunicorn)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=linuxlab
+Group=linuxlab
+WorkingDirectory=/opt/linuxlab
+EnvironmentFile=/etc/linuxlab/node.env
+ExecStart=/opt/linuxlab/.venv/bin/gunicorn --bind 127.0.0.1:8000 --workers 3 linuxlab.wsgi:application
+Restart=on-failure
+RestartSec=5
+
+# Deliberately no ExecStartPre migration step: database migration is an
+# explicit, separate operator action, never an implicit side effect of
+# service start/restart.
+#
+# The Node -> Central sync worker is a separate process (see
+# docs/operator/sync-operations.md) and is intentionally out of scope for
+# this unit.
+
+[Install]
+WantedBy=multi-user.target
