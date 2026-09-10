@@ -139,10 +139,22 @@ class OutboxInboxProof:
         # only the coerced COPY was validated, not the field itself).
         if type(self.event_uuid) is not str:
             raise InvalidProofError("OutboxInboxProof.event_uuid must be an exact canonical str")
+        # Task 15 Task 11 corrective v15, Section 4: `UUID(value)` alone
+        # PARSES a noncanonical-but-valid representation (uppercase,
+        # unhyphenated, braced, urn-prefixed) without complaint -- the
+        # constructor used to retain that original noncanonical string
+        # by identity instead of rejecting it. Requiring `str(parsed) ==
+        # self.event_uuid` closes that: only the exact canonical
+        # lowercase-hyphenated form UUID's own str() would itself
+        # produce is accepted, and the value is never coerced/replaced.
         try:
-            uuid_module.UUID(self.event_uuid)
+            parsed = uuid_module.UUID(self.event_uuid)
         except ValueError as exc:
             raise InvalidProofError("OutboxInboxProof.event_uuid must be a valid UUID") from exc
+        if str(parsed) != self.event_uuid:
+            raise InvalidProofError(
+                "OutboxInboxProof.event_uuid must be the canonical lowercase hyphenated UUID representation"
+            )
         # Task 15 Task 11 corrective v13, Section 8: exact `type(x) is
         # int`, never `isinstance`, so an int SUBCLASS (carrying hidden
         # mutable state or overridden behavior while still comparing as

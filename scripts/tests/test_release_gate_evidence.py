@@ -429,10 +429,21 @@ def _write_and_read_markdown(evidence, tmp_path=None):
     import tempfile
     from pathlib import Path
 
-    directory = Path(tmp_path) if tmp_path is not None else Path(tempfile.mkdtemp())
-    path = directory / "release-evidence.md"
-    write_markdown_evidence(path, evidence, SecretRegistry())
-    return path.read_text()
+    if tmp_path is not None:
+        path = Path(tmp_path) / "release-evidence.md"
+        write_markdown_evidence(path, evidence, SecretRegistry())
+        return path.read_text()
+
+    # Task 15 Task 11 corrective v15, Section 5: the no-tmp_path branch
+    # used to leave a leaked `tempfile.mkdtemp()` directory behind on
+    # every call (no caller passes `tmp_path`, and nothing ever cleaned
+    # it up) -- `TemporaryDirectory()` removes it the instant this
+    # function returns, and the file content is read out BEFORE the
+    # context exits so the caller never touches a removed path.
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "release-evidence.md"
+        write_markdown_evidence(path, evidence, SecretRegistry())
+        return path.read_text()
 
 
 # --- atomic writes -----------------------------------------------------

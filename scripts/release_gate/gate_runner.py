@@ -354,6 +354,17 @@ class ResourceLedger:
                 "duplicate acquisition is rejected rather than silently preserving or "
                 "updating parent metadata"
             )
+        # Task 15 Task 11 corrective v15, Section 3: the legacy parent
+        # pair is either BOTH supplied or BOTH absent -- exactly one
+        # supplied is rejected fail-closed, BEFORE any record or locator
+        # index mutation, rather than silently creating an unparented
+        # record that still retains half of the legacy tuple.
+        if (parent_kind is None) != (parent_safe_id is None):
+            raise ResourceOwnershipError(
+                f"cannot acquire kind={kind!r} safe_id={safe_id!r}: parent_kind and "
+                "parent_safe_id must be supplied together or not at all "
+                f"(parent_kind={parent_kind!r}, parent_safe_id={parent_safe_id!r})"
+            )
         if parent_kind is not None and parent_safe_id is not None:
             parent_ref = self._locator_index.get((parent_kind, parent_safe_id))
             if parent_ref is None:
@@ -842,6 +853,26 @@ class GateRunResult:
                 raise UnsupportedEvidenceValueError(
                     f"GateRunResult.{path_field_name} must be a canonical str or None, "
                     f"got {type(value).__name__!r}"
+                )
+
+        # Task 15 Task 11 corrective v15, Section 2: `evidence` and
+        # `terminal_failure` are two mutually exclusive authority modes
+        # -- EVIDENCE MODE (ordinary ReleaseEvidence-backed truth) and
+        # EMERGENCY MODE (the last-resort fixed-content path, used only
+        # when FINALIZE's own machinery itself failed). A prior gap let
+        # both be populated at once, producing a result with two
+        # contradictory failure authorities (e.g. evidence.primary_
+        # failure.category disagreeing with terminal_failure.category).
+        # This is checked independently of `overall` -- it is not only a
+        # PASS-path concern.
+        if self.terminal_failure is not None:
+            if self.evidence is not None:
+                raise UnsupportedEvidenceValueError(
+                    "GateRunResult.terminal_failure requires evidence to be None"
+                )
+            if self.json_path is not None or self.markdown_path is not None:
+                raise UnsupportedEvidenceValueError(
+                    "GateRunResult.terminal_failure requires json_path and markdown_path to be None"
                 )
 
         # Task 15 Task 11 corrective v14, Section 5.1/5.2: GateRunResult
