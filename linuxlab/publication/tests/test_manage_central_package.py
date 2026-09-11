@@ -285,3 +285,254 @@ def test_write_new_file_atomically_translates_link_failure_other_than_eexist(tmp
     assert "TEST_LINK_FAILURE" not in str(excinfo.value)
     assert not destination.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_capability_guard_precedes_uuid_and_version_validation(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = False
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", "not-a-uuid",
+            "--version", "invalid-version",
+            "--output", str(output_path),
+        )
+
+    message = str(excinfo.value)
+    assert "not permitted on this deployment profile" in message
+    assert "not a valid UUID" not in message
+    assert "version" not in message.lower()
+    assert not output_path.exists()
+    assert PublicationSnapshot.objects.count() == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_malformed_learning_path_uuid(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", "not-a-uuid", "--version", "1", "--output", str(output_path),
+        )
+
+    assert "not a valid UUID" in str(excinfo.value)
+    assert not output_path.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_invalid_version(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(uuid.uuid4()),
+            "--version", "not-a-version",
+            "--output", str(output_path),
+        )
+
+    assert "version" in str(excinfo.value).lower()
+    assert not output_path.exists()
+    assert PublicationSnapshot.objects.count() == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_unknown_learning_path(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(uuid.uuid4()), "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert not output_path.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_nonexistent_version_does_not_select_a_different_one(settings, tmp_path):
+    # Adversarial shape (coordinator Section 14): version 1 exists;
+    # requesting version 2 must fail, never silently build version 1.
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id), "--version", "2",
+            "--output", str(output_path),
+        )
+
+    assert str(path.public_id) in str(excinfo.value)
+    assert not output_path.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_zero_version(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(uuid.uuid4()),
+            "--version", "0",
+            "--output", str(output_path),
+        )
+
+    assert not output_path.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_fails_closed_on_missing_signing_configuration(settings, tmp_path, monkeypatch):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+
+    monkeypatch.setattr(
+        "linuxlab.publication.signing._SIGNING_KEY_PATH", tmp_path / "missing.key"
+    )
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id), "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert not output_path.exists()
+    assert "BEGIN" not in str(excinfo.value)
+    assert "PRIVATE KEY" not in str(excinfo.value)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_produces_verifiable_package(settings, tmp_path, monkeypatch, capsys):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    from linuxlab.activities.default_registry import build_default_activity_registry
+    from linuxlab.publication.package import verify_package
+
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+    capsys.readouterr()
+
+    private_key = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "package-signing.key"
+    key_path.write_bytes(
+        private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    monkeypatch.setattr("linuxlab.publication.signing._SIGNING_KEY_PATH", key_path)
+
+    output_path = tmp_path / "out.llpkg"
+    call_command(
+        "manage_central_package", "build",
+        "--learning-path", str(path.public_id),
+        "--version", "1",
+        "--output", str(output_path),
+    )
+
+    assert output_path.exists()
+
+    verified = verify_package(
+        output_path.read_bytes(), build_default_activity_registry(), private_key.public_key()
+    )
+    assert str(verified.manifest.package_uuid) == str(path.public_id)
+    assert verified.manifest.package_type == "learning_path"
+    assert verified.manifest.package_version == 1
+
+    assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 1
+
+    out = capsys.readouterr().out
+    assert out == (
+        "Operation: build\n"
+        "Kind: learning_path\n"
+        f"LearningPath: {path.public_id}\n"
+        "Version: 1\n"
+        "PackageType: learning_path\n"
+        "PackageVersion: 1\n"
+        f"PackageUUID: {path.public_id}\n"
+        f"Output: {output_path}\n"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_fails_before_file_work_on_wrong_profile(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = False
+    output_path = tmp_path / "out.llpkg"
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(uuid.uuid4()), "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert not output_path.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_command_level_existing_destination_preserved_unchanged(
+    settings, tmp_path, monkeypatch
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+
+    private_key = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "package-signing.key"
+    key_path.write_bytes(
+        private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    monkeypatch.setattr("linuxlab.publication.signing._SIGNING_KEY_PATH", key_path)
+
+    output_path = tmp_path / "out.llpkg"
+    sentinel_bytes = b"ORIGINAL_DESTINATION_BYTES"
+    output_path.write_bytes(sentinel_bytes)
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id), "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert output_path.read_bytes() == sentinel_bytes
+    remaining = [entry.name for entry in tmp_path.iterdir()]
+    assert sorted(remaining) == sorted(["package-signing.key", "out.llpkg"])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_invalid_output_parent(settings, tmp_path):
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id), "--version", "1",
+            "--output", str(tmp_path / "does-not-exist" / "out.llpkg"),
+        )

@@ -1,11 +1,18 @@
 import os
 import uuid
+from pathlib import Path
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from linuxlab.activities.default_registry import build_default_activity_registry
 from linuxlab.content.models import LearningPathPage
+from linuxlab.publication.models import PublicationSnapshot
+from linuxlab.publication.package import build_package
+from linuxlab.publication.signing import (
+    PackageSigningConfigurationError,
+    load_package_signing_private_key,
+)
 from linuxlab.publication.snapshots import publish_learning_path
 
 
@@ -21,6 +28,16 @@ def _parse_uuid(raw, *, what):
         return uuid.UUID(raw)
     except (ValueError, AttributeError, TypeError) as exc:
         raise CommandError(f"{what} is not a valid UUID: {raw!r}") from exc
+
+
+def _parse_version(raw):
+    try:
+        version = int(raw)
+    except (ValueError, TypeError) as exc:
+        raise CommandError(f"--version is not a valid version number: {raw!r}") from exc
+    if version < 1:
+        raise CommandError(f"--version is not a valid version number: {raw!r}")
+    return version
 
 
 def _write_new_file_atomically(destination, data: bytes) -> None:
@@ -66,7 +83,7 @@ def _write_new_file_atomically(destination, data: bytes) -> None:
 
 
 class Command(BaseCommand):
-    help = "Central package operator surface: publish."
+    help = "Central package operator surface: publish, build."
 
     def add_arguments(self, parser):
         subparsers = parser.add_subparsers(dest="action", required=True)
@@ -74,11 +91,27 @@ class Command(BaseCommand):
         publish_parser = subparsers.add_parser("publish")
         publish_parser.add_argument("--learning-path", required=True)
 
+        # --version and --learning-path are deliberately plain strings
+        # (no argparse type=int/type=uuid.UUID): argparse-level type
+        # coercion runs before handle() is ever called, which would let a
+        # malformed value reject the command before
+        # _require_central_capability() has a chance to run first. Both
+        # are parsed manually, inside _handle_build(), strictly after the
+        # capability guard.
+        build_parser = subparsers.add_parser("build")
+        build_parser.add_argument("--learning-path", required=True)
+        build_parser.add_argument("--version", required=True)
+        build_parser.add_argument("--output", required=True)
+
     def handle(self, *args, **options):
         _require_central_capability()
 
         if options["action"] == "publish":
             self._handle_publish(options)
+            return
+
+        if options["action"] == "build":
+            self._handle_build(options)
             return
 
     def _handle_publish(self, options):
@@ -100,3 +133,41 @@ class Command(BaseCommand):
         self.stdout.write(f"Kind: {snapshot.kind}")
         self.stdout.write(f"LearningPath: {snapshot.source_public_id}")
         self.stdout.write(f"Version: {snapshot.version}")
+
+    def _handle_build(self, options):
+        source_public_id = _parse_uuid(options["learning_path"], what="--learning-path")
+        version = _parse_version(options["version"])
+
+        try:
+            snapshot = PublicationSnapshot.objects.get(
+                kind="learning_path", source_public_id=source_public_id, version=version
+            )
+        except PublicationSnapshot.DoesNotExist as exc:
+            raise CommandError(
+                f"no publication for LearningPath {source_public_id} at version {version}"
+            ) from exc
+
+        output_path = Path(options["output"])
+        if not output_path.parent.is_dir():
+            raise CommandError(f"output directory does not exist: {output_path.parent}")
+        if output_path.exists():
+            raise CommandError(f"output already exists: {output_path}")
+
+        try:
+            private_key = load_package_signing_private_key()
+        except PackageSigningConfigurationError as exc:
+            raise CommandError(f"signing configuration unavailable: {exc}") from exc
+
+        registry = build_default_activity_registry()
+        package_bytes = build_package(snapshot, registry, private_key)
+
+        _write_new_file_atomically(output_path, package_bytes)
+
+        self.stdout.write("Operation: build")
+        self.stdout.write(f"Kind: {snapshot.kind}")
+        self.stdout.write(f"LearningPath: {snapshot.source_public_id}")
+        self.stdout.write(f"Version: {snapshot.version}")
+        self.stdout.write(f"PackageType: {snapshot.kind}")
+        self.stdout.write(f"PackageVersion: {snapshot.version}")
+        self.stdout.write(f"PackageUUID: {snapshot.source_public_id}")
+        self.stdout.write(f"Output: {output_path}")
