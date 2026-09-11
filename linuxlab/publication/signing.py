@@ -15,6 +15,8 @@ only at invocation time, never at module import, and never logs or
 returns anything but the parsed key object itself.
 """
 
+import os
+import stat
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -27,6 +29,36 @@ _SIGNING_KEY_PATH = Path("/etc/linuxlab/keys/package-signing.key")
 
 class PackageSigningConfigurationError(Exception):
     pass
+
+
+def _read_signing_key_bytes():
+    """Open the canonical signing-key path with O_NOFOLLOW (a symlink at
+    that path is rejected outright, never followed) and O_NONBLOCK (so a
+    FIFO can never block this call), then fstat() and read from that SAME
+    descriptor -- never a separate pre-open stat()/is_file() check, which
+    would leave a TOCTOU window between checking and opening. Only an
+    ordinary regular file is accepted.
+    """
+    try:
+        fd = os.open(str(_SIGNING_KEY_PATH), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise PackageSigningConfigurationError(
+            f"cannot read Central signing key at {_SIGNING_KEY_PATH}: {exc.strerror}"
+        ) from exc
+
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise PackageSigningConfigurationError(
+                f"Central signing key at {_SIGNING_KEY_PATH} is not a regular file"
+            )
+        handle = os.fdopen(fd, "rb")
+        fd = None  # ownership transferred to `handle`; its own close below
+        # is now the only close
+        with handle:
+            return handle.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def sign_bytes(message, private_key):
@@ -50,12 +82,7 @@ def verify_signature(message, signature, public_key):
 
 
 def load_package_signing_private_key():
-    try:
-        pem_bytes = _SIGNING_KEY_PATH.read_bytes()
-    except OSError as exc:
-        raise PackageSigningConfigurationError(
-            f"cannot read Central signing key at {_SIGNING_KEY_PATH}: {exc.strerror}"
-        ) from exc
+    pem_bytes = _read_signing_key_bytes()
 
     if not pem_bytes:
         raise PackageSigningConfigurationError(
@@ -66,7 +93,8 @@ def load_package_signing_private_key():
         private_key = load_pem_private_key(pem_bytes, password=None)
     except (ValueError, TypeError) as exc:
         raise PackageSigningConfigurationError(
-            f"Central signing key at {_SIGNING_KEY_PATH} is not valid PEM: {exc}"
+            f"Central signing key at {_SIGNING_KEY_PATH} is not a valid unencrypted "
+            "Ed25519 PEM PKCS8 private key"
         ) from exc
 
     if not isinstance(private_key, Ed25519PrivateKey):
