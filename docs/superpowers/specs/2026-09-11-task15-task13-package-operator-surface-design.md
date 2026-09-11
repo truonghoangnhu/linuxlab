@@ -7,6 +7,8 @@ Task: Task 15 / Task 13 / Corrective A
 Start HEAD: `abdda90b2f9f8cbd3942c41ed2d947a42ef4e42b`
 Amended: 2026-09-11 — Amendment A (installed-package identity/rollback
 alignment), starting HEAD `ffa5c1b165ddbdc90607492c346c36e6936c830d`
+Amended: 2026-09-11 — Amendment B (Central publication identity alignment),
+starting HEAD `98fc2bddc81fe7a3d4e7e12754062af80feabd81`
 
 ## Context
 
@@ -49,6 +51,38 @@ introduced.
 
 **RATIONALE:** Explicit-target rollback would constitute new lifecycle
 business semantics and is outside Corrective A.
+
+### Amendment B
+
+Implementation-plan-time domain inventory found that the Central side of
+the spec had the same class of mismatch Amendment A already fixed on the
+Node side. `PublicationSnapshot` (like `InstalledPackage`) has no
+independent `public_id`; its canonical distributed identity is
+`(kind, source_public_id, version)` (ADR-011 pattern). `build_package()`
+takes a `PublicationSnapshot` instance, not a publication UUID, and no
+single UUID identifying "the publication" exists anywhere in the domain.
+The original spec's `--publication <UUID>` argument and `Publication:
+<uuid>` output line do not match this reality. Amendment B resolves the
+mismatch the same way Amendment A did: by aligning the CLI to the domain's
+existing identity instead of inventing a new one.
+
+**RULING B1:** `PublicationSnapshot` has no operator-facing `public_id`.
+Its canonical publication identity is `(kind, source_public_id, version)`.
+
+**RATIONALE:** Corrective A is a thin operator adapter and must not
+introduce a new publication identity namespace, synthetic UUID, or schema
+migration merely for CLI ergonomics.
+
+**RULING B2:** For Phase 1, `learning_path` is the only supported
+publication kind (`_SUPPORTED_PUBLICATION_KINDS` in
+`linuxlab/publication/package.py` contains exactly one entry:
+`"learning_path"`), so the Central CLI exposes `--learning-path` and
+`--version` instead of a generic `--kind` / `--source-public-id` /
+`--version`.
+
+**RATIONALE:** This reflects the current supported domain and avoids
+premature generalization. If additional publication kinds are introduced
+later, CLI generalization may be designed then.
 
 ## 1. Architecture / Operator Surface
 
@@ -120,7 +154,8 @@ manage_central_package publish
   --learning-path <UUID>
 
 manage_central_package build
-  --publication <UUID>
+  --learning-path <UUID>
+  --version <VERSION>
   --output <FILE.llpkg>
 ```
 
@@ -156,24 +191,32 @@ report the architectural mismatch rather than force the domain into this
 CLI shape. The `InstalledPackage` identity and `rollback_package` contract
 mismatch discovered during Corrective A's own implementation-time inventory
 is already resolved by Amendment A and is not a live mismatch (Section 22).
+The `PublicationSnapshot` identity and `build_package` contract mismatch
+discovered during implementation-plan-time inventory is already resolved
+by Amendment B and is not a live mismatch (Section 22).
 
-Identifiers exposed to the operator are one of three distinct concepts —
-never conflated:
+Identifiers exposed to the operator are one of four distinct layers —
+never conflated. See Section 2a for the full identity model; in brief:
 
-- **Source identity** — `source_public_id`, the stable public UUID of the
-  packaged source/content lineage.
+- **Authoring source identity** — `LearningPath.public_id`, the stable
+  public UUID of the authored source/content lineage. Operator-facing CLI
+  field: `--learning-path`.
+- **Publication snapshot identity** — the composite tuple
+  `(kind, source_public_id, version)`, which identifies one immutable
+  publication snapshot. `PublicationSnapshot` has no `public_id` of its
+  own. For Phase 1, `kind` is always `"learning_path"` and is implicit;
+  the operator supplies `--learning-path` (= `source_public_id`) and
+  `--version`.
+- **Package/manifest identity** — the manifest's own
+  `(package_uuid, package_type, package_version)` fields, which under the
+  current package contract mirror the publication snapshot's
+  `(source_public_id, kind, version)` exactly. `package_uuid` is not a
+  distinct publication identifier — it is `source_public_id`.
 - **Installed-artifact identity** — the composite tuple
   `(package_type, source_public_id, package_version)`, which identifies one
-  concrete installed immutable artifact on Node. All three components are
-  required together; none of them alone is a stable installed-artifact
-  identity.
-- **Package/manifest identity** — whatever immutable identity/version the
-  verified manifest actually carries. This is not assumed to be the same as
-  the installed-artifact identity above.
-
-`LearningPath` and publication `public_id` values (Sections 3–4) are
-unrelated, legitimate stable identifiers and are unaffected by this
-distinction.
+  concrete installed immutable artifact on Node. `InstalledPackage` has no
+  `public_id` of its own. All three components are required together; none
+  of them alone is a stable installed-artifact identity.
 
 Do **not** expose as operator identity:
 
@@ -183,8 +226,44 @@ Do **not** expose as operator identity:
 - a title or slug
 - an ambiguous "latest"
 - a synthetic `InstalledPackage` UUID that does not exist in the domain
+- a synthetic `PublicationSnapshot` UUID that does not exist in the domain
 
 Filename is transport location only, never identity.
+
+### 2a. Identity Model
+
+Four identity layers, kept distinct throughout this document:
+
+**A. Authoring source** — `LearningPath.public_id` (a real stable UUID
+field on `LearningPathPage`). Operator-facing CLI field: `--learning-path`.
+
+**B. Publication snapshot** — canonical identity
+`(kind, source_public_id, version)`. No `PublicationSnapshot.public_id`
+exists. `kind` is fixed to `"learning_path"` for Phase 1 (the only entry in
+`_SUPPORTED_PUBLICATION_KINDS`), so the operator-facing identity reduces to
+`--learning-path` (= `source_public_id`) + `--version`.
+
+**C. Package manifest** — current fields, exactly as produced by
+`build_package()`'s `_manifest_dict()`:
+
+```
+package_uuid    = source_public_id
+package_type    = publication kind
+package_version = publication version
+```
+
+These mirror the publication snapshot's own identity; `package_uuid` is
+never a distinct publication UUID.
+
+**D. Node installed artifact** — canonical identity
+`(package_type, source_public_id, package_version)`. No
+`InstalledPackage.public_id` exists (Amendment A).
+
+Values may mirror one another numerically across these four layers (e.g.
+the same `source_public_id` appears in layers A, B, C, and D), but each is
+a distinct domain concept owned by a distinct lifecycle stage. A database
+primary key never crosses any operator boundary at any layer. Filename is
+transport location only, never identity, at any layer.
 
 ## 3. Central Publish Semantics
 
@@ -193,20 +272,31 @@ Filename is transport location only, never identity.
 Flow:
 
 ```
-LearningPath public_id
-→ sanctioned publication service
+--learning-path <UUID>
+→ sanctioned read-only LearningPathPage lookup
+  (LearningPathPage.objects.get(public_id=<uuid>))
+→ publish_learning_path(page, activity_registry)
 → immutable publication snapshot
 ```
 
-Success output contains only safe stable identifiers, for example:
+Success output contains only safe stable identifiers that actually exist on
+`PublicationSnapshot` (Section 2a, layer B), for example:
 
 ```
 Operation: publish
-LearningPath: <uuid>
-Publication: <uuid>
+Kind: learning_path
+LearningPath: <source_public_id>
 Version: <version>
-State: published
 ```
+
+There is no `Publication: <uuid>` field: `PublicationSnapshot` has no
+`public_id` (Amendment B, Ruling B1). `PublicationSnapshot` also has no
+separate state field/service contract, so no `State: published` line is
+required or invented merely because the operation is named `publish`.
+
+The output must expose `LearningPath` + `Version` together, since that
+pair is exactly what the operator needs to supply to a later `build`
+invocation.
 
 Rules:
 
@@ -217,17 +307,28 @@ Rules:
 
 ## 4. Central Build Semantics
 
-`build` takes an immutable publication identity plus a final output path.
+`build` takes the canonical publication snapshot identity
+(`--learning-path <UUID> --version <VERSION>`, Section 2a layer B) plus a
+final output path. There is no single `--publication <UUID>` argument:
+`PublicationSnapshot` has no `public_id` (Amendment B, Ruling B1), and
+`kind` is implicit (`"learning_path"`, Ruling B2).
 
 Flow:
 
 ```
-published immutable publication
-→ existing package builder
+--learning-path <UUID> + --version <VERSION>
+→ read-only PublicationSnapshot lookup
+  (kind="learning_path", source_public_id=<uuid>, version=<version>)
+→ build_package(snapshot, activity_registry, private_key)
 → existing signing boundary
 → immutable .llpkg bytes/artifact
 → safe final file output
 ```
+
+The lookup requires the exact version supplied by the operator. No
+`latest`/`current`/`most_recent` selection semantics are introduced — an
+unknown `(source_public_id, version)` pair fails closed rather than
+silently selecting a different snapshot.
 
 Rules:
 
@@ -238,14 +339,39 @@ Rules:
 - an existing destination path fails closed
 - the parent directory must be valid and writable
 - failure must not leave a partial final artifact
+- the CLI performs only a read-only `PublicationSnapshot` lookup; it must
+  not mutate `PublicationSnapshot` rows
 - if the builder returns immutable bytes, the adapter may perform safe
   atomic file I/O around those bytes
 - if the repository already has a sanctioned atomic export helper, that
   helper must be reused rather than reimplemented
+- `build_package`'s signature (`snapshot, activity_registry, private_key`)
+  is not changed merely to accept CLI arguments directly
 
 The CLI must not invent a fabricated package UUID if the manifest uses a
 different identity form; the adapter reports whatever stable identity the
-manifest actually carries.
+manifest actually carries. Under the current package contract, the
+manifest's `package_uuid` field equals `source_public_id` — it is not a
+distinct publication identifier (Section 2a, layer C).
+
+Success output contains only safe stable identifiers that actually exist,
+distinguishing the publication-snapshot identity that was built from the
+resulting package-manifest identity, for example:
+
+```
+Operation: build
+Kind: learning_path
+LearningPath: <source_public_id>
+Version: <publication version>
+PackageUUID: <manifest package_uuid>
+PackageType: <manifest package_type>
+PackageVersion: <manifest package_version>
+Output: <final path>
+```
+
+`PackageUUID` is a real manifest field, not an invented one. Under the
+current package contract it equals `LearningPath`/`source_public_id` —
+the output must not imply it is a second, distinct publication UUID.
 
 ## 5. File Transport Boundary
 
@@ -468,7 +594,10 @@ Do **not** invent a separate release-gate-style exit-code table.
 
 Expected failures must be sanitized and actionable, for example:
 
-- publication not found
+- LearningPath not found
+- publication version not found for LearningPath
+- publication snapshot is not buildable
+- signing configuration unavailable
 - package signature invalid
 - package already active
 - activation prerequisite incomplete
@@ -501,11 +630,14 @@ Idempotency is operation-specific and inherited from current services:
 
 The CLI may resolve a canonical `(package_type, source_public_id,
 package_version)` tuple to a model instance read-only, when a service
-signature requires a model instance rather than the tuple (Section 9). The
-CLI may **not**:
+signature requires a model instance rather than the tuple (Section 9).
+Likewise, the CLI may resolve `(kind="learning_path", source_public_id,
+version)` to a `PublicationSnapshot` instance read-only, for `build_package`
+(Section 4). The CLI may **not**:
 
 ```
 InstalledPackage.objects.update(...)
+PublicationSnapshot mutation of any kind
 manually archive an ACTIVE package
 manually choose a rollback target
 manually activate a historical version
@@ -572,24 +704,29 @@ Rejection must occur before mutation.
 
 `publish` tests:
 
-- valid `LearningPath` stable public_id
+- valid `LearningPath` stable public_id → output reports `Kind`,
+  `LearningPath`, `Version` (no `Publication` field, no invented `State`)
 - unknown UUID
 - malformed UUID
 - wrong profile
 - domain publication rejection
 
-`build` tests:
+`build` tests, using `--learning-path <UUID> --version <VERSION>`
+(Section 2a layer B — there is no `--publication <UUID>` argument):
 
-- valid publication → real signed `.llpkg`
+- valid source + exact version → resolves the correct `PublicationSnapshot`
+  → real signed `.llpkg`
 - verifier accepts the built artifact
-- unknown publication
-- invalid/unpublished publication
-- missing signing configuration
+- malformed `LearningPath` UUID → fails before package build/file output
+- unknown `LearningPath` UUID → fails
+- known `LearningPath` but nonexistent version → fails
+- a different, valid version for the same `LearningPath` does not
+  silently get selected instead of the requested version
+- missing signing configuration → fails closed
 - invalid/missing parent directory
-- existing destination fails
-- original file remains unchanged
+- existing destination fails and existing bytes are unchanged
 - a failed write/build leaves no final partial artifact
-- wrong profile
+- wrong profile → fails before build/file output
 
 Deterministic bytes are not required unless already a domain invariant.
 
@@ -659,15 +796,17 @@ already owns them.
 Command adapters must not directly mutate:
 
 - `InstalledPackage`
-- publication snapshot rows
+- `PublicationSnapshot` rows
 - authoring `ActivityVersion` rows
 - other lifecycle state
 
 Read-only lookup from the adapter (e.g. resolving the canonical
 `(package_type, source_public_id, package_version)` tuple to a model
-instance for `activate_package`) is acceptable only when required by an
-existing service signature. If the service can resolve the identity itself,
-that path is preferred.
+instance for `activate_package`, or resolving
+`(kind="learning_path", source_public_id, version)` to a
+`PublicationSnapshot` instance for `build_package`) is acceptable only when
+required by an existing service signature. If the service can resolve the
+identity itself, that path is preferred.
 
 ## 19. Secret-Output Tests
 
@@ -686,9 +825,15 @@ One real operator end-to-end scenario:
 
 ```
 Central fixture
-→ call_command publish
-→ capture publication identity
-→ call_command build
+→ call_command("manage_central_package", "publish",
+               "--learning-path", <learning-path-public-id>)
+→ read the returned/reported Version (source_public_id is already known:
+  it is the LearningPath public_id used above; kind is implicit
+  "learning_path" — there is no separate Publication UUID to capture)
+→ call_command("manage_central_package", "build",
+               "--learning-path", <learning-path-public-id>,
+               "--version", <publication-version>,
+               "--output", <path>)
 → .llpkg exists
 → pure file boundary
 → Node call_command verify
@@ -708,7 +853,9 @@ Central fixture
 After minimal fixture setup, package-lifecycle steps under test must go
 through management commands. Internal services are not called directly for
 the same steps whose operator accessibility the end-to-end test is meant to
-prove.
+prove. The handoff between `publish` and `build` uses only
+`LearningPath.public_id` + the reported publication `Version` — never
+`PublicationSnapshot`'s database primary key.
 
 Central and Node DB/profile separation must remain intact. No DB
 replication or row copying.
@@ -771,16 +918,36 @@ Implementation must **not** stop merely because:
 
 Those are now intentional, approved architecture, not open mismatches.
 
+**Resolved by Amendment B:** implementation-plan-time inventory also found
+that `PublicationSnapshot` has no `public_id` and that `build_package()`
+requires a `PublicationSnapshot` instance rather than a publication UUID.
+Amendment B adopted the domain's existing `(kind, source_public_id,
+version)` identity as approved architecture (see the Amendment B rulings
+above). Implementation must **not** stop merely because:
+
+- `PublicationSnapshot` lacks a `public_id`, or
+- `build_package` requires a `PublicationSnapshot` instance rather than a
+  single publication UUID.
+
+Those are now intentional, approved architecture, not open mismatches.
+
 Implementation must still STOP if it discovers that:
 
 - the `(package_type, source_public_id, package_version)` tuple is not
   actually sufficient/stable for selecting one installed artifact;
+- the `(kind, source_public_id, version)` tuple is not actually
+  sufficient/stable for selecting one publication snapshot;
+- the real supported publication kinds differ materially from
+  `{"learning_path"}`;
 - `activate_package` requires semantics not representable through current
   domain fields;
+- `build_package` requires new package business semantics;
+- signing requires architecture redesign;
 - the rollback service has materially different behavior from the
   inventory recorded here;
 - a schema migration is required;
-- package lifecycle semantics must be changed;
+- package or publication lifecycle semantics must be changed;
+- a synthetic publication identity becomes necessary;
 - direct ORM mutation would be required;
 - a new package state is required.
 
@@ -866,8 +1033,15 @@ Task 13 must **not** be closed immediately after Corrective A.
 
 ## 27. Acceptance Definition
 
-- Central operator can publish by stable identity.
-- Central operator can build a signed `.llpkg`.
+- Central operator can publish by stable identity (`LearningPath.public_id`).
+- Central operator can build an exact immutable publication using the
+  canonical publication identity — represented in the Phase 1 CLI by
+  `LearningPath.public_id` + publication `Version`, with publication kind
+  fixed to `learning_path` — and produce a signed `.llpkg`.
+- Corrective A does not add `PublicationSnapshot.public_id` or any
+  synthetic publication identity.
+- Corrective A does not expose `PublicationSnapshot`'s database primary
+  key as an operator identifier.
 - Package can cross a pure file boundary.
 - Node operator can verify without mutation.
 - Node operator can import through verifier/lifecycle authority.
