@@ -185,3 +185,107 @@ def test_loaded_public_key_bytes_equal_written_bytes(tmp_path, monkeypatch):
 
     loaded_bytes = loaded.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
     assert loaded_bytes == written_bytes
+
+
+def test_fstat_failure_raises_configuration_error_and_closes_fd(tmp_path, monkeypatch):
+    import os
+
+    key_path = tmp_path / "package-signing-public.key"
+    key_path.write_bytes(b"placeholder")
+    monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", key_path)
+
+    real_fstat = os.fstat
+    captured = {}
+
+    def _raise_after_capturing_fd(fd):
+        captured["fd"] = fd
+        raise OSError("TEST_FSTAT_FAILURE")
+
+    monkeypatch.setattr(os, "fstat", _raise_after_capturing_fd)
+
+    with pytest.raises(PackageTrustConfigurationError) as excinfo:
+        load_package_trusted_public_key()
+
+    assert "TEST_FSTAT_FAILURE" not in str(excinfo.value)
+
+    # The descriptor must have been closed by the loader -- using the
+    # REAL fstat (captured before patching) on it now raises OSError
+    # (bad file descriptor), proving cleanup occurred without depending
+    # on an exact platform error message.
+    with pytest.raises(OSError):
+        real_fstat(captured["fd"])
+
+
+def test_fdopen_failure_raises_configuration_error_and_closes_fd(tmp_path, monkeypatch):
+    import os
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    key_path = tmp_path / "package-signing-public.key"
+    public_key = Ed25519PrivateKey.generate().public_key()
+    key_path.write_bytes(
+        public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    )
+    monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", key_path)
+
+    real_fstat = os.fstat
+    captured = {}
+
+    def _raise_after_capturing_fd(fd, *args, **kwargs):
+        captured["fd"] = fd
+        raise OSError("TEST_FDOPEN_FAILURE")
+
+    monkeypatch.setattr(os, "fdopen", _raise_after_capturing_fd)
+
+    with pytest.raises(PackageTrustConfigurationError) as excinfo:
+        load_package_trusted_public_key()
+
+    assert "TEST_FDOPEN_FAILURE" not in str(excinfo.value)
+    with pytest.raises(OSError):
+        real_fstat(captured["fd"])
+
+
+def test_read_failure_raises_configuration_error_and_closes_fd(tmp_path, monkeypatch):
+    import os
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    key_path = tmp_path / "package-signing-public.key"
+    public_key = Ed25519PrivateKey.generate().public_key()
+    key_path.write_bytes(
+        public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    )
+    monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", key_path)
+
+    real_fstat = os.fstat
+    real_fdopen = os.fdopen
+    captured = {}
+
+    class _FailingReadHandle:
+        def __init__(self, real_handle):
+            self._real_handle = real_handle
+
+        def read(self, *args, **kwargs):
+            raise OSError("TEST_READ_FAILURE")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._real_handle.close()
+            return False
+
+    def _wrap_real_fdopen(fd, *args, **kwargs):
+        captured["fd"] = fd
+        return _FailingReadHandle(real_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(os, "fdopen", _wrap_real_fdopen)
+
+    with pytest.raises(PackageTrustConfigurationError) as excinfo:
+        load_package_trusted_public_key()
+
+    assert "TEST_READ_FAILURE" not in str(excinfo.value)
+    with pytest.raises(OSError):
+        real_fstat(captured["fd"])

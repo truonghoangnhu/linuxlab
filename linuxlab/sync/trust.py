@@ -42,6 +42,15 @@ def _read_trust_anchor_bytes():
         # is now the only close
         with handle:
             return handle.read()
+    except OSError as exc:
+        # Covers fstat()/fdopen()/read() -- the same narrow filesystem
+        # translation boundary os.open() above already uses. The
+        # intentional non-regular-file PackageTrustConfigurationError
+        # raised just above is not an OSError, so it passes through this
+        # clause untouched.
+        raise PackageTrustConfigurationError(
+            f"cannot read Node trust anchor at {_TRUST_ANCHOR_PATH}: {exc.strerror}"
+        ) from exc
     finally:
         if fd is not None:
             os.close(fd)
