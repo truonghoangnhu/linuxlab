@@ -173,6 +173,12 @@ LINUXLAB_CAN_IMPORT_PACKAGES = True (node only)
   file.
 - No Central→Node automatic content transport; only an operator-controlled
   file crosses the boundary.
+- The CLI-driven E2E acceptance test (Task 7) proves this with two real,
+  independently created and migrated ephemeral PostgreSQL databases and
+  Central/Node commands each run in their own subprocess under their own
+  real settings module — never a single shared test database, never
+  `override_settings`/mutable global `settings` standing in for two
+  deployments inside one already-initialized Django process.
 - `docs/operator/` is not modified in this corrective.
 - Deployment templates are not modified (the approved spec does not require
   it).
@@ -192,7 +198,8 @@ LINUXLAB_CAN_IMPORT_PACKAGES = True (node only)
 | Create | `linuxlab/publication/tests/test_manage_central_package.py` | Command contract + integration tests for `publish` and `build` | 2, 3 |
 | Create | `linuxlab/sync/management/commands/manage_node_package.py` | `verify`, `import`, `status`, `activate`, `rollback` subcommands | 4, 5, 6 |
 | Create | `linuxlab/sync/tests/test_manage_node_package.py` | Command contract + integration tests for all five Node subcommands | 4, 5, 6 |
-| Create | `linuxlab/sync/tests/test_package_operator_e2e.py` | One real CLI-driven Central→file→Node end-to-end acceptance test | 7 |
+| Create | `scripts/tests/_package_operator_subprocess.py` | Test-only subprocess bootstrap: runs one management command (or the authoring fixture) under an explicit profile/database, in its own process | 7 |
+| Create | `scripts/tests/test_package_operator_e2e.py` | One real CLI-driven Central→file→Node end-to-end acceptance test, using two independently created/migrated ephemeral PostgreSQL databases | 7 |
 
 No shared "operator framework" module is created: `manage_central_package.py`
 and `manage_node_package.py` do not import from each other, and neither
@@ -2032,183 +2039,525 @@ match unexpected behavior.
 ## Task 7: CLI-driven Central→file→Node end-to-end acceptance test
 
 **Files:**
-- Create: `linuxlab/sync/tests/test_package_operator_e2e.py`
+- Create: `scripts/tests/_package_operator_subprocess.py` (test-only
+  subprocess bootstrap; never imported by production code)
+- Create: `scripts/tests/test_package_operator_e2e.py`
 
 **Interfaces:**
-- Consumes: every command produced by Tasks 2–6, via `call_command()` only.
-- Produces: no new production code; one test module.
+- Consumes (reused as generic test/database orchestration —
+  category A, per the inventory below):
+  `scripts.release_gate.database.GateDatabaseNames.for_run(run_id)`,
+  `create_database(db_admin, gate_names, member)`,
+  `run_migrations(gate_names, member, profile_env)`,
+  `drop_database(db_admin, gate_names, member)`,
+  `scripts.release_gate.environment.DatabaseAdminConnection`.
+- Explicitly NOT consumed (release-gate-only — category B, never a
+  production dependency and never imported by this test either):
+  `scripts.release_gate.signing_material` (ephemeral keypair generation),
+  `scripts.release_gate.actions`, `scripts.release_gate.gate_runner`,
+  `scripts.release_gate.cli`'s action dispatch,
+  `scripts.release_gate.environment.build_gate_environment` (its
+  git-sha/clean-working-tree/artifact-dir concerns are release-gate-run
+  concepts this test does not need).
+- Produces: two new test-only files; no new production code, no shared
+  production module. `manage_central_package`/`manage_node_package`
+  themselves are exercised completely unmodified, exactly as built in
+  Tasks 2–6.
 
-**E2E profile/DB isolation strategy (concrete decision, not left open):**
-This test runs in a single pytest-django test process against the single
-shared `linuxlab_test` database (`pytest.mark.django_db`), exactly matching
-the only established precedent for Central/Node dual-profile testing
-already in this codebase (`linuxlab/sync/tests/test_task14_profiles.py`,
-which toggles `LINUXLAB_CAN_RECEIVE_SYNC_EVENTS`/`LINUXLAB_CAN_RUN_SYNC_WORKER`
-via the `settings` pytest fixture within one test file rather than running
-two real separate database servers). This plan does not invent a new
-dual-Postgres/dual-process test harness: `scripts/release_gate/`'s
-`dual_deployment` (real ephemeral Postgres databases plus real Gunicorn
-subprocesses) is release-gate-only infrastructure for full HTTP-level
-deployment scenarios, is never imported by production or by this test, and
-predates Amendment C's fixed-path-only trust anchor (it has no mechanism to
-redirect a Node subprocess's trust-anchor path without violating that
-Ruling). Central/Node separation is instead proven **behaviorally**: the
-capability flag is toggled between the Central-flavored and Node-flavored
-`call_command()` calls (`settings.LINUXLAB_CAN_AUTHOR` /
-`settings.LINUXLAB_CAN_IMPORT_PACKAGES`), and the only value that crosses
-from the "Central" steps to the "Node" steps is the `.llpkg` file's bytes on
-disk — no Python object, and no direct read of a `PublicationSnapshot` row,
-is ever passed to or performed by a Node-flavored step. The trust-anchor
-path (`linuxlab.sync.trust._TRUST_ANCHOR_PATH`) and the signing-key path
-(`linuxlab.publication.signing._SIGNING_KEY_PATH`) are each monkeypatched to
-a `tmp_path` file for the duration of the test, exactly as the spec's own
-Section 5a explicitly sanctions ("Test code may substitute/monkeypatch the
-internal path boundary").
+### Existing DB/profile test infrastructure inventory (read before writing this task)
 
-- [ ] Write the complete E2E test in one file (this is Task 7's only RED→
-  GREEN cycle, since it composes commands already proven individually in
-  Tasks 2–6 — RED is expected only if any prior task's command has a defect
-  that only surfaces under this full sequence):
+`scripts/release_gate/database.py` already provides hardened, reusable
+ephemeral-PostgreSQL orchestration:
+
+- `GateDatabaseNames.for_run(run_id)` derives four canonical, safety-checked
+  database names (`linuxlab_gate_{central,node,restore_central,restore_node}_{run_id}`)
+  from one `run_id` matching `^[a-z][a-z0-9_]*\Z`
+  (`scripts/release_gate/environment.py`'s `_RUN_ID_PATTERN`); every
+  create/migrate/drop call below re-derives and checks this name, so a
+  forged/foreign/production-looking name can never be operated on
+  (`assert_ephemeral_database_name`).
+- `create_database(db_admin, gate_names, member)` issues `CREATE DATABASE`
+  for one of the four names.
+- `run_migrations(gate_names, member, profile_env, *, repo_root=None)` runs
+  `manage.py migrate --noinput` as a **subprocess**, with
+  `POSTGRES_DB` pinned to the resolved ephemeral name last (so nothing in
+  `profile_env` can override it) — this is the exact established pattern
+  this task reuses for running `manage_central_package`/
+  `manage_node_package` too.
+- `drop_database(db_admin, gate_names, member, ...)` is idempotent,
+  privilege-safe cleanup: it polls `pg_stat_activity` for the database's
+  remaining connections (bounded by a deadline), then issues a plain
+  `DROP DATABASE IF EXISTS`, then verifies the database is actually gone —
+  it never calls `pg_terminate_backend()`. Dropping a name that was never
+  created is a safe no-op.
+- `scripts/release_gate/environment.py`'s `DatabaseAdminConnection` is a
+  plain four-field dataclass (`host`/`port`/`user`/`password`) read from
+  `POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_USER`/`POSTGRES_PASSWORD` — the
+  same environment variables `.env` already provides for local Postgres
+  (per CLAUDE.md).
+
+Explicitly NOT reused, because it is release-gate-run business logic, not
+generic database orchestration:
+`build_gate_environment()` (asserts a clean git working tree and computes
+a git SHA and an `artifacts/phase1-release/<run_id>` directory — none of
+which this test needs or wants); `scripts/release_gate/signing_material.py`
+(`create_ephemeral_signing_keypair` — its own docstring calls it "ephemeral
+Ed25519 signing keypair lifecycle," test/release-gate scaffolding only);
+`scripts/release_gate/dual_deployment` in `e2e_support.py` (spins up real
+Gunicorn HTTP servers for full deployment-level scenarios — heavier than
+this test needs, and it predates Amendment C, so it has no mechanism to
+redirect a Node process's trust-anchor path without touching the real
+`/etc/linuxlab` path); `scripts/release_gate/cli.py`'s action dispatch and
+`scripts/release_gate/actions.py` (call the same domain services this
+plan's own commands call, but through release-gate-specific wrapper
+functions this test has no reason to go through when the real commands
+under test are `manage_central_package`/`manage_node_package` themselves).
+
+### Subprocess boundary and trust-material strategy (concrete decision, not left open)
+
+Central and Node run in **separate OS subprocesses**, one process per
+management-command invocation, each given only its own profile's
+`DJANGO_SETTINGS_MODULE` and `POSTGRES_DB` via that subprocess's own
+`env=`, exactly mirroring `run_migrations()`'s already-established
+pattern above. No `override_settings(...)` and no mutable global
+`settings` fixture is used anywhere in this task — Django's settings/app
+registry is configured exactly once, at each subprocess's own startup,
+and that subprocess exits after one command.
+
+Because each profile runs in its own fresh interpreter, `unittest.mock`/
+pytest's `monkeypatch` (which only work within one already-running
+process) cannot reach across the subprocess boundary. Instead, a small
+test-only bootstrap script, `scripts/tests/_package_operator_subprocess.py`,
+is the literal target of each subprocess invocation: it calls
+`django.setup()` once, optionally reassigns
+`linuxlab.publication.signing._SIGNING_KEY_PATH` or
+`linuxlab.sync.trust._TRUST_ANCHOR_PATH` to a test-generated file path
+**inside that fresh process's own module state** (a plain attribute
+assignment on an already-imported module — not a mock, not needed to be
+"undone," since the process exits immediately after), and then calls the
+real, completely unmodified `manage_central_package`/`manage_node_package`
+command via `django.core.management.call_command()`. This is test-only
+code, analogous in spirit to `scripts/release_gate/cli.py` being a
+standalone non-production subprocess entry point, but far smaller and
+specific to this one test — it is never imported by
+`linuxlab/publication/` or `linuxlab/sync/` production code, and it never
+writes to the real `/etc/linuxlab/keys/` path. Production loader/command
+code (Tasks 1–6) is not modified by this task in any way.
+
+The Central-flavored subprocess request carries `signing_key_path`
+(pointing at a `tmp_path` file); the Node-flavored request carries
+`trust_anchor_path` (pointing at a **different** `tmp_path` file
+containing only the matching *public* key). No request ever carries both,
+and the Central private key bytes are never written anywhere the
+Node-flavored subprocess call can read them — only `trust_anchor_path`'s
+public-key file is available to Node.
+
+- [ ] Create `scripts/tests/_package_operator_subprocess.py`:
 
   ```python
+  """Test-only subprocess bootstrap for
+  scripts/tests/test_package_operator_e2e.py. Never imported by
+  production code. Runs `django.setup()` once, optionally points the
+  Central signing-key loader or Node trust-anchor loader at a
+  test-generated file (a plain module-attribute assignment, valid only
+  for this one short-lived process), then either bootstraps one
+  LearningPathPage or calls one real management command unmodified.
+  """
+
+  import json
+  import sys
+  from pathlib import Path
+
+  import django
+
+  django.setup()
+
+  from django.core.management import call_command  # noqa: E402
+  from django.core.management.base import CommandError  # noqa: E402
+
+
+  def _bootstrap_learning_path(request):
+      from linuxlab.content.models import LearningPathPage
+      from linuxlab.publication.tests._wagtail_bootstrap import get_or_create_root_page
+
+      root = get_or_create_root_page()
+      page = LearningPathPage(title=request["title"], slug=request["slug"])
+      root.add_child(instance=page)
+      print(f"LEARNING_PATH_PUBLIC_ID:{page.public_id}")
+
+
+  def main():
+      request = json.loads(sys.argv[1])
+
+      if request.get("signing_key_path"):
+          import linuxlab.publication.signing as signing_module
+
+          signing_module._SIGNING_KEY_PATH = Path(request["signing_key_path"])
+
+      if request.get("trust_anchor_path"):
+          import linuxlab.sync.trust as trust_module
+
+          trust_module._TRUST_ANCHOR_PATH = Path(request["trust_anchor_path"])
+
+      if request["mode"] == "bootstrap_learning_path":
+          _bootstrap_learning_path(request)
+          return
+
+      try:
+          call_command(*request["command"])
+      except CommandError as exc:
+          print(f"COMMAND_ERROR: {exc}", file=sys.stderr)
+          sys.exit(1)
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+
+  This file is test-only infrastructure, not a test itself (no `test_`
+  prefix; mirrors the already-established `linuxlab/publication/tests/
+  _wagtail_bootstrap.py` naming convention for non-test helper files
+  inside a `tests/` directory).
+
+- [ ] Write the complete E2E test in `scripts/tests/test_package_operator_e2e.py`
+  (this is Task 7's only RED→GREEN cycle, since it composes commands
+  already proven individually in Tasks 2–6 — RED is expected only if any
+  prior task's command has a defect that only surfaces under this full
+  two-database sequence):
+
+  ```python
+  import json
+  import os
+  import secrets
+  import subprocess
+  import sys
   import uuid
+  from pathlib import Path
 
+  import psycopg
+  from psycopg import sql
   import pytest
-  from django.core.management import call_command
 
-  pytestmark = pytest.mark.django_db
+  from scripts.release_gate.database import (
+      GateDatabaseNames,
+      create_database,
+      drop_database,
+      run_migrations,
+  )
+  from scripts.release_gate.environment import DatabaseAdminConnection
+
+  _REPO_ROOT = Path(__file__).resolve().parents[2]
+  _SUBPROCESS_SCRIPT = Path(__file__).parent / "_package_operator_subprocess.py"
 
 
-  def test_full_operator_workflow_central_to_node(settings, tmp_path, monkeypatch):
+  def _db_admin_from_env():
+      return DatabaseAdminConnection(
+          host=os.environ.get("POSTGRES_HOST", "127.0.0.1"),
+          port=os.environ.get("POSTGRES_PORT", "5432"),
+          user=os.environ.get("POSTGRES_USER", "linuxlab"),
+          password=os.environ.get("POSTGRES_PASSWORD", ""),
+      )
+
+
+  def _run_subprocess_command(*, settings_module, db_name, request):
+      child_env = {
+          **os.environ,
+          "DJANGO_SETTINGS_MODULE": settings_module,
+          "POSTGRES_DB": db_name,
+      }
+      return subprocess.run(
+          [sys.executable, str(_SUBPROCESS_SCRIPT), json.dumps(request)],
+          cwd=str(_REPO_ROOT),
+          env=child_env,
+          capture_output=True,
+          text=True,
+      )
+
+
+  def _count_rows(db_admin, db_name, table_name):
+      conn = psycopg.connect(
+          host=db_admin.host, port=db_admin.port, user=db_admin.user,
+          password=db_admin.password, dbname=db_name,
+      )
+      try:
+          with conn.cursor() as cursor:
+              cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table_name)))
+              return cursor.fetchone()[0]
+      finally:
+          conn.close()
+
+
+  @pytest.fixture
+  def package_operator_e2e_databases():
+      db_admin = _db_admin_from_env()
+      run_id = f"pkgope2e{secrets.token_hex(4)}"
+      gate_names = GateDatabaseNames.for_run(run_id)
+
+      create_database(db_admin, gate_names, "central")
+      run_migrations(
+          gate_names, "central", {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.central"}
+      )
+
+      create_database(db_admin, gate_names, "node")
+      run_migrations(gate_names, "node", {"DJANGO_SETTINGS_MODULE": "linuxlab.settings.node"})
+
+      try:
+          yield {"db_admin": db_admin, "gate_names": gate_names}
+      finally:
+          # Cleanup runs on pass AND failure (this is inside `finally`),
+          # and both databases are attempted even if one drop fails, so a
+          # Node cleanup failure never skips Central cleanup (matching
+          # database.py's own documented cleanup invariant).
+          errors = []
+          for member in ("central", "node"):
+              try:
+                  drop_database(db_admin, gate_names, member)
+              except Exception as exc:  # noqa: BLE001
+                  errors.append(exc)
+          if errors:
+              raise RuntimeError(f"ephemeral database cleanup failed: {errors}")
+
+
+  def test_full_operator_workflow_central_to_node(package_operator_e2e_databases, tmp_path):
       from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
       from cryptography.hazmat.primitives.serialization import (
           Encoding, NoEncryption, PrivateFormat, PublicFormat,
       )
-      from linuxlab.content.models import LearningPathPage
-      from linuxlab.sync.models import ACTIVE, InstalledPackage
-      from wagtail.models import Page
 
-      # --- fixture/bootstrap: authoring content and trust material only,
-      # never a lifecycle step this test is meant to prove via CLI ---
-      root = Page.objects.get(depth=1)
-      path = LearningPathPage(title="E2E Path", slug=f"e2e-{uuid.uuid4().hex[:8]}")
-      root.add_child(instance=path)
+      db_admin = package_operator_e2e_databases["db_admin"]
+      gate_names = package_operator_e2e_databases["gate_names"]
+      central_db = gate_names.central
+      node_db = gate_names.node
 
+      # --- fixture/bootstrap: test-only trust material, written only
+      # under tmp_path (cleaned up by pytest itself) -- never the real
+      # /etc/linuxlab path, and the private key file is never referenced
+      # by any Node-flavored request below. ---
       private_key = Ed25519PrivateKey.generate()
       signing_key_path = tmp_path / "package-signing.key"
       signing_key_path.write_bytes(
           private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
       )
-      monkeypatch.setattr("linuxlab.publication.signing._SIGNING_KEY_PATH", signing_key_path)
-
-      trust_path = tmp_path / "package-signing-public.key"
-      trust_path.write_bytes(
+      trust_anchor_path = tmp_path / "package-signing-public.key"
+      trust_anchor_path.write_bytes(
           private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
       )
-      monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", trust_path)
 
-      # --- Central: version A ---
-      settings.LINUXLAB_CAN_AUTHOR = True
-      call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+      # --- database isolation proof, BEFORE any Central or Node command
+      # runs: the freshly migrated Node database has zero rows in either
+      # a Central-owned table or its own lifecycle table. ---
+      assert _count_rows(db_admin, node_db, "publication_publicationsnapshot") == 0
+      assert _count_rows(db_admin, node_db, "sync_installedpackage") == 0
+
+      # --- Central: bootstrap one LearningPathPage directly in the
+      # Central database (authoring fixture only, not a lifecycle step
+      # this test proves via CLI). ---
+      bootstrap = _run_subprocess_command(
+          settings_module="linuxlab.settings.central", db_name=central_db,
+          request={
+              "mode": "bootstrap_learning_path",
+              "title": "E2E Path",
+              "slug": f"e2e-{uuid.uuid4().hex[:8]}",
+          },
+      )
+      assert bootstrap.returncode == 0, bootstrap.stderr
+      learning_path_id = bootstrap.stdout.strip().removeprefix("LEARNING_PATH_PUBLIC_ID:")
+
+      # --- Central: publish + build version A, through the CLI only ---
+      publish_a = _run_subprocess_command(
+          settings_module="linuxlab.settings.central", db_name=central_db,
+          request={
+              "mode": "command",
+              "signing_key_path": str(signing_key_path),
+              "command": [
+                  "manage_central_package", "publish", "--learning-path", learning_path_id
+              ],
+          },
+      )
+      assert publish_a.returncode == 0, publish_a.stderr
+      assert "Version: 1" in publish_a.stdout
 
       package_a_path = tmp_path / "package-a.llpkg"
-      call_command(
-          "manage_central_package", "build",
-          "--learning-path", str(path.public_id), "--version", "1",
-          "--output", str(package_a_path),
+      build_a = _run_subprocess_command(
+          settings_module="linuxlab.settings.central", db_name=central_db,
+          request={
+              "mode": "command",
+              "signing_key_path": str(signing_key_path),
+              "command": [
+                  "manage_central_package", "build",
+                  "--learning-path", learning_path_id, "--version", "1",
+                  "--output", str(package_a_path),
+              ],
+          },
       )
+      assert build_a.returncode == 0, build_a.stderr
       assert package_a_path.exists()
 
-      # --- pure file boundary: only these bytes reach the Node steps below ---
-      settings.LINUXLAB_CAN_AUTHOR = False
+      # --- pure file boundary: from here on, only package_a_path's bytes
+      # reach Node. Every Node-flavored request below omits central_db and
+      # signing_key_path entirely; it is not merely unused, it is never
+      # constructed. ---
 
-      # --- Node: version A ---
-      settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
-      before = InstalledPackage.objects.count()
-      call_command("manage_node_package", "verify", "--file", str(package_a_path))
-      assert InstalledPackage.objects.count() == before
-
-      call_command("manage_node_package", "import", "--file", str(package_a_path))
-      call_command("manage_node_package", "status")
-      call_command(
-          "manage_node_package", "activate",
-          "--package-type", "learning_path",
-          "--source-public-id", str(path.public_id),
-          "--package-version", "1",
+      # --- Node: verify (read-only) ---
+      before = _count_rows(db_admin, node_db, "sync_installedpackage")
+      verify_a = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "trust_anchor_path": str(trust_anchor_path),
+              "command": ["manage_node_package", "verify", "--file", str(package_a_path)],
+          },
       )
+      assert verify_a.returncode == 0, verify_a.stderr
+      assert _count_rows(db_admin, node_db, "sync_installedpackage") == before
 
-      active = InstalledPackage.objects.get(
-          package_type="learning_path", source_public_id=path.public_id, state=ACTIVE
+      # --- Node: import, status, activate ---
+      import_a = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "trust_anchor_path": str(trust_anchor_path),
+              "command": ["manage_node_package", "import", "--file", str(package_a_path)],
+          },
       )
-      assert active.package_version == 1
+      assert import_a.returncode == 0, import_a.stderr
+
+      status_after_import = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={"mode": "command", "command": ["manage_node_package", "status"]},
+      )
+      assert status_after_import.returncode == 0, status_after_import.stderr
+      assert "State: staged" in status_after_import.stdout
+
+      activate_a = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "command": [
+                  "manage_node_package", "activate",
+                  "--package-type", "learning_path",
+                  "--source-public-id", learning_path_id,
+                  "--package-version", "1",
+              ],
+          },
+      )
+      assert activate_a.returncode == 0, activate_a.stderr
+      assert "State: active" in activate_a.stdout
 
       # --- Central: version B, through the same operator workflow ---
-      settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
-      settings.LINUXLAB_CAN_AUTHOR = True
-      call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+      publish_b = _run_subprocess_command(
+          settings_module="linuxlab.settings.central", db_name=central_db,
+          request={
+              "mode": "command",
+              "signing_key_path": str(signing_key_path),
+              "command": [
+                  "manage_central_package", "publish", "--learning-path", learning_path_id
+              ],
+          },
+      )
+      assert publish_b.returncode == 0, publish_b.stderr
+      assert "Version: 2" in publish_b.stdout
 
       package_b_path = tmp_path / "package-b.llpkg"
-      call_command(
-          "manage_central_package", "build",
-          "--learning-path", str(path.public_id), "--version", "2",
-          "--output", str(package_b_path),
+      build_b = _run_subprocess_command(
+          settings_module="linuxlab.settings.central", db_name=central_db,
+          request={
+              "mode": "command",
+              "signing_key_path": str(signing_key_path),
+              "command": [
+                  "manage_central_package", "build",
+                  "--learning-path", learning_path_id, "--version", "2",
+                  "--output", str(package_b_path),
+              ],
+          },
       )
+      assert build_b.returncode == 0, build_b.stderr
 
       # --- Node: version B ---
-      settings.LINUXLAB_CAN_AUTHOR = False
-      settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
-      call_command("manage_node_package", "verify", "--file", str(package_b_path))
-      call_command("manage_node_package", "import", "--file", str(package_b_path))
-      call_command(
-          "manage_node_package", "activate",
-          "--package-type", "learning_path",
-          "--source-public-id", str(path.public_id),
-          "--package-version", "2",
+      verify_b = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "trust_anchor_path": str(trust_anchor_path),
+              "command": ["manage_node_package", "verify", "--file", str(package_b_path)],
+          },
       )
+      assert verify_b.returncode == 0, verify_b.stderr
 
-      active = InstalledPackage.objects.get(
-          package_type="learning_path", source_public_id=path.public_id, state=ACTIVE
+      import_b = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "trust_anchor_path": str(trust_anchor_path),
+              "command": ["manage_node_package", "import", "--file", str(package_b_path)],
+          },
       )
-      assert active.package_version == 2
-      assert active.previous_package.package_version == 1
+      assert import_b.returncode == 0, import_b.stderr
+
+      activate_b = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "command": [
+                  "manage_node_package", "activate",
+                  "--package-type", "learning_path",
+                  "--source-public-id", learning_path_id,
+                  "--package-version", "2",
+              ],
+          },
+      )
+      assert activate_b.returncode == 0, activate_b.stderr
+      assert "State: active" in activate_b.stdout
 
       # --- Node: rollback to the existing lifecycle's own previous_package ---
-      call_command(
-          "manage_node_package", "rollback",
-          "--package-type", "learning_path",
-          "--source-public-id", str(path.public_id),
+      rollback = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={
+              "mode": "command",
+              "command": [
+                  "manage_node_package", "rollback",
+                  "--package-type", "learning_path",
+                  "--source-public-id", learning_path_id,
+              ],
+          },
       )
+      assert rollback.returncode == 0, rollback.stderr
+      assert "Version: 1" in rollback.stdout
+      assert "State: active" in rollback.stdout
 
-      active = InstalledPackage.objects.get(
-          package_type="learning_path", source_public_id=path.public_id, state=ACTIVE
+      status_final = _run_subprocess_command(
+          settings_module="linuxlab.settings.node", db_name=node_db,
+          request={"mode": "command", "command": ["manage_node_package", "status"]},
       )
-      assert active.package_version == 1
-
-      active_count = InstalledPackage.objects.filter(
-          package_type="learning_path", source_public_id=path.public_id, state=ACTIVE
-      ).count()
-      assert active_count == 1
+      assert status_final.stdout.count("State: active") == 1
   ```
 
-- [ ] Run it: `.venv/bin/pytest linuxlab/sync/tests/test_package_operator_e2e.py -q`
-  — this must reach GREEN using only the commands built in Tasks 1–6; do
-  not add any new command logic in this task. If it fails, the defect is
-  in an earlier task's command, not in this test, and must be fixed by
-  revisiting that task (do not weaken this test's assertions to
-  accommodate a defect).
-- [ ] `git diff --check`; inspect the diff — confirm it touches only this
-  one new test file.
+- [ ] Run it:
+  `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_package_operator_e2e.py -q`
+  (unset, not left as whatever the shell happens to export, exactly like
+  the rest of the `scripts/tests` suite — this test configures
+  `DJANGO_SETTINGS_MODULE` itself, per subprocess, via `env=`) — this must
+  reach GREEN using only the commands built in Tasks 1–6; do not add any
+  new command logic in this task. If it fails, the defect is in an earlier
+  task's command, not in this test, and must be fixed by revisiting that
+  task (do not weaken this test's assertions to accommodate a defect).
+- [ ] `git diff --check`; inspect the diff — confirm it touches only these
+  two new test-infrastructure files.
 - [ ] Commit:
-  `git add linuxlab/sync/tests/test_package_operator_e2e.py && git commit -m "test: verify package operator workflow end to end"`
+  `git add scripts/tests/_package_operator_subprocess.py scripts/tests/test_package_operator_e2e.py && git commit -m "test: verify package operator workflow end to end"`
 
-**Task 7 STOP conditions:** STOP and report if proving genuine physical
-Central/Node database separation (as opposed to the behavioral file-boundary
-proof this test performs) turns out to be a hard requirement — re-read spec
-Section 20 ("Central and Node DB/profile separation must remain intact")
-together with Section 5a's explicit sanction of test-only path
-substitution before concluding this; if a stricter requirement is intended,
-that is a specification clarification to raise, not a new dual-database
-test harness to invent unilaterally inside this plan.
+**Task 7 STOP conditions:** STOP and report if `GateDatabaseNames.for_run()`
+combined with `create_database`/`run_migrations`/`drop_database` cannot
+actually produce two working, separately migrated databases outside a
+full release-gate run (e.g. if `run_migrations()`'s subprocess call is
+found to depend on release-gate-run-only environment state this test does
+not set up) — re-verify by running the fixture alone before writing the
+rest of the test, and escalate rather than papering over it with a new,
+uninventoried helper; if the real Ed25519/PEM round-trip through the
+subprocess bootstrap script behaves differently from the in-process
+Task 1 loader tests (it should not — the loader functions themselves are
+completely unmodified), that is a genuine defect in Task 1, not something
+to work around here.
 
 ## Task 8: Final verification at the exact implementation HEAD
 
@@ -2232,8 +2581,15 @@ test harness to invent unilaterally inside this plan.
     linuxlab/publication/tests/test_signing.py \
     linuxlab/publication/tests/test_manage_central_package.py \
     linuxlab/sync/tests/test_manage_node_package.py \
-    linuxlab/sync/tests/test_package_operator_e2e.py \
     -q
+  ```
+
+- [ ] New package-operator CLI-driven E2E test (its own invocation, since
+  it lives under `scripts/tests/` and manages its own
+  `DJANGO_SETTINGS_MODULE`/`POSTGRES_DB` per subprocess — do not fold it
+  into the `linuxlab/**/tests` invocation above):
+  ```
+  env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_package_operator_e2e.py -q
   ```
 
 - [ ] Relevant existing publication/package tests:
@@ -2362,9 +2718,12 @@ implementation is complete:
     source_public_id)`, with no explicit-target argument?
 16. Does the single-ACTIVE-per-source invariant hold after every
     activate/rollback test?
-17. Does the E2E test cross the Central→Node boundary only through the
-    `.llpkg` file's bytes, never a shared in-memory object or direct
-    cross-read of the other side's rows?
+17. Does the E2E test use two independently created and migrated
+    ephemeral PostgreSQL databases (never a single shared test database),
+    run Central and Node in separate subprocesses under their own real
+    settings modules, and cross the Central→Node boundary only through
+    the `.llpkg` file's bytes — proven by the explicit zero-row assertions
+    against Node's database before any Node command runs?
 18. Is there no schema migration (confirmed by the migration-drift checks
     in Task 8)?
 19. Is `docs/operator/` unchanged?
@@ -2395,7 +2754,7 @@ against this checklist.
 | Node `status` deterministic discovery, canonical filters only | Task 5 | status tests |
 | Safe, non-overwriting, atomic build output | Task 3a (`_write_new_file_atomically`) | helper tests; Checkpoint #10 |
 | No secret material in output/logs | Tasks 1, 3, 4 (sentinel-absence tests) | Task 1a/1b sentinel tests |
-| CLI-driven E2E through management commands only, file-only Central→Node boundary | Task 7 | E2E test; Checkpoint #17 |
+| CLI-driven E2E through management commands only, file-only Central→Node boundary, real Central/Node DB separation | Task 7 (two ephemeral databases, subprocess-per-profile, zero-row assertions on Node before import) | E2E test; Checkpoint #17 |
 | No schema migration | All tasks (no model changes anywhere in this plan) | Task 8 migration-drift checks; Checkpoint #18 |
 | `docs/operator/` untouched | This plan does not touch it | Task 8 diff review; Checkpoint #19 |
 | Task 14 unchanged | This plan does not touch `sync_events`/`manage_sync_node`/outbox/inbox code | Task 8 regression run; Checkpoint #20 |
