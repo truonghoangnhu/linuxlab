@@ -5,6 +5,8 @@ Status: Approved design for implementation planning
 Repository: LinuxLab
 Task: Task 15 / Task 13 / Corrective A
 Start HEAD: `abdda90b2f9f8cbd3942c41ed2d947a42ef4e42b`
+Amended: 2026-09-11 — Amendment A (installed-package identity/rollback
+alignment), starting HEAD `ffa5c1b165ddbdc90607492c346c36e6936c830d`
 
 ## Context
 
@@ -20,6 +22,33 @@ distribution, authorization, or transport subsystem.
 
 This document is an approved design specification for implementation
 planning. It is not an implementation plan and it is not code.
+
+### Amendment A
+
+Implementation-time domain inventory (Section 22) confirmed that
+`InstalledPackage` has no independent `public_id` and that
+`rollback_package()` does not accept an explicit target. The original
+spec's `--installed-package <UUID>` / `--to-installed-package <UUID>`
+contract does not match this reality. Amendment A resolves the mismatch by
+aligning the CLI to the domain's existing identity and rollback semantics
+instead of introducing a new identity or new rollback contract.
+
+**RULING:** Use the existing `InstalledPackage` composite identity —
+`(package_type, source_public_id, package_version)` — as the operator-facing
+installed-artifact identity. No `InstalledPackage.public_id` field and no
+synthetic installed-package UUID are introduced.
+
+**RATIONALE:** Corrective A is a thin operator adapter and must not create a
+new identity namespace or schema migration merely for CLI ergonomics.
+
+**RULING:** `rollback` exposes the existing
+`rollback_package(package_type, source_public_id)` semantics — rollback to
+the currently active package's recorded `previous_package`, chosen entirely
+by the existing lifecycle service. No explicit-target rollback argument is
+introduced.
+
+**RATIONALE:** Explicit-target rollback would constitute new lifecycle
+business semantics and is outside Corrective A.
 
 ## 1. Architecture / Operator Surface
 
@@ -60,7 +89,7 @@ Node flow:
 → status
 → activate
 → runtime serves exact ACTIVE artifact
-→ rollback to explicit target if required
+→ rollback via the existing rollback authority if required
 ```
 
 The CLI must never bypass:
@@ -105,25 +134,46 @@ manage_node_package import
   --file <FILE.llpkg>
 
 manage_node_package status
-  [--installed-package <UUID>]
+  [--package-type <TYPE>]
+  [--source-public-id <UUID>]
+  [--package-version <VERSION>]
 
 manage_node_package activate
-  --installed-package <UUID>
+  --package-type <TYPE>
+  --source-public-id <UUID>
+  --package-version <VERSION>
 
 manage_node_package rollback
-  --to-installed-package <UUID>
+  --package-type <TYPE>
+  --source-public-id <UUID>
 ```
 
 These are approved CLI semantics, but implementation must first inventory
-the real service signatures and real domain identifiers (see Section 24).
+the real service signatures and real domain identifiers (see Section 22).
 If an existing sanctioned service uses a materially different stable
-identity or contract, implementation must STOP and report the architectural
-mismatch rather than force the domain into this CLI shape.
+identity or contract than documented here, implementation must STOP and
+report the architectural mismatch rather than force the domain into this
+CLI shape. The `InstalledPackage` identity and `rollback_package` contract
+mismatch discovered during Corrective A's own implementation-time inventory
+is already resolved by Amendment A and is not a live mismatch (Section 22).
 
-Identifiers exposed to the operator:
+Identifiers exposed to the operator are one of three distinct concepts —
+never conflated:
 
-- stable public UUID
-- immutable package identity/version from the verified manifest
+- **Source identity** — `source_public_id`, the stable public UUID of the
+  packaged source/content lineage.
+- **Installed-artifact identity** — the composite tuple
+  `(package_type, source_public_id, package_version)`, which identifies one
+  concrete installed immutable artifact on Node. All three components are
+  required together; none of them alone is a stable installed-artifact
+  identity.
+- **Package/manifest identity** — whatever immutable identity/version the
+  verified manifest actually carries. This is not assumed to be the same as
+  the installed-artifact identity above.
+
+`LearningPath` and publication `public_id` values (Sections 3–4) are
+unrelated, legitimate stable identifiers and are unaffected by this
+distinction.
 
 Do **not** expose as operator identity:
 
@@ -132,6 +182,7 @@ Do **not** expose as operator identity:
 - a filename as identity
 - a title or slug
 - an ambiguous "latest"
+- a synthetic `InstalledPackage` UUID that does not exist in the domain
 
 Filename is transport location only, never identity.
 
@@ -256,12 +307,22 @@ file
 
 The CLI must not trust a previous `verify` invocation.
 
-Output must distinguish, where applicable:
+Output must expose the canonical installed-artifact identity so the
+operator can copy it into a later `status`/`activate`/`rollback` invocation,
+for example semantically:
 
-- manifest/package identity
-- Node `InstalledPackage` stable identity
-- version
-- real lifecycle state
+```
+Operation: import
+PackageType: <package_type>
+Source: <source_public_id>
+Version: <package_version>
+State: <real lifecycle state>
+```
+
+If the verified manifest carries an additional distinct package/manifest
+identity, it may also be shown, but the CLI must not invent one. There is
+no `InstalledPackage.public_id` to report — see the identifier contract in
+Section 2.
 
 Duplicate-import behavior remains whatever the current lifecycle service
 already defines. The CLI must not invent duplicate-import semantics of its
@@ -270,20 +331,22 @@ own.
 ## 8. Node Status Semantics
 
 `status` with no argument gives a deterministic read-only overview
-sufficient for an operator to discover `InstalledPackage` stable
+sufficient for an operator to discover installed-artifact canonical
 identities.
 
-Optional filter:
+Optional filters, using the canonical identity fields (Section 2):
 
 ```
---installed-package <UUID>
+--package-type <TYPE>
+--source-public-id <UUID>
+--package-version <VERSION>
 ```
 
-Output includes:
+Output includes, per installed artifact:
 
-- `InstalledPackage` stable identity
-- package identity
-- version
+- `package_type`
+- `source_public_id`
+- `package_version`
 - real lifecycle state
 
 Rules:
@@ -291,16 +354,37 @@ Rules:
 - no ORM repr dump
 - no "latest" concept
 - no mutation
+- no database primary key
+- no `InstalledPackage` UUID/public_id, which does not exist (Section 2)
 
 ## 9. Activate / Rollback Semantics
 
 `activate`:
 
 ```
---installed-package <UUID>
+--package-type <TYPE>
+--source-public-id <UUID>
+--package-version <VERSION>
 ```
 
-Must call the existing lifecycle activation service and preserve:
+Activation selects a concrete installed artifact using this canonical
+tuple:
+
+```
+(package_type, source_public_id, package_version)
+→ sanctioned read-only lookup (the existing activation service takes an
+  InstalledPackage instance, not the tuple, so the adapter resolves it
+  first)
+→ existing lifecycle activation service
+→ existing lock/completeness checks
+→ resulting ACTIVE state
+```
+
+The adapter's lookup is read-only; it must not mutate lifecycle state
+itself. `activate_package` is not redesigned merely to make the CLI
+signature take the tuple directly.
+
+Must preserve:
 
 - completeness checks
 - locking
@@ -310,15 +394,32 @@ Must call the existing lifecycle activation service and preserve:
 `rollback`:
 
 ```
---to-installed-package <UUID>
+--package-type <TYPE>
+--source-public-id <UUID>
 ```
 
-Uses an explicit target. The CLI must not invent "previous" semantics.
+Exposes the existing `rollback_package(package_type, source_public_id)`
+lifecycle contract exactly as it exists today: rollback to the currently
+active package's recorded previous package for that
+`(package_type, source_public_id)` scope, chosen entirely by the existing
+lifecycle service. The command reports the resulting active artifact's
+identity/state.
 
-If the existing rollback service has a materially different canonical
-target contract than an explicit `--to-installed-package` identity,
-implementation must STOP and report the mismatch (see Section 24) rather
-than reshape the service or the CLI unilaterally.
+The CLI must **not** invent:
+
+- explicit historical target selection
+- "previous" selection rules of its own
+- version-order semantics
+- rollback stack/history semantics
+
+If the existing rollback service rejects rollback because no active
+package or no recorded previous package exists, that sanctioned domain
+failure is propagated as-is.
+
+If a future inventory finds the rollback service's actual behavior
+materially different from this description, implementation must STOP and
+report the mismatch (see Section 22) rather than reshape the service or the
+CLI unilaterally.
 
 Rules:
 
@@ -394,7 +495,21 @@ Idempotency is operation-specific and inherited from current services:
   service semantics, but an existing destination path fails closed
 - `import`: duplicate behavior inherited from the lifecycle service
 - `activate`: already-active behavior inherited from the lifecycle service
-- `rollback`: explicit target; no CLI-generated history semantics
+- `rollback`: behavior is entirely inherited from the existing
+  `rollback_package` service; the CLI adds no version-selection policy of
+  its own
+
+The CLI may resolve a canonical `(package_type, source_public_id,
+package_version)` tuple to a model instance read-only, when a service
+signature requires a model instance rather than the tuple (Section 9). The
+CLI may **not**:
+
+```
+InstalledPackage.objects.update(...)
+manually archive an ACTIVE package
+manually choose a rollback target
+manually activate a historical version
+```
 
 No implicit chaining:
 
@@ -507,28 +622,34 @@ This locks the invariant: a `verify` result is never a trusted cache.
 `status`:
 
 - no-arg listing
-- filtered by stable UUID
+- filtered by the canonical `(package_type, source_public_id,
+  package_version)` fields
 - deterministic output
 - real state/version
 - unknown identity behavior
 
-`activate`/`rollback` integration:
+`activate`/`rollback` integration, using the current lifecycle service's
+own rollback contract rather than an arbitrary explicit version target:
 
 ```
 STAGED A
-→ activate A
+→ activate A (package_type, source_public_id, version A)
 → A ACTIVE
 
-STAGED B
+STAGED B (same package_type/source_public_id, version B)
 → activate B
-→ B ACTIVE
+→ B ACTIVE, A ARCHIVED, B.previous_package == A
 
-rollback explicitly to A
-→ A ACTIVE
+rollback for (package_type, source_public_id)
+→ existing rollback_package() selects A (B's recorded previous package)
+→ A ACTIVE again
 ```
 
 After transitions: at most one ACTIVE for the relevant source/type
-according to the existing lifecycle invariant.
+according to the existing lifecycle invariant. The test must not assume an
+arbitrary explicit version target unless that is already the lifecycle
+contract — here the target is whichever package `rollback_package()`
+determines, not an operator-chosen version.
 
 Existing lifecycle concurrency tests are not duplicated if the lifecycle
 already owns them.
@@ -542,9 +663,11 @@ Command adapters must not directly mutate:
 - authoring `ActivityVersion` rows
 - other lifecycle state
 
-Read-only stable-ID lookup from the adapter is acceptable only when required
-by an existing service signature. If the service can resolve the UUID
-itself, that path is preferred.
+Read-only lookup from the adapter (e.g. resolving the canonical
+`(package_type, source_public_id, package_version)` tuple to a model
+instance for `activate_package`) is acceptable only when required by an
+existing service signature. If the service can resolve the identity itself,
+that path is preferred.
 
 ## 19. Secret-Output Tests
 
@@ -571,11 +694,15 @@ Central fixture
 → Node call_command verify
 → assert no mutation
 → Node call_command import
+→ capture the canonical installed tuple
+  (package_type, source_public_id, package_version)
 → Node call_command status
-→ Node call_command activate
+→ Node call_command activate using the canonical tuple
 → lifecycle/runtime confirms ACTIVE
-→ Node call_command rollback
-→ previous explicit target ACTIVE again
+→ establish another lifecycle version as required by existing tests/domain
+→ Node call_command rollback using package_type + source_public_id
+→ existing rollback authority selects the result
+→ command reports the resulting active tuple/state
 ```
 
 After minimal fixture setup, package-lifecycle steps under test must go
@@ -631,6 +758,31 @@ today: proceed.
 
 If it does not: STOP and report the mismatch rather than reshaping either
 side to force a fit.
+
+**Resolved by Amendment A:** this inventory already ran once for
+Corrective A and found that `InstalledPackage` has no `public_id` and that
+`rollback_package(package_type, source_public_id)` does not accept an
+explicit target. Amendment A adopted the domain's existing identity and
+rollback contract as approved architecture (see the rulings above).
+Implementation must **not** stop merely because:
+
+- `InstalledPackage` lacks a `public_id`, or
+- `rollback_package` does not accept an explicit target UUID.
+
+Those are now intentional, approved architecture, not open mismatches.
+
+Implementation must still STOP if it discovers that:
+
+- the `(package_type, source_public_id, package_version)` tuple is not
+  actually sufficient/stable for selecting one installed artifact;
+- `activate_package` requires semantics not representable through current
+  domain fields;
+- the rollback service has materially different behavior from the
+  inventory recorded here;
+- a schema migration is required;
+- package lifecycle semantics must be changed;
+- direct ORM mutation would be required;
+- a new package state is required.
 
 ## 23. Required Verification
 
@@ -719,14 +871,20 @@ Task 13 must **not** be closed immediately after Corrective A.
 - Package can cross a pure file boundary.
 - Node operator can verify without mutation.
 - Node operator can import through verifier/lifecycle authority.
-- Node operator can discover installed stable identities.
-- Node operator can activate explicitly.
-- Node operator can rollback to an explicit target.
+- Node operator can discover canonical installed-artifact identities
+  composed of `package_type`, `source_public_id`, and `package_version`.
+- Node operator can activate explicitly using that canonical identity.
+- Node operator can invoke the canonical rollback operation through the
+  existing lifecycle authority and obtain the resulting active package
+  identity/state.
 - Wrong-profile use fails closed.
 - No command exposes secrets.
 - No command offers bypass/force behavior.
 - No direct lifecycle ORM mutation is introduced.
 - No schema migration is required.
+- Corrective A does not add `InstalledPackage.public_id` or any synthetic
+  installed identity.
+- Corrective A does not change rollback target-selection semantics.
 - A real CLI-driven end-to-end test passes.
 - Full regression suite passes.
 
