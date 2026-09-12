@@ -501,3 +501,274 @@ def test_importing_the_same_package_twice_is_idempotent(settings, signed_package
     assert "Operation: import" in out
     assert "State: staged" in out
     assert InstalledPackage.objects.count() == 1
+
+
+# --- status -----------------------------------------------------------------
+
+
+def test_status_with_no_args_lists_installed_packages_deterministically(
+    settings, signed_package, capsys
+):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    capsys.readouterr()
+
+    call_command("manage_node_package", "status")
+
+    out = capsys.readouterr().out
+    assert f"Source: {signed_package['source_public_id']}" in out
+    assert f"Version: {signed_package['version']}" in out
+    assert "State: staged" in out
+
+
+def test_status_rejects_wrong_profile_before_selector_validation(settings):
+    """Capability-first (Task 4's established ordering, preserved here):
+    malformed selector values must never even be parsed when the
+    deployment profile cannot import packages."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package",
+            "status",
+            "--source-public-id",
+            "not-a-uuid",
+            "--package-version",
+            "not-a-version",
+        )
+
+    message = str(excinfo.value)
+    assert "not permitted on this deployment profile" in message
+    assert "not a valid UUID" not in message
+    assert "version" not in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_status_filters_by_exact_canonical_tuple(settings, signed_package, capsys):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    capsys.readouterr()
+
+    call_command(
+        "manage_node_package",
+        "status",
+        "--package-type",
+        "learning_path",
+        "--source-public-id",
+        str(signed_package["source_public_id"]),
+        "--package-version",
+        str(signed_package["version"]),
+    )
+
+    out = capsys.readouterr().out
+    assert f"Version: {signed_package['version']}" in out
+
+
+def test_status_unknown_identity_returns_no_rows(settings, capsys):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command(
+        "manage_node_package",
+        "status",
+        "--package-type",
+        "learning_path",
+        "--source-public-id",
+        str(uuid.uuid4()),
+        "--package-version",
+        "1",
+    )
+    assert capsys.readouterr().out == ""
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_status_rejects_version_without_source(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError):
+        call_command("manage_node_package", "status", "--package-version", "1")
+
+
+def test_status_rejects_malformed_source_uuid(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "status", "--source-public-id", "not-a-uuid")
+
+    assert "not a valid UUID" in str(excinfo.value)
+
+
+def test_status_rejects_malformed_package_version(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package",
+            "status",
+            "--source-public-id",
+            str(signed_package["source_public_id"]),
+            "--package-version",
+            "not-a-version",
+        )
+
+    assert "not a valid version number" in str(excinfo.value)
+
+
+def test_status_never_exposes_database_primary_key(settings, signed_package, capsys):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    capsys.readouterr()
+
+    call_command("manage_node_package", "status")
+
+    out = capsys.readouterr().out
+    assert "pk" not in out.lower()
+    assert "InstalledPackage object" not in out
+
+
+def test_status_selects_exact_version_when_multiple_versions_exist(
+    settings, tmp_path, monkeypatch, capsys
+):
+    """Load-bearing canonical-identity coverage (corrective Section 22):
+    two real installed versions of the same source must never be confused
+    -- querying one exact version reports exactly that version, never the
+    other, and never a 'latest' substitute."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from linuxlab.activities.default_registry import build_default_activity_registry
+    from linuxlab.content.models import LearningPathPage
+    from linuxlab.publication.package import build_package
+    from linuxlab.publication.snapshots import publish_learning_path
+
+    from ._wagtail_bootstrap import get_or_create_root_page
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    root = get_or_create_root_page()
+    path = LearningPathPage(title="Two Versions", slug=f"two-versions-{uuid.uuid4().hex[:8]}")
+    root.add_child(instance=path)
+
+    registry = build_default_activity_registry()
+    private_key = Ed25519PrivateKey.generate()
+
+    trust_path = tmp_path / "package-signing-public.key"
+    trust_path.write_bytes(
+        private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    )
+    monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", trust_path)
+
+    snapshot_v1 = publish_learning_path(path, registry)
+    package_v1_path = tmp_path / "package-v1.llpkg"
+    package_v1_path.write_bytes(build_package(snapshot_v1, registry, private_key))
+
+    live_path = LearningPathPage.objects.get(public_id=snapshot_v1.source_public_id)
+    snapshot_v2 = publish_learning_path(live_path, registry)
+    package_v2_path = tmp_path / "package-v2.llpkg"
+    package_v2_path.write_bytes(build_package(snapshot_v2, registry, private_key))
+
+    call_command("manage_node_package", "import", "--file", str(package_v1_path))
+    call_command("manage_node_package", "import", "--file", str(package_v2_path))
+    capsys.readouterr()
+    source_public_id = str(snapshot_v1.source_public_id)
+
+    call_command(
+        "manage_node_package", "status",
+        "--source-public-id", source_public_id,
+        "--package-version", "1",
+    )
+    out_v1 = capsys.readouterr().out
+    assert "Version: 1" in out_v1
+    assert "Version: 2" not in out_v1
+
+    call_command(
+        "manage_node_package", "status",
+        "--source-public-id", source_public_id,
+        "--package-version", "2",
+    )
+    out_v2 = capsys.readouterr().out
+    assert "Version: 2" in out_v2
+    assert "Version: 1" not in out_v2
+
+
+def test_status_reflects_real_active_state_after_activation(settings, signed_package, capsys):
+    """State authenticity (corrective Section 23): status must report the
+    real current lifecycle state, not merely echo `staged` from import.
+    activate_package() is used only to construct pre-existing state, as
+    the corrective explicitly permits -- Task 5 exposes no activate CLI."""
+    from linuxlab.sync.services import activate_package
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    installed = InstalledPackage.objects.get()
+    activate_package(installed)
+    capsys.readouterr()
+
+    call_command("manage_node_package", "status")
+
+    out = capsys.readouterr().out
+    assert "State: active" in out
+    assert "State: staged" not in out
+
+
+def test_status_leaves_installed_package_inventory_unchanged(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    installed_before = InstalledPackage.objects.get()
+    identity_before = (
+        installed_before.pk,
+        installed_before.package_type,
+        installed_before.source_public_id,
+        installed_before.package_version,
+        installed_before.state,
+        installed_before.previous_package_id,
+    )
+
+    call_command("manage_node_package", "status")
+
+    assert InstalledPackage.objects.count() == 1
+    installed_after = InstalledPackage.objects.get()
+    identity_after = (
+        installed_after.pk,
+        installed_after.package_type,
+        installed_after.source_public_id,
+        installed_after.package_version,
+        installed_after.state,
+        installed_after.previous_package_id,
+    )
+    assert identity_after == identity_before
+
+
+def test_status_does_not_load_trust_anchor(settings, signed_package, monkeypatch):
+    """Trust separation (corrective Section 8/25/27): status is local DB
+    inspection, never a trust operation. Proven by making the trust
+    loader raise if it is ever called."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+
+    def _raise_if_called():
+        raise AssertionError("status must not load the trust anchor")
+
+    monkeypatch.setattr(
+        "linuxlab.sync.management.commands.manage_node_package.load_package_trusted_public_key",
+        _raise_if_called,
+    )
+
+    call_command("manage_node_package", "status")
+
+
+def test_status_succeeds_with_no_trust_configuration_at_all(
+    settings, signed_package, tmp_path, monkeypatch, capsys
+):
+    """Stronger trust-separation proof: status succeeds even when the
+    trust anchor is completely missing/invalid, since it never needs
+    trust material at all."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "linuxlab.sync.trust._TRUST_ANCHOR_PATH", tmp_path / "does-not-exist.key"
+    )
+
+    call_command("manage_node_package", "status")
+
+    out = capsys.readouterr().out
+    assert "State: staged" in out

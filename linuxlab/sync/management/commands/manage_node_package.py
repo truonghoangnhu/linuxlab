@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 
 from django.conf import settings
@@ -16,6 +17,23 @@ def _require_node_capability():
         )
 
 
+def _parse_uuid(raw, *, what):
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise CommandError(f"{what} is not a valid UUID: {raw!r}") from exc
+
+
+def _parse_version(raw, *, what):
+    try:
+        version = int(raw)
+    except (ValueError, TypeError) as exc:
+        raise CommandError(f"{what} is not a valid version number: {raw!r}") from exc
+    if version < 1:
+        raise CommandError(f"{what} is not a valid version number: {raw!r}")
+    return version
+
+
 def _load_trust_anchor():
     try:
         return load_package_trusted_public_key()
@@ -24,7 +42,7 @@ def _load_trust_anchor():
 
 
 class Command(BaseCommand):
-    help = "Node package operator surface: verify, import."
+    help = "Node package operator surface: verify, import, status."
 
     def add_arguments(self, parser):
         subparsers = parser.add_subparsers(dest="action", required=True)
@@ -35,6 +53,11 @@ class Command(BaseCommand):
         import_parser = subparsers.add_parser("import")
         import_parser.add_argument("--file", required=True)
 
+        status_parser = subparsers.add_parser("status")
+        status_parser.add_argument("--package-type")
+        status_parser.add_argument("--source-public-id")
+        status_parser.add_argument("--package-version")
+
     def handle(self, *args, **options):
         _require_node_capability()
 
@@ -44,6 +67,10 @@ class Command(BaseCommand):
 
         if options["action"] == "import":
             self._handle_import(options)
+            return
+
+        if options["action"] == "status":
+            self._handle_status(options)
             return
 
     def _handle_verify(self, options):
@@ -90,3 +117,35 @@ class Command(BaseCommand):
         self.stdout.write(f"Source: {installed.source_public_id}")
         self.stdout.write(f"Version: {installed.package_version}")
         self.stdout.write(f"State: {installed.state}")
+
+    def _handle_status(self, options):
+        from linuxlab.sync.models import InstalledPackage
+
+        package_type = options["package_type"]
+        source_public_id_raw = options["source_public_id"]
+        package_version_raw = options["package_version"]
+
+        if package_version_raw is not None and source_public_id_raw is None:
+            raise CommandError("--package-version requires --source-public-id")
+
+        queryset = InstalledPackage.objects.all()
+
+        if source_public_id_raw is not None:
+            source_public_id = _parse_uuid(source_public_id_raw, what="--source-public-id")
+            queryset = queryset.filter(source_public_id=source_public_id)
+
+        if package_type is not None:
+            queryset = queryset.filter(package_type=package_type)
+
+        if package_version_raw is not None:
+            package_version = _parse_version(package_version_raw, what="--package-version")
+            queryset = queryset.filter(package_version=package_version)
+
+        rows = queryset.order_by("package_type", "source_public_id", "package_version")
+
+        for row in rows:
+            self.stdout.write("Operation: status")
+            self.stdout.write(f"PackageType: {row.package_type}")
+            self.stdout.write(f"Source: {row.source_public_id}")
+            self.stdout.write(f"Version: {row.package_version}")
+            self.stdout.write(f"State: {row.state}")
