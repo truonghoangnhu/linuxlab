@@ -163,27 +163,54 @@ def package_operator_e2e_databases():
 
 @contextmanager
 def _materialized_private_key(private_key_path, pem_bytes):
-    """Independent review Important I2 root-cause fix: the Central
+    """Independent review Important I2/I3 root-cause fix: the Central
     private signing key must exist on disk only for the narrow window a
     single Central `build` subprocess needs it -- never while any Node
-    subprocess runs, and never left behind after a failed Central build.
-    Writes `pem_bytes` to `private_key_path`, yields for exactly one
-    Central build call, and unlinks the file in `finally` regardless of
-    whether that call succeeds. The caller (the parent pytest process)
-    is the only place the private PEM bytes/key object ever exist
-    in-memory across the whole scenario.
+    subprocess runs, and never left behind after ANY failure, including
+    one that happens while writing or chmod'ing the file itself (I3: a
+    prior version wrote the file, then chmod'd it, BEFORE entering the
+    try/finally that owned cleanup -- so a write or chmod failure left
+    the file on disk, never reaching unlink).
+
+    Ownership is established the instant this helper's own exclusive
+    `O_CREAT | O_EXCL` creation succeeds -- before any write that can
+    fail -- and every exit path after that point (write failure, chmod
+    failure, a failing Central-build body, or normal success) unlinks
+    the file in `finally`. A pre-existing file at this path is never
+    this helper's to delete: exclusive creation fails closed with
+    FileExistsError in that case, `owned` is never set, and the
+    unrelated file is left completely untouched -- normalized to the
+    same `AssertionError` contract callers already depend on. The
+    caller (the parent pytest process) is the only place the private
+    PEM bytes/key object ever exist in-memory across the whole
+    scenario.
     """
-    assert not private_key_path.exists(), (
-        f"private signing key file must not already exist at {private_key_path}"
-    )
     private_key_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(private_key_path.parent, 0o700)
-    private_key_path.write_bytes(pem_bytes)
-    os.chmod(private_key_path, 0o600)
+
     try:
+        fd = os.open(str(private_key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise AssertionError(
+            f"private signing key file must not already exist at {private_key_path}"
+        ) from exc
+
+    owned = True
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(pem_bytes)
+        os.chmod(private_key_path, 0o600)
         yield
     finally:
-        private_key_path.unlink(missing_ok=True)
+        primary_exc = sys.exc_info()[1]
+        try:
+            if owned:
+                private_key_path.unlink(missing_ok=True)
+        except OSError as unlink_exc:
+            if primary_exc is not None:
+                primary_exc.add_note(f"private key file cleanup also failed: {unlink_exc!r}")
+            else:
+                raise
 
 
 # --- Important I1: database cleanup ownership -------------------------------
@@ -378,12 +405,20 @@ def test_run_node_subprocess_command_refuses_to_run_while_private_key_file_exist
 
 
 def test_materialized_private_key_refuses_to_overwrite_existing_file(tmp_path):
+    """I3 ownership contract: a pre-existing file at the target path is
+    never this helper's to touch. Exclusive creation must fail closed
+    before ownership is ever established, leaving the unrelated file's
+    contents byte-for-byte unchanged and never unlinked."""
     private_key_path = tmp_path / "central-keys" / "package-signing.key"
     private_key_path.parent.mkdir(parents=True)
-    private_key_path.write_bytes(b"PRE_EXISTING")
+    sentinel_bytes = b"PRE_EXISTING_UNRELATED_FILE_CONTENTS"
+    private_key_path.write_bytes(sentinel_bytes)
 
     with pytest.raises(AssertionError), _materialized_private_key(private_key_path, b"NEW_PEM_BYTES"):
             pytest.fail("must never reach the yielded body")
+
+    assert private_key_path.exists()
+    assert private_key_path.read_bytes() == sentinel_bytes
 
 
 def test_materialized_private_key_unlinks_file_even_when_central_build_fails():
@@ -404,6 +439,93 @@ def test_materialized_private_key_unlinks_file_even_when_central_build_fails():
                 raise _FakeBuildError("central build boom")
 
         assert not private_key_path.exists()
+
+
+def test_materialized_private_key_leaves_no_file_when_write_fails(tmp_path, monkeypatch):
+    """I3: ownership is established at exclusive-creation time, BEFORE
+    the write that can fail -- so a write failure right after creation
+    must still leave no owned private file behind."""
+    private_key_path = tmp_path / "central-keys" / "package-signing.key"
+
+    real_fdopen = os.fdopen
+
+    class _FailingWriteHandle:
+        def __init__(self, real_handle):
+            self._real_handle = real_handle
+
+        def write(self, *args, **kwargs):
+            raise OSError("TEST_WRITE_FAILURE")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._real_handle.close()
+            return False
+
+    def _wrap_real_fdopen(fd, *args, **kwargs):
+        return _FailingWriteHandle(real_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(os, "fdopen", _wrap_real_fdopen)
+
+    with pytest.raises(OSError, match="TEST_WRITE_FAILURE"), _materialized_private_key(private_key_path, b"FAKE_PEM_BYTES"):
+            pytest.fail("must never reach the yielded body")
+
+    assert not private_key_path.exists()
+
+
+def test_materialized_private_key_leaves_no_file_when_chmod_fails_after_write(tmp_path, monkeypatch):
+    """I3 RED->GREEN: reproduces the independent reviewer's exact
+    finding -- os.chmod() on the private file raises AFTER the PEM
+    content has already been fully written. The file must not remain on
+    disk afterward."""
+    private_key_path = tmp_path / "central-keys" / "package-signing.key"
+    real_chmod = os.chmod
+
+    def _fake_chmod(path, mode, *args, **kwargs):
+        if Path(path) == private_key_path:
+            raise OSError("TEST_CHMOD_FAILURE")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _fake_chmod)
+
+    with pytest.raises(OSError, match="TEST_CHMOD_FAILURE"), _materialized_private_key(private_key_path, b"FAKE_PEM_BYTES"):
+            pytest.fail("must never reach the yielded body")
+
+    assert not private_key_path.exists()
+
+
+def test_materialized_private_key_unlink_failure_does_not_mask_primary_body_failure(
+    tmp_path, monkeypatch
+):
+    """Section 11: if the primary failure is inside the Central-build
+    body and the cleanup unlink ALSO fails, the primary failure must
+    still be what propagates, with the cleanup failure attached as a
+    note -- mirroring _ephemeral_database_pair's existing precedence
+    convention."""
+    private_key_path = tmp_path / "central-keys" / "package-signing.key"
+    real_unlink = Path.unlink
+
+    def _fake_unlink(self, *args, **kwargs):
+        if self == private_key_path:
+            raise OSError("TEST_UNLINK_FAILURE")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _fake_unlink)
+
+    class _FakeBuildError(Exception):
+        pass
+
+    with (
+        pytest.raises(_FakeBuildError) as excinfo,
+        _materialized_private_key(private_key_path, b"FAKE_PEM_BYTES"),
+    ):
+        raise _FakeBuildError("central build boom")
+
+    assert str(excinfo.value) == "central build boom"
+    assert any(
+        "TEST_UNLINK_FAILURE" in note for note in getattr(excinfo.value, "__notes__", [])
+    )
 
 
 # --- Minor M1: adversarial environment isolation ----------------------------
