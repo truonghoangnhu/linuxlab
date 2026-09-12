@@ -58,6 +58,15 @@ class Command(BaseCommand):
         status_parser.add_argument("--source-public-id")
         status_parser.add_argument("--package-version")
 
+        activate_parser = subparsers.add_parser("activate")
+        activate_parser.add_argument("--package-type", required=True)
+        activate_parser.add_argument("--source-public-id", required=True)
+        activate_parser.add_argument("--package-version", required=True)
+
+        rollback_parser = subparsers.add_parser("rollback")
+        rollback_parser.add_argument("--package-type", required=True)
+        rollback_parser.add_argument("--source-public-id", required=True)
+
     def handle(self, *args, **options):
         _require_node_capability()
 
@@ -71,6 +80,14 @@ class Command(BaseCommand):
 
         if options["action"] == "status":
             self._handle_status(options)
+            return
+
+        if options["action"] == "activate":
+            self._handle_activate(options)
+            return
+
+        if options["action"] == "rollback":
+            self._handle_rollback(options)
             return
 
     def _handle_verify(self, options):
@@ -149,3 +166,49 @@ class Command(BaseCommand):
             self.stdout.write(f"Source: {row.source_public_id}")
             self.stdout.write(f"Version: {row.package_version}")
             self.stdout.write(f"State: {row.state}")
+
+    def _handle_activate(self, options):
+        from linuxlab.sync.models import InstalledPackage
+        from linuxlab.sync.services import PackageActivationError, activate_package
+
+        source_public_id = _parse_uuid(options["source_public_id"], what="--source-public-id")
+        package_version = _parse_version(options["package_version"], what="--package-version")
+
+        try:
+            package = InstalledPackage.objects.get(
+                package_type=options["package_type"],
+                source_public_id=source_public_id,
+                package_version=package_version,
+            )
+        except InstalledPackage.DoesNotExist as exc:
+            raise CommandError(
+                f"no installed artifact for {options['package_type']!r} / "
+                f"{source_public_id} / version {package_version}"
+            ) from exc
+
+        try:
+            activated = activate_package(package)
+        except PackageActivationError as exc:
+            raise CommandError(f"activation failed: {exc}") from exc
+
+        self.stdout.write("Operation: activate")
+        self.stdout.write(f"PackageType: {activated.package_type}")
+        self.stdout.write(f"Source: {activated.source_public_id}")
+        self.stdout.write(f"Version: {activated.package_version}")
+        self.stdout.write(f"State: {activated.state}")
+
+    def _handle_rollback(self, options):
+        from linuxlab.sync.services import PackageRollbackError, rollback_package
+
+        source_public_id = _parse_uuid(options["source_public_id"], what="--source-public-id")
+
+        try:
+            rolled_back = rollback_package(options["package_type"], source_public_id)
+        except PackageRollbackError as exc:
+            raise CommandError(f"rollback failed: {exc}") from exc
+
+        self.stdout.write("Operation: rollback")
+        self.stdout.write(f"PackageType: {rolled_back.package_type}")
+        self.stdout.write(f"Source: {rolled_back.source_public_id}")
+        self.stdout.write(f"Version: {rolled_back.package_version}")
+        self.stdout.write(f"State: {rolled_back.state}")

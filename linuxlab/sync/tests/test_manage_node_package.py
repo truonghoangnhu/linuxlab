@@ -98,6 +98,24 @@ def signed_package(tmp_path, monkeypatch):
     }
 
 
+@pytest.fixture
+def rollback_world(signed_package, tmp_path):
+    from linuxlab.activities.default_registry import build_default_activity_registry
+    from linuxlab.content.models import LearningPathPage
+    from linuxlab.publication.package import build_package
+    from linuxlab.publication.snapshots import publish_learning_path
+
+    page = LearningPathPage.objects.get(public_id=signed_package["source_public_id"])
+    registry = build_default_activity_registry()
+    snapshot_b = publish_learning_path(page, registry)
+    package_bytes_b = build_package(snapshot_b, registry, signed_package["private_key"])
+
+    package_path_b = tmp_path / "package-b.llpkg"
+    package_path_b.write_bytes(package_bytes_b)
+
+    return {**signed_package, "path_b": package_path_b, "version_b": snapshot_b.version}
+
+
 # --- verify -------------------------------------------------------------
 
 
@@ -772,3 +790,419 @@ def test_status_succeeds_with_no_trust_configuration_at_all(
 
     out = capsys.readouterr().out
     assert "State: staged" in out
+
+
+# --- activate -----------------------------------------------------------
+
+
+def test_activate_transitions_staged_package_to_active(settings, signed_package, capsys):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    capsys.readouterr()
+
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(signed_package["source_public_id"]),
+        "--package-version", str(signed_package["version"]),
+    )
+
+    out = capsys.readouterr().out
+    assert "Operation: activate" in out
+    assert "State: active" in out
+
+
+def test_activate_rejects_unknown_tuple(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", str(uuid.uuid4()),
+            "--package-version", "1",
+        )
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_activate_rejects_malformed_source_uuid(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", "not-a-uuid",
+            "--package-version", "1",
+        )
+    assert "not a valid UUID" in str(excinfo.value)
+
+
+def test_activate_rejects_malformed_version(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", str(signed_package["source_public_id"]),
+            "--package-version", "not-a-version",
+        )
+    assert "not a valid version number" in str(excinfo.value)
+
+
+def test_activate_rejects_wrong_profile_before_selector_validation(settings):
+    """Capability-first (corrective Section 17): a malformed UUID/version
+    combined with capability off must still surface only the capability
+    rejection, proving selector parsing never runs first."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", "not-a-uuid",
+            "--package-version", "not-a-version",
+        )
+
+    message = str(excinfo.value)
+    assert "not permitted on this deployment profile" in message
+    assert "not a valid UUID" not in message
+    assert "version" not in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_activate_fails_before_mutation_on_wrong_profile(settings, signed_package):
+    from linuxlab.sync.models import ACTIVE
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", str(signed_package["source_public_id"]),
+            "--package-version", str(signed_package["version"]),
+        )
+
+    assert not InstalledPackage.objects.filter(state=ACTIVE).exists()
+
+
+def test_activate_maintains_single_active_invariant(settings, signed_package):
+    from linuxlab.sync.models import ACTIVE
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(signed_package["source_public_id"]),
+        "--package-version", str(signed_package["version"]),
+    )
+
+    active_count = InstalledPackage.objects.filter(
+        package_type="learning_path",
+        source_public_id=signed_package["source_public_id"],
+        state=ACTIVE,
+    ).count()
+    assert active_count == 1
+
+
+def test_activate_selects_exact_version_when_multiple_versions_exist(
+    settings, tmp_path, monkeypatch, capsys
+):
+    """Load-bearing canonical-identity coverage (corrective Section 21):
+    two real installed versions of the same source; activating version 1
+    must activate exactly version 1, never version 2, and vice versa."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from linuxlab.activities.default_registry import build_default_activity_registry
+    from linuxlab.content.models import LearningPathPage
+    from linuxlab.publication.package import build_package
+    from linuxlab.publication.snapshots import publish_learning_path
+
+    from ._wagtail_bootstrap import get_or_create_root_page
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    root = get_or_create_root_page()
+    path = LearningPathPage(
+        title="Activate Two Versions", slug=f"activate-two-versions-{uuid.uuid4().hex[:8]}"
+    )
+    root.add_child(instance=path)
+
+    registry = build_default_activity_registry()
+    private_key = Ed25519PrivateKey.generate()
+
+    trust_path = tmp_path / "package-signing-public.key"
+    trust_path.write_bytes(
+        private_key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    )
+    monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", trust_path)
+
+    snapshot_v1 = publish_learning_path(path, registry)
+    package_v1_path = tmp_path / "package-v1.llpkg"
+    package_v1_path.write_bytes(build_package(snapshot_v1, registry, private_key))
+
+    live_path = LearningPathPage.objects.get(public_id=snapshot_v1.source_public_id)
+    snapshot_v2 = publish_learning_path(live_path, registry)
+    package_v2_path = tmp_path / "package-v2.llpkg"
+    package_v2_path.write_bytes(build_package(snapshot_v2, registry, private_key))
+
+    call_command("manage_node_package", "import", "--file", str(package_v1_path))
+    call_command("manage_node_package", "import", "--file", str(package_v2_path))
+    source_public_id = str(snapshot_v1.source_public_id)
+
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", source_public_id,
+        "--package-version", "1",
+    )
+    capsys.readouterr()
+
+    from linuxlab.sync.models import ACTIVE
+
+    active = InstalledPackage.objects.get(
+        package_type="learning_path", source_public_id=snapshot_v1.source_public_id, state=ACTIVE
+    )
+    assert active.package_version == 1
+
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", source_public_id,
+        "--package-version", "2",
+    )
+    out = capsys.readouterr().out
+    assert "Version: 2" in out
+    assert "State: active" in out
+
+    from linuxlab.sync.models import ARCHIVED
+
+    active = InstalledPackage.objects.get(
+        package_type="learning_path", source_public_id=snapshot_v1.source_public_id, state=ACTIVE
+    )
+    assert active.package_version == 2
+    # Service-owned previous_package semantics (Task 12): activating
+    # version 2 archives version 1 and records it as version 2's
+    # previous_package -- asserting the actual existing contract, not a
+    # guessed transition.
+    assert active.previous_package.package_version == 1
+    assert active.previous_package.state == ARCHIVED
+
+
+def test_activate_does_not_load_trust_anchor(settings, signed_package, monkeypatch):
+    """Trust separation (corrective Section 8/32): activate is a local
+    lifecycle operation on already-installed state, never a trust
+    operation."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+
+    def _raise_if_called():
+        raise AssertionError("activate must not load the trust anchor")
+
+    monkeypatch.setattr(
+        "linuxlab.sync.management.commands.manage_node_package.load_package_trusted_public_key",
+        _raise_if_called,
+    )
+
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(signed_package["source_public_id"]),
+        "--package-version", str(signed_package["version"]),
+    )
+
+
+# --- rollback -------------------------------------------------------------
+
+
+def test_rollback_reactivates_previous_package(settings, rollback_world, capsys):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    world = rollback_world
+
+    call_command("manage_node_package", "import", "--file", str(world["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version"]),
+    )
+    call_command("manage_node_package", "import", "--file", str(world["path_b"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version_b"]),
+    )
+    capsys.readouterr()
+
+    call_command(
+        "manage_node_package", "rollback",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+    )
+
+    out = capsys.readouterr().out
+    assert f"Version: {world['version']}" in out
+    assert "State: active" in out
+
+
+def test_rollback_fails_with_no_active_package(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "rollback",
+            "--package-type", "learning_path",
+            "--source-public-id", str(uuid.uuid4()),
+        )
+
+
+def test_rollback_fails_when_active_has_no_previous_package(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(signed_package["source_public_id"]),
+        "--package-version", str(signed_package["version"]),
+    )
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "rollback",
+            "--package-type", "learning_path",
+            "--source-public-id", str(signed_package["source_public_id"]),
+        )
+
+    assert (
+        InstalledPackage.objects.get(source_public_id=signed_package["source_public_id"]).state
+        == "active"
+    )
+
+
+def test_rollback_rejects_malformed_source_uuid(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "rollback",
+            "--package-type", "learning_path", "--source-public-id", "not-a-uuid",
+        )
+    assert "not a valid UUID" in str(excinfo.value)
+
+
+def test_rollback_rejects_wrong_profile_before_selector_validation(settings):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "rollback",
+            "--package-type", "learning_path", "--source-public-id", "not-a-uuid",
+        )
+
+    message = str(excinfo.value)
+    assert "not permitted on this deployment profile" in message
+    assert "not a valid UUID" not in message
+
+
+def test_rollback_fails_before_mutation_on_wrong_profile(settings, rollback_world):
+    from linuxlab.sync.models import ACTIVE
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    world = rollback_world
+    call_command("manage_node_package", "import", "--file", str(world["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version"]),
+    )
+    call_command("manage_node_package", "import", "--file", str(world["path_b"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version_b"]),
+    )
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = False
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "rollback",
+            "--package-type", "learning_path",
+            "--source-public-id", str(world["source_public_id"]),
+        )
+
+    active = InstalledPackage.objects.get(
+        package_type="learning_path", source_public_id=world["source_public_id"], state=ACTIVE
+    )
+    assert active.package_version == world["version_b"]
+
+
+def test_rollback_maintains_single_active_invariant(settings, rollback_world):
+    from linuxlab.sync.models import ACTIVE
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    world = rollback_world
+    call_command("manage_node_package", "import", "--file", str(world["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version"]),
+    )
+    call_command("manage_node_package", "import", "--file", str(world["path_b"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version_b"]),
+    )
+    call_command(
+        "manage_node_package", "rollback",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+    )
+
+    active_count = InstalledPackage.objects.filter(
+        package_type="learning_path",
+        source_public_id=world["source_public_id"],
+        state=ACTIVE,
+    ).count()
+    assert active_count == 1
+
+
+def test_rollback_does_not_load_trust_anchor(settings, rollback_world, monkeypatch):
+    """Trust separation (corrective Section 8/32): rollback acts purely on
+    already-installed lifecycle state."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    world = rollback_world
+    call_command("manage_node_package", "import", "--file", str(world["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version"]),
+    )
+    call_command("manage_node_package", "import", "--file", str(world["path_b"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version_b"]),
+    )
+
+    def _raise_if_called():
+        raise AssertionError("rollback must not load the trust anchor")
+
+    monkeypatch.setattr(
+        "linuxlab.sync.management.commands.manage_node_package.load_package_trusted_public_key",
+        _raise_if_called,
+    )
+
+    call_command(
+        "manage_node_package", "rollback",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+    )
