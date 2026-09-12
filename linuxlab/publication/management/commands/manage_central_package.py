@@ -8,7 +8,7 @@ from django.core.management.base import BaseCommand, CommandError
 from linuxlab.activities.default_registry import build_default_activity_registry
 from linuxlab.content.models import LearningPathPage
 from linuxlab.publication.models import PublicationSnapshot
-from linuxlab.publication.package import build_package
+from linuxlab.publication.package import PackageBuildError, build_package
 from linuxlab.publication.signing import (
     PackageSigningConfigurationError,
     load_package_signing_private_key,
@@ -43,7 +43,8 @@ def _parse_version(raw):
 def _write_new_file_atomically(destination, data: bytes) -> None:
     """Publish `data` at `destination` without ever overwriting an
     existing file there, and without ever leaving a partial final file
-    or a leaked temp file on any failure path.
+    or a leaked temp file on any failure path this invocation is
+    actually responsible for.
 
     Strategy: write the full bytes to a temp file in the SAME directory
     as `destination` (so the later link is a same-filesystem, atomic
@@ -51,35 +52,67 @@ def _write_new_file_atomically(destination, data: bytes) -> None:
     final path. `os.link()` raises FileExistsError atomically if the
     destination already exists (unlike `os.replace()`, which silently
     overwrites) -- this closes the TOCTOU race an `if not path.exists()`
-    check followed by a separate write/rename would leave open. The temp
-    file is always removed in `finally`, whether the link succeeded or
-    not, so no leaked temp artifact remains on any exit path.
+    check followed by a separate write/rename would leave open.
 
-    Every expected filesystem OSError anywhere in this open/write/flush/
-    fsync/link lifecycle -- not only the destination-collision case --
-    is translated into a sanitized CommandError; only the destination
-    already existing gets its own specific message.
+    Ownership: this invocation may only unlink temp_path once it has
+    itself successfully created that exact entry via exclusive (O_EXCL)
+    creation. If that creation fails -- including because a same-named
+    entry already exists and belongs to someone else -- this invocation
+    never owned it and must not touch it. Cleanup afterwards is
+    best-effort and must never replace/mask an already-established
+    primary failure; a cleanup-only failure (nothing else went wrong) is
+    still surfaced explicitly rather than silently ignored.
     """
     parent = destination.parent
     temp_path = parent / f".{destination.name}.tmp-{os.getpid()}-{id(data)}"
 
     try:
         fd = os.open(str(temp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-
-            os.link(str(temp_path), str(destination))
-        except FileExistsError as exc:
-            raise CommandError(f"output already exists: {destination}") from exc
     except OSError as exc:
+        # temp_path was never created by this invocation: it is not ours
+        # to remove, whether it failed because it already existed or for
+        # any other reason (e.g. a non-directory parent).
         raise CommandError(
             f"failed to write package output at {destination}: {exc.strerror}"
         ) from exc
-    finally:
-        temp_path.unlink(missing_ok=True)
+
+    primary_error = None
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.link(str(temp_path), str(destination))
+    except FileExistsError as exc:
+        primary_error = CommandError(f"output already exists: {destination}")
+        primary_error.__cause__ = exc
+    except OSError as exc:
+        primary_error = CommandError(
+            f"failed to write package output at {destination}: {exc.strerror}"
+        )
+        primary_error.__cause__ = exc
+
+    # This invocation successfully created temp_path above, so it -- and
+    # only it -- is responsible for removing it.
+    try:
+        temp_path.unlink()
+    except OSError as cleanup_exc:
+        if primary_error is None:
+            # Nothing else failed: the output was written and linked
+            # successfully, so a cleanup-only failure here is a distinct,
+            # expected filesystem problem worth surfacing on its own
+            # rather than silently treating overall cleanup as having
+            # succeeded.
+            raise CommandError(
+                f"package output written at {destination} but failed to "
+                f"remove temporary file {temp_path}: {cleanup_exc.strerror}"
+            ) from cleanup_exc
+        # A primary failure already occurred; best-effort cleanup of our
+        # own owned temp file must not replace/mask it.
+
+    if primary_error is not None:
+        raise primary_error
 
 
 class Command(BaseCommand):
@@ -159,7 +192,10 @@ class Command(BaseCommand):
             raise CommandError(f"signing configuration unavailable: {exc}") from exc
 
         registry = build_default_activity_registry()
-        package_bytes = build_package(snapshot, registry, private_key)
+        try:
+            package_bytes = build_package(snapshot, registry, private_key)
+        except PackageBuildError as exc:
+            raise CommandError(f"package build rejected: {exc}") from exc
 
         _write_new_file_atomically(output_path, package_bytes)
 

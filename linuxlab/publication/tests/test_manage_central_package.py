@@ -1,9 +1,17 @@
 import uuid
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from linuxlab.activities.default_registry import build_default_activity_registry
+from linuxlab.activities.models import ActivityDefinition, ActivityVersion
+from linuxlab.activities.services import create_activity_version, publish_activity_version
+from linuxlab.assessment.default_registry import build_default_question_registry
+from linuxlab.assessment.models import Question
+from linuxlab.assessment.services import create_question_version, publish_question_version
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.models import PublicationSnapshot
 
@@ -177,6 +185,33 @@ def test_write_new_file_atomically_leaves_no_temp_file_on_existing_destination(t
     assert remaining == [destination]
 
 
+def test_write_new_file_atomically_never_deletes_unowned_preexisting_temp_entry(tmp_path):
+    """Independent-review diagnostic (I2): if a pre-existing filesystem
+    entry already occupies the exact temp pathname this invocation would
+    use, O_EXCL creation fails and this invocation never acquired
+    ownership of that entry. Cleanup must not delete a temp entry it does
+    not own."""
+    import os as os_module
+
+    from linuxlab.publication.management.commands.manage_central_package import (
+        _write_new_file_atomically,
+    )
+
+    destination = tmp_path / "out.llpkg"
+    data = b"our-bytes-payload"
+    preexisting_temp_path = (
+        tmp_path / f".{destination.name}.tmp-{os_module.getpid()}-{id(data)}"
+    )
+    preexisting_temp_path.write_bytes(b"UNOWNED_TEMP_SENTINEL")
+
+    with pytest.raises(CommandError):
+        _write_new_file_atomically(destination, data)
+
+    assert preexisting_temp_path.exists()
+    assert preexisting_temp_path.read_bytes() == b"UNOWNED_TEMP_SENTINEL"
+    assert not destination.exists()
+
+
 def test_write_new_file_atomically_fails_closed_on_race_after_temp_write(tmp_path, monkeypatch):
     """Proves the FINAL authority is the atomic os.link() call itself, not
     any pre-check: a competing file is created concurrently, AFTER our temp
@@ -285,6 +320,60 @@ def test_write_new_file_atomically_translates_link_failure_other_than_eexist(tmp
     assert "TEST_LINK_FAILURE" not in str(excinfo.value)
     assert not destination.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_write_new_file_atomically_primary_failure_survives_cleanup_failure(tmp_path, monkeypatch):
+    """M1: when the primary filesystem operation fails AND best-effort
+    cleanup of our own owned temp file also fails, the externally visible
+    failure must be the PRIMARY translated CommandError, never the
+    cleanup OSError."""
+    import os as os_module
+    from pathlib import Path as PathType
+
+    from linuxlab.publication.management.commands.manage_central_package import (
+        _write_new_file_atomically,
+    )
+
+    destination = tmp_path / "out.llpkg"
+
+    def _raise_primary_link_failure(*args, **kwargs):
+        raise OSError("PRIMARY_OPERATION_FAILURE")
+
+    def _raise_cleanup_failure(self, *args, **kwargs):
+        raise OSError("CLEANUP_FAILURE")
+
+    monkeypatch.setattr(os_module, "link", _raise_primary_link_failure)
+    monkeypatch.setattr(PathType, "unlink", _raise_cleanup_failure)
+
+    with pytest.raises(CommandError) as excinfo:
+        _write_new_file_atomically(destination, b"our-bytes")
+
+    message = str(excinfo.value)
+    assert message.startswith("failed to write package output at")
+    assert "CLEANUP_FAILURE" not in message
+    assert str(excinfo.value.__cause__) == "PRIMARY_OPERATION_FAILURE"
+    assert not destination.exists()
+
+
+def test_write_new_file_atomically_sanitizes_error_when_parent_is_not_a_directory(tmp_path):
+    """Section 11 concrete regression: destination.parent is itself a
+    regular file, so os.open() on the temp path fails with
+    NotADirectoryError before this invocation ever owns a temp entry.
+    Previously, `finally: temp_path.unlink(missing_ok=True)` re-attempted
+    the same doomed filesystem operation and its raw OSError silently
+    replaced the intended sanitized CommandError."""
+    from linuxlab.publication.management.commands.manage_central_package import (
+        _write_new_file_atomically,
+    )
+
+    not_a_directory = tmp_path / "not-a-directory"
+    not_a_directory.write_bytes(b"i-am-a-file-not-a-directory")
+    destination = not_a_directory / "out.llpkg"
+
+    with pytest.raises(CommandError) as excinfo:
+        _write_new_file_atomically(destination, b"our-bytes")
+
+    assert "Traceback" not in str(excinfo.value)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -536,3 +625,150 @@ def test_build_rejects_invalid_output_parent(settings, tmp_path):
             "--learning-path", str(path.public_id), "--version", "1",
             "--output", str(tmp_path / "does-not-exist" / "out.llpkg"),
         )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_translates_real_packagebuilderror_to_commanderror(settings, tmp_path, monkeypatch):
+    # Real, already-existing domain rejection (linuxlab/publication/
+    # package.py::_resolve_activities): an ActivityVersion referenced by an
+    # already-published LearningPath that is deleted afterwards raises
+    # PackageBuildError from inside build_package() itself. This is not a
+    # new CLI-invented failure mode -- it is the same rejection
+    # linuxlab/publication/tests/test_package.py::
+    # test_deleted_activity_version_after_publication_blocks_packaging
+    # already exercises directly against build_package().
+    settings.LINUXLAB_CAN_AUTHOR = True
+
+    question_registry = build_default_question_registry()
+    question = Question.objects.create(name="Shell basics Q1")
+    question_version = create_question_version(
+        question,
+        type_key="single_choice",
+        content={
+            "prompt": "Which command lists files?",
+            "options": [{"id": "a", "text": "ls"}, {"id": "b", "text": "rm"}],
+        },
+        answer_key={"correct_option_id": "a"},
+        scoring={"max_score": 1},
+    )
+    published_question = publish_question_version(question_version, question_registry)
+
+    definition = ActivityDefinition.objects.create(name="Shell quiz", type_key="assessment")
+    activity_version = create_activity_version(
+        definition,
+        config={
+            "questions": [
+                {
+                    "question_public_id": str(published_question.question.public_id),
+                    "question_version": published_question.version,
+                }
+            ]
+        },
+    )
+    activity_registry = build_default_activity_registry()
+    published_activity = publish_activity_version(activity_version, activity_registry)
+
+    path = _make_learning_path(title="Quiz Path")
+    module = ModulePage(title="Shell Basics")
+    path.add_child(instance=module)
+    lesson = LessonPage(title="The ls command")
+    lesson.body = [
+        (
+            "activity",
+            {
+                "activity_public_id": str(definition.public_id),
+                "activity_version": published_activity.version,
+            },
+        )
+    ]
+    module.add_child(instance=lesson)
+
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+
+    ActivityVersion.objects.filter(pk=published_activity.pk).delete()
+
+    private_key = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "package-signing.key"
+    key_path.write_bytes(
+        private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    monkeypatch.setattr("linuxlab.publication.signing._SIGNING_KEY_PATH", key_path)
+
+    output_path = tmp_path / "out.llpkg"
+    snapshot_count_before = PublicationSnapshot.objects.count()
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id),
+            "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert "Traceback" not in str(excinfo.value)
+    assert not output_path.exists()
+    assert PublicationSnapshot.objects.count() == snapshot_count_before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_rejects_existing_unpublished_learning_path(settings, tmp_path):
+    # M2.A: a real, existing LearningPathPage that was never published
+    # (as opposed to a source_public_id with no matching page at all)
+    # must still fail closed, and must not create a PublicationSnapshot
+    # as a side effect of the failed build attempt.
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path(title="Never Published")
+    output_path = tmp_path / "out.llpkg"
+    snapshot_count_before = PublicationSnapshot.objects.count()
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_central_package", "build",
+            "--learning-path", str(path.public_id),
+            "--version", "1",
+            "--output", str(output_path),
+        )
+
+    assert str(path.public_id) in str(excinfo.value)
+    assert not output_path.exists()
+    assert PublicationSnapshot.objects.count() == snapshot_count_before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_selects_older_exact_version_when_newer_also_exists(
+    settings, tmp_path, monkeypatch
+):
+    # M2.B: versions 1 and 2 both exist; requesting version 1 explicitly
+    # must build exactly version 1, proving exact-version selection works
+    # in both directions (test_build_rejects_nonexistent_version_does_not_
+    # select_a_different_one above already covers the other direction:
+    # requesting a version that does not exist must never fall back to
+    # one that does).
+    from linuxlab.publication.package import verify_package
+
+    settings.LINUXLAB_CAN_AUTHOR = True
+    path = _make_learning_path()
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+    call_command("manage_central_package", "publish", "--learning-path", str(path.public_id))
+    assert PublicationSnapshot.objects.filter(source_public_id=path.public_id).count() == 2
+
+    private_key = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "package-signing.key"
+    key_path.write_bytes(
+        private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    monkeypatch.setattr("linuxlab.publication.signing._SIGNING_KEY_PATH", key_path)
+
+    output_path = tmp_path / "out.llpkg"
+    call_command(
+        "manage_central_package", "build",
+        "--learning-path", str(path.public_id),
+        "--version", "1",
+        "--output", str(output_path),
+    )
+
+    verified = verify_package(
+        output_path.read_bytes(), build_default_activity_registry(), private_key.public_key()
+    )
+    assert str(verified.manifest.package_uuid) == str(path.public_id)
+    assert verified.manifest.package_version == 1
