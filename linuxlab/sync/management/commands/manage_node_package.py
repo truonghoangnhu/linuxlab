@@ -189,7 +189,20 @@ class Command(BaseCommand):
         try:
             activated = activate_package(package)
         except PackageActivationError as exc:
-            raise CommandError(f"activation failed: {exc}") from exc
+            # Never forward str(exc) verbatim: at least one real
+            # activate_package() rejection embeds the local
+            # InstalledPackage database primary key
+            # ("InstalledPackage {pk} has no staged publication
+            # artifact..."), which must never cross the operator
+            # boundary. Build a new operator-safe message from only the
+            # canonical identity this command already trusts (the
+            # selectors the operator supplied), not from the package row
+            # or the internal exception text.
+            raise CommandError(
+                f"activation failed for PackageType={options['package_type']!r} "
+                f"Source={source_public_id} Version={package_version}: "
+                "package is not eligible for activation"
+            ) from exc
 
         self.stdout.write("Operation: activate")
         self.stdout.write(f"PackageType: {activated.package_type}")

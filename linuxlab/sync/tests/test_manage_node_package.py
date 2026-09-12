@@ -808,8 +808,13 @@ def test_activate_transitions_staged_package_to_active(settings, signed_package,
     )
 
     out = capsys.readouterr().out
-    assert "Operation: activate" in out
-    assert "State: active" in out
+    assert out == (
+        "Operation: activate\n"
+        "PackageType: learning_path\n"
+        f"Source: {signed_package['source_public_id']}\n"
+        f"Version: {signed_package['version']}\n"
+        "State: active\n"
+    )
 
 
 def test_activate_rejects_unknown_tuple(settings):
@@ -822,6 +827,103 @@ def test_activate_rejects_unknown_tuple(settings):
             "--package-version", "1",
         )
     assert InstalledPackage.objects.count() == 0
+
+
+def test_activate_rejects_incomplete_package_without_leaking_local_pk(settings):
+    """Independent review Important I1: a real service rejection
+    (_require_complete_inventory) includes the local InstalledPackage
+    primary key in its internal message
+    ("InstalledPackage {package.pk} has no staged publication artifact;
+    ..."). The operator-facing CommandError raised by the real `activate`
+    command must never forward that internal identity verbatim -- only
+    the canonical (package_type, source_public_id, package_version)
+    tuple the operator already supplied may appear."""
+    import uuid as uuid_module
+    from datetime import UTC, datetime
+
+    from linuxlab.sync.models import STAGED
+    from linuxlab.sync.services import _insert_trusted
+
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    source_public_id = uuid_module.uuid4()
+    package = _insert_trusted(
+        InstalledPackage,
+        package_type="learning_path",
+        source_public_id=source_public_id,
+        package_version=1,
+        payload_sha256="0" * 64,
+        schema_version=1,
+        minimum_linuxlab_version="0.1.0",
+        signature_algorithm="ed25519",
+        manifest_created_at=datetime.now(UTC),
+        state=STAGED,
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", str(source_public_id),
+            "--package-version", "1",
+        )
+
+    message = str(excinfo.value)
+    # The known pre-fix unsafe phrase, reproduced exactly as the real
+    # service raises it -- not a generic digit-scrub check (a UUID or
+    # version number could coincidentally contain the same digits).
+    assert f"InstalledPackage {package.pk}" not in message
+    assert "publication artifact" not in message
+
+    from linuxlab.sync.services import PackageActivationError
+
+    assert isinstance(excinfo.value.__cause__, PackageActivationError)
+
+    package.refresh_from_db()
+    assert package.state == STAGED
+
+
+def test_activate_rejects_reactivating_archived_package_without_leaking_internals(
+    settings, rollback_world
+):
+    """Section 9 coverage: a DIFFERENT real activate_package() rejection
+    site (state != STAGED, no PK in its own message) must flow through
+    the same safe operator boundary as the PK-bearing one above -- no
+    PackageActivationError text of any kind reaches operator output."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    world = rollback_world
+
+    call_command("manage_node_package", "import", "--file", str(world["path"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version"]),
+    )
+    call_command("manage_node_package", "import", "--file", str(world["path_b"]))
+    call_command(
+        "manage_node_package", "activate",
+        "--package-type", "learning_path",
+        "--source-public-id", str(world["source_public_id"]),
+        "--package-version", str(world["version_b"]),
+    )
+    # v1 is now ARCHIVED; only rollback_package() may reactivate it.
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "manage_node_package", "activate",
+            "--package-type", "learning_path",
+            "--source-public-id", str(world["source_public_id"]),
+            "--package-version", str(world["version"]),
+        )
+
+    message = str(excinfo.value)
+    assert "archived package can only be reactivated" not in message
+    assert "package is not eligible for activation" in message
+
+    from linuxlab.sync.services import PackageActivationError
+
+    assert isinstance(excinfo.value.__cause__, PackageActivationError)
 
 
 def test_activate_rejects_malformed_source_uuid(settings):
@@ -1019,6 +1121,13 @@ def test_activate_does_not_load_trust_anchor(settings, signed_package, monkeypat
 
 
 def test_rollback_reactivates_previous_package(settings, rollback_world, capsys):
+    """M1 (independent review): the successful rollback command must
+    prove -- via real re-queried DB state, not just stdout substrings --
+    that v1 is restored to ACTIVE, v2 is ARCHIVED, exactly one ACTIVE row
+    remains for the source scope, and stdout is the exact deterministic
+    operator block."""
+    from linuxlab.sync.models import ACTIVE, ARCHIVED
+
     settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
     world = rollback_world
 
@@ -1045,8 +1154,33 @@ def test_rollback_reactivates_previous_package(settings, rollback_world, capsys)
     )
 
     out = capsys.readouterr().out
-    assert f"Version: {world['version']}" in out
-    assert "State: active" in out
+    assert out == (
+        "Operation: rollback\n"
+        "PackageType: learning_path\n"
+        f"Source: {world['source_public_id']}\n"
+        f"Version: {world['version']}\n"
+        "State: active\n"
+    )
+
+    v1 = InstalledPackage.objects.get(
+        package_type="learning_path",
+        source_public_id=world["source_public_id"],
+        package_version=world["version"],
+    )
+    v2 = InstalledPackage.objects.get(
+        package_type="learning_path",
+        source_public_id=world["source_public_id"],
+        package_version=world["version_b"],
+    )
+    assert v1.state == ACTIVE
+    assert v2.state == ARCHIVED
+
+    active_count = InstalledPackage.objects.filter(
+        package_type="learning_path",
+        source_public_id=world["source_public_id"],
+        state=ACTIVE,
+    ).count()
+    assert active_count == 1
 
 
 def test_rollback_fails_with_no_active_package(settings):
