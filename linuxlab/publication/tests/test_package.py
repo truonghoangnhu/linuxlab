@@ -10,6 +10,7 @@ keypair, build and verify every package here."""
 
 import dataclasses
 import json
+import struct
 import uuid
 import zipfile
 from datetime import datetime
@@ -499,6 +500,53 @@ def test_one_byte_modification_to_payload_is_rejected(snapshot, keypair):
 
     with pytest.raises(PackageVerificationError):
         verify_package(tampered, registry, public_key)
+
+
+# --- Important (independent review, Task 4 fix-round-1): malformed --------
+# --- DEFLATE-compressed member data must not raise raw zlib.error --------
+
+
+def _corrupt_deflate_member(package_bytes, member_name):
+    """Corrupt a member's ON-DISK DEFLATE-compressed bytes in place,
+    leaving the surrounding ZIP container structure (local header,
+    filename/extra field lengths, compressed size) untouched -- so
+    zipfile still recognizes the archive as well-formed, but decompressing
+    this one member's data raises a genuine zlib.error, not a
+    zipfile.BadZipFile. `_rewrite_member` (above) cannot reproduce this:
+    rebuilding the archive with `writestr()` would either re-compress
+    whatever bytes are given (producing valid DEFLATE of garbage content)
+    or store them raw -- never inject an invalid DEFLATE byte stream under
+    compression method 8, which is what a real corrupted/malicious archive
+    looks like."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_DEFLATED
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", package_bytes, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+
+    corrupted = bytearray(package_bytes)
+    # 0xFF's leading bits (BFINAL=1, BTYPE=11) are a reserved/invalid
+    # DEFLATE block type, so inflate must fail on the very first block
+    # header -- a deterministic, real zlib.error, not a probabilistic one.
+    corrupted[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+    return bytes(corrupted)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_malformed_deflate_member_is_rejected_as_packageverificationerror(snapshot, keypair):
+    private_key, public_key = keypair
+    registry = _fake_registry()
+    package_bytes = build_package(snapshot, registry, private_key)
+
+    corrupted = _corrupt_deflate_member(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageVerificationError) as excinfo:
+        verify_package(corrupted, registry, public_key)
+
+    assert "zlib" not in str(excinfo.value).lower()
 
 
 # --- Critical: unsaved / mutated / hash-corrupt source --------------------

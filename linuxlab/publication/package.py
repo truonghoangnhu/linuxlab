@@ -72,6 +72,7 @@ equivalent to a verified one.
 import json
 import uuid
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -457,7 +458,13 @@ def _read_exact_members(archive):
 
     try:
         return {name: archive.read(name) for name in _REQUIRED_MEMBERS}
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, zlib.error) as exc:
+        # archive.read() decompresses each member; a structurally
+        # well-formed ZIP container can still hold an invalid DEFLATE
+        # byte stream for one member, which raises zlib.error directly
+        # from the decompressor rather than zipfile.BadZipFile. Both are
+        # the same trust boundary here: malformed compressed package
+        # content, normalized to one domain rejection.
         raise PackageVerificationError("corrupt archive member") from exc
 
 

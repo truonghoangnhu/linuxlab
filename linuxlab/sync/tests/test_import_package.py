@@ -5,6 +5,7 @@ constructed VerifiedPackage must never reach the database through the
 public API)."""
 
 import json
+import struct
 import zipfile
 from hashlib import sha256
 from io import BytesIO
@@ -128,6 +129,43 @@ def test_malformed_bytes_create_no_rows(quiz_world, keypair):
     with pytest.raises(PackageImportError):
         import_package(b"not a package at all", quiz_world["activity_registry"], public_key)
 
+    _assert_no_installed_rows()
+
+
+def _corrupt_deflate_member(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _corrupt_deflate_member (independent review, Task 4 fix-round-1):
+    overwrite a member's ON-DISK DEFLATE-compressed bytes in place, so the
+    ZIP container stays structurally valid but decompressing this member
+    raises a real zlib.error, not a zipfile.BadZipFile."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_DEFLATED
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", package_bytes, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+
+    corrupted = bytearray(package_bytes)
+    corrupted[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+    return bytes(corrupted)
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_malformed_deflate_member_creates_no_rows(quiz_world, keypair):
+    """Verifier normalization (Task 4 fix-round-1, Important I1): a
+    well-formed ZIP container holding an invalid DEFLATE byte stream for
+    one member must surface through the exact same PackageImportError
+    boundary as any other malformed package, not a raw zlib.error."""
+    private_key, public_key = keypair
+    package_bytes = _package_bytes(quiz_world, private_key)
+    corrupted = _corrupt_deflate_member(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageImportError) as excinfo:
+        import_package(corrupted, quiz_world["activity_registry"], public_key)
+
+    assert "zlib" not in str(excinfo.value).lower()
     _assert_no_installed_rows()
 
 

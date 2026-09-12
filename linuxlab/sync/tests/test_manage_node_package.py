@@ -1,3 +1,4 @@
+import struct
 import uuid
 import zipfile
 from io import BytesIO
@@ -31,6 +32,29 @@ def _tamper_package_payload(package_bytes):
         for name, data in members.items():
             archive.writestr(name, data)
     return buffer.getvalue()
+
+
+def _corrupt_deflate_member(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _corrupt_deflate_member and linuxlab/sync/tests/test_import_package.py
+    ::_corrupt_deflate_member (independent review, Task 4 fix-round-1,
+    Important I1): overwrite a member's ON-DISK DEFLATE-compressed bytes
+    in place, so the ZIP container stays structurally valid but
+    decompressing this member raises a real zlib.error, not a
+    zipfile.BadZipFile -- exercising the exact verifier-boundary
+    normalization this fix-round adds, through the real command."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_DEFLATED
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", package_bytes, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+
+    corrupted = bytearray(package_bytes)
+    corrupted[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+    return bytes(corrupted)
 
 
 @pytest.fixture
@@ -83,8 +107,12 @@ def test_verify_succeeds_on_valid_package(settings, signed_package, capsys):
     call_command("manage_node_package", "verify", "--file", str(signed_package["path"]))
 
     out = capsys.readouterr().out
-    assert "Operation: verify" in out
-    assert f"Source: {signed_package['source_public_id']}" in out
+    assert out == (
+        "Operation: verify\n"
+        "PackageType: learning_path\n"
+        f"Source: {signed_package['source_public_id']}\n"
+        f"Version: {signed_package['version']}\n"
+    )
 
 
 def test_verify_causes_zero_installed_package_mutation(settings, signed_package):
@@ -105,9 +133,16 @@ def test_verify_rejects_wrong_key(settings, signed_package, tmp_path, monkeypatc
     )
     monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", wrong_trust_path)
 
-    with pytest.raises(CommandError):
+    with pytest.raises(CommandError) as excinfo:
         call_command("manage_node_package", "verify", "--file", str(signed_package["path"]))
 
+    # A syntactically valid but non-matching trust key is a signature
+    # verification failure, NOT a trust-configuration error (Amendment C
+    # acceptance / spec Section 5a) -- pin the stable command-level
+    # category, not the underlying crypto library's exact wording.
+    message = str(excinfo.value)
+    assert "package verification failed" in message
+    assert "trust anchor" not in message
     assert InstalledPackage.objects.count() == 0
 
 
@@ -116,8 +151,53 @@ def test_verify_rejects_tampered_package(settings, signed_package):
     tampered_path = signed_package["path"].with_name("tampered.llpkg")
     tampered_path.write_bytes(_tamper_package_payload(signed_package["bytes"]))
 
-    with pytest.raises(CommandError):
+    with pytest.raises(CommandError) as excinfo:
         call_command("manage_node_package", "verify", "--file", str(tampered_path))
+
+    message = str(excinfo.value)
+    assert "package verification failed" in message
+    assert "trust anchor" not in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_malformed_deflate_member(settings, signed_package):
+    """Independent review Important I1: a malformed compressed package
+    member must surface as a normal package-verification CommandError,
+    never a raw zlib.error, through the real (unmocked) verify_package()."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupted.llpkg")
+    corrupted_path.write_bytes(_corrupt_deflate_member(signed_package["bytes"], PAYLOAD_MEMBER))
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "verify", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "zlib" not in message.lower()
+    assert "package verification failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_missing_package_file(settings, signed_package, tmp_path):
+    """M1: file-read boundary after a successful trust load."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "verify", "--file", str(tmp_path / "does-not-exist.llpkg")
+        )
+
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_directory_as_package_file(settings, signed_package, tmp_path):
+    """M1: file-read boundary after a successful trust load, for a path
+    that exists but is not a regular file."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    a_directory = tmp_path / "a-directory"
+    a_directory.mkdir()
+
+    with pytest.raises(CommandError):
+        call_command("manage_node_package", "verify", "--file", str(a_directory))
 
     assert InstalledPackage.objects.count() == 0
 
@@ -182,6 +262,41 @@ def test_verify_rejects_wrong_profile_with_nonexistent_file_and_gives_capability
     assert trust_called == []
 
 
+def test_verify_leaves_preexisting_installed_package_inventory_unchanged(
+    settings, signed_package
+):
+    """M1: verify's read-only guarantee proven against a NON-empty
+    inventory, not merely an empty database. A package is staged first
+    (a real InstalledPackage row now exists); verify is then run again on
+    the same valid package, and the existing row's identity/state/pk must
+    be completely unaffected -- verify must never create, restage, or
+    otherwise touch it."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
+    installed_before = InstalledPackage.objects.get()
+    identity_before = (
+        installed_before.pk,
+        installed_before.package_type,
+        installed_before.source_public_id,
+        installed_before.package_version,
+        installed_before.state,
+    )
+
+    call_command("manage_node_package", "verify", "--file", str(signed_package["path"]))
+
+    assert InstalledPackage.objects.count() == 1
+    installed_after = InstalledPackage.objects.get()
+    identity_after = (
+        installed_after.pk,
+        installed_after.package_type,
+        installed_after.source_public_id,
+        installed_after.package_version,
+        installed_after.state,
+    )
+    assert identity_after == identity_before
+
+
 def test_verify_trust_failure_precedes_missing_file_error(settings, tmp_path, monkeypatch):
     """Ordering (spec Section 5a / Amendment C, plan Task 4): trust-anchor
     loading happens strictly before the package file is read, so an
@@ -212,10 +327,13 @@ def test_import_stages_package_and_reports_canonical_identity(settings, signed_p
     call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
 
     out = capsys.readouterr().out
-    assert "Operation: import" in out
-    assert f"Source: {signed_package['source_public_id']}" in out
-    assert f"Version: {signed_package['version']}" in out
-    assert "State: staged" in out
+    assert out == (
+        "Operation: import\n"
+        "PackageType: learning_path\n"
+        f"Source: {signed_package['source_public_id']}\n"
+        f"Version: {signed_package['version']}\n"
+        "State: staged\n"
+    )
 
 
 def test_import_rejects_wrong_key_with_zero_mutation(
@@ -232,9 +350,15 @@ def test_import_rejects_wrong_key_with_zero_mutation(
     )
     monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", wrong_trust_path)
 
-    with pytest.raises(CommandError):
+    with pytest.raises(CommandError) as excinfo:
         call_command("manage_node_package", "import", "--file", str(signed_package["path"]))
 
+    # Same distinction as verify: a syntactically valid but non-matching
+    # trust key fails as an import/verification rejection, not a
+    # trust-configuration error.
+    message = str(excinfo.value)
+    assert "package import failed" in message
+    assert "trust anchor" not in message
     assert InstalledPackage.objects.count() == 0
 
 
@@ -257,8 +381,55 @@ def test_import_rejects_tampered_package_with_zero_mutation(settings, signed_pac
     tampered_path = signed_package["path"].with_name("tampered.llpkg")
     tampered_path.write_bytes(_tamper_package_payload(signed_package["bytes"]))
 
-    with pytest.raises(CommandError):
+    with pytest.raises(CommandError) as excinfo:
         call_command("manage_node_package", "import", "--file", str(tampered_path))
+
+    message = str(excinfo.value)
+    assert "package import failed" in message
+    assert "trust anchor" not in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_malformed_deflate_member_with_zero_mutation(settings, signed_package):
+    """Independent review Important I1, at the command layer: malformed
+    compressed package content must flow
+    verify_package -> PackageVerificationError -> import_package ->
+    PackageImportError -> CommandError, never a raw zlib.error, and must
+    never persist a partial/any InstalledPackage row."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupted.llpkg")
+    corrupted_path.write_bytes(_corrupt_deflate_member(signed_package["bytes"], PAYLOAD_MEMBER))
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "import", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "zlib" not in message.lower()
+    assert "package import failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_missing_package_file(settings, signed_package, tmp_path):
+    """M1: file-read boundary after a successful trust load, on the
+    import subcommand too (verify and import each read the file
+    independently -- neither shares a cached result)."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+
+    with pytest.raises(CommandError):
+        call_command(
+            "manage_node_package", "import", "--file", str(tmp_path / "does-not-exist.llpkg")
+        )
+
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_directory_as_package_file(settings, signed_package, tmp_path):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    a_directory = tmp_path / "a-directory"
+    a_directory.mkdir()
+
+    with pytest.raises(CommandError):
+        call_command("manage_node_package", "import", "--file", str(a_directory))
 
     assert InstalledPackage.objects.count() == 0
 
