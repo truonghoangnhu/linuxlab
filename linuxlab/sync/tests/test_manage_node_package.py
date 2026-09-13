@@ -57,6 +57,93 @@ def _corrupt_deflate_member(package_bytes, member_name):
     return bytes(corrupted)
 
 
+def _find_central_directory_offset(data, cd_start, member_name):
+    name_bytes = member_name.encode()
+    search_from = cd_start
+    while True:
+        cd_offset = data.find(b"PK\x01\x02", search_from)
+        if cd_offset == -1:
+            raise AssertionError(f"central directory record for {member_name!r} not found")
+        fn_len = struct.unpack_from("<H", data, cd_offset + 28)[0]
+        candidate_name = bytes(data[cd_offset + 46 : cd_offset + 46 + fn_len])
+        if candidate_name == name_bytes:
+            return cd_offset
+        search_from = cd_offset + 4
+
+
+def _rewrite_member_with_encrypted_flag(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _rewrite_member_with_encrypted_flag (Corrective A final review
+    FA-I1): mark a real member as encrypted via the real ZIP
+    general-purpose bit flag, in both the local file header and the
+    central directory record."""
+    encrypted_flag_bit = 1 << 0
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+        cd_start = archive.start_dir
+
+    data = bytearray(package_bytes)
+
+    local_flag_offset = info.header_offset + 6
+    local_flags = struct.unpack_from("<H", data, local_flag_offset)[0]
+    struct.pack_into("<H", data, local_flag_offset, local_flags | encrypted_flag_bit)
+
+    cd_offset = _find_central_directory_offset(data, cd_start, member_name)
+    cd_flag_offset = cd_offset + 8
+    cd_flags = struct.unpack_from("<H", data, cd_flag_offset)[0]
+    struct.pack_into("<H", data, cd_flag_offset, cd_flags | encrypted_flag_bit)
+
+    return bytes(data)
+
+
+def _rewrite_member_with_unsupported_compression(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _rewrite_member_with_unsupported_compression (Corrective A final
+    review FA-I1)."""
+    unsupported_method = 99
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+        cd_start = archive.start_dir
+
+    data = bytearray(package_bytes)
+
+    local_method_offset = info.header_offset + 8
+    struct.pack_into("<H", data, local_method_offset, unsupported_method)
+
+    cd_offset = _find_central_directory_offset(data, cd_start, member_name)
+    cd_method_offset = cd_offset + 10
+    struct.pack_into("<H", data, cd_method_offset, unsupported_method)
+
+    return bytes(data)
+
+
+def _corrupt_bzip2_member(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _corrupt_bzip2_member (Corrective A final review FA-I1): rebuild
+    with every member re-compressed as ZIP_BZIP2, then corrupt the
+    target member's compressed byte stream."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_BZIP2) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_BZIP2
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+    rebuilt[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+
+    return bytes(rebuilt)
+
+
 @pytest.fixture
 def signed_package(tmp_path, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -191,6 +278,58 @@ def test_verify_rejects_malformed_deflate_member(settings, signed_package):
 
     message = str(excinfo.value)
     assert "zlib" not in message.lower()
+    assert "package verification failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_encrypted_member(settings, signed_package):
+    """Corrective A final review FA-I1: an encrypted archive member must
+    surface as a normal package-verification CommandError, never a raw
+    RuntimeError, through the real command."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    encrypted_path = signed_package["path"].with_name("encrypted.llpkg")
+    encrypted_path.write_bytes(
+        _rewrite_member_with_encrypted_flag(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "verify", "--file", str(encrypted_path))
+
+    message = str(excinfo.value)
+    assert "encrypted" in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_unsupported_compression_member(settings, signed_package):
+    """Corrective A final review FA-I1: a member declaring an
+    unsupported compression method must surface as a normal
+    package-verification CommandError, never a raw NotImplementedError."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("unsupported-compression.llpkg")
+    corrupted_path.write_bytes(
+        _rewrite_member_with_unsupported_compression(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "verify", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "compression" in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_corrupt_bzip2_member(settings, signed_package):
+    """Corrective A final review FA-I1: a corrupted BZIP2-compressed
+    member must surface as a normal package-verification CommandError,
+    never a raw OSError."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupt-bzip2.llpkg")
+    corrupted_path.write_bytes(_corrupt_bzip2_member(signed_package["bytes"], PAYLOAD_MEMBER))
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "verify", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
     assert "package verification failed" in message
     assert InstalledPackage.objects.count() == 0
 
@@ -423,6 +562,54 @@ def test_import_rejects_malformed_deflate_member_with_zero_mutation(settings, si
 
     message = str(excinfo.value)
     assert "zlib" not in message.lower()
+    assert "package import failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_encrypted_member_with_zero_mutation(settings, signed_package):
+    """Corrective A final review FA-I1, at the command layer: an
+    encrypted archive member must flow verify_package ->
+    PackageVerificationError -> import_package -> PackageImportError ->
+    CommandError, never a raw RuntimeError, and must never persist a
+    partial/any InstalledPackage row."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    encrypted_path = signed_package["path"].with_name("encrypted.llpkg")
+    encrypted_path.write_bytes(
+        _rewrite_member_with_encrypted_flag(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "import", "--file", str(encrypted_path))
+
+    message = str(excinfo.value)
+    assert "encrypted" in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_unsupported_compression_member_with_zero_mutation(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("unsupported-compression.llpkg")
+    corrupted_path.write_bytes(
+        _rewrite_member_with_unsupported_compression(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "import", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "compression" in message.lower()
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_corrupt_bzip2_member_with_zero_mutation(settings, signed_package):
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupt-bzip2.llpkg")
+    corrupted_path.write_bytes(_corrupt_bzip2_member(signed_package["bytes"], PAYLOAD_MEMBER))
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "import", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
     assert "package import failed" in message
     assert InstalledPackage.objects.count() == 0
 

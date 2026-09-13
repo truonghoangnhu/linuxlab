@@ -549,6 +549,187 @@ def test_malformed_deflate_member_is_rejected_as_packageverificationerror(snapsh
     assert "zlib" not in str(excinfo.value).lower()
 
 
+# --- Important (Corrective A final review, FA-I1): the remaining ----------
+# --- untrusted-archive exception taxonomy zlib.error normalization -------
+# --- (Task 4 fix-round-1) did not cover: encrypted members, unsupported ---
+# --- compression methods, and corrupt BZIP2 streams ------------------------
+
+
+_ZIP_ENCRYPTED_FLAG_BIT = 0x1  # ZIP general-purpose bit flag bit 0
+_UNSUPPORTED_COMPRESSION_METHOD = 99  # not one of zipfile's supported methods
+
+
+def _find_central_directory_offset(data, cd_start, member_name):
+    """Locate the exact central directory record for `member_name`,
+    searching only from `cd_start` onward (the real central directory
+    start, from `ZipFile.start_dir`) so a coincidental "PK\\x01\\x02"
+    byte sequence inside compressed member DATA can never be mistaken
+    for a central directory record."""
+    name_bytes = member_name.encode()
+    search_from = cd_start
+    while True:
+        cd_offset = data.find(b"PK\x01\x02", search_from)
+        if cd_offset == -1:
+            raise AssertionError(f"central directory record for {member_name!r} not found")
+        fn_len = struct.unpack_from("<H", data, cd_offset + 28)[0]
+        candidate_name = bytes(data[cd_offset + 46 : cd_offset + 46 + fn_len])
+        if candidate_name == name_bytes:
+            return cd_offset
+        search_from = cd_offset + 4
+
+
+def _rewrite_member_with_encrypted_flag(package_bytes, member_name):
+    """Mark a real member as encrypted via the exact real ZIP mechanism
+    (general-purpose bit flag bit 0), in both the local file header and
+    the central directory record -- this is what a genuinely encrypted
+    ZIP member looks like on disk. Setting `ZipInfo.flag_bits` before
+    `writestr()` does NOT work: zipfile recomputes flag bits itself
+    during writing and discards whatever the caller set, so (like
+    `_corrupt_deflate_member` above) this patches the raw bytes of an
+    already-built real package directly."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+        cd_start = archive.start_dir
+
+    data = bytearray(package_bytes)
+
+    local_flag_offset = info.header_offset + 6
+    local_flags = struct.unpack_from("<H", data, local_flag_offset)[0]
+    struct.pack_into("<H", data, local_flag_offset, local_flags | _ZIP_ENCRYPTED_FLAG_BIT)
+
+    cd_offset = _find_central_directory_offset(data, cd_start, member_name)
+    cd_flag_offset = cd_offset + 8
+    cd_flags = struct.unpack_from("<H", data, cd_flag_offset)[0]
+    struct.pack_into("<H", data, cd_flag_offset, cd_flags | _ZIP_ENCRYPTED_FLAG_BIT)
+
+    return bytes(data)
+
+
+def _rewrite_member_with_unsupported_compression(package_bytes, member_name):
+    """Mark a real member's compression method (in both the local file
+    header and the central directory record) as a method number zipfile
+    does not implement. The underlying compressed bytes are left
+    untouched -- zipfile's decompressor dispatch fails purely on the
+    method NUMBER, before ever attempting to interpret the bytes."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        info = archive.getinfo(member_name)
+        cd_start = archive.start_dir
+
+    data = bytearray(package_bytes)
+
+    local_method_offset = info.header_offset + 8
+    struct.pack_into("<H", data, local_method_offset, _UNSUPPORTED_COMPRESSION_METHOD)
+
+    cd_offset = _find_central_directory_offset(data, cd_start, member_name)
+    cd_method_offset = cd_offset + 10
+    struct.pack_into("<H", data, cd_method_offset, _UNSUPPORTED_COMPRESSION_METHOD)
+
+    return bytes(data)
+
+
+def _corrupt_bzip2_member(package_bytes, member_name):
+    """Rebuild the archive with every member re-compressed as ZIP_BZIP2,
+    then corrupt the target member's on-disk compressed byte stream --
+    the other members' compression doesn't matter for this test, since
+    verification fails while reading the corrupted member, long before
+    any other member or the signature is ever checked."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_BZIP2) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_BZIP2
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+    rebuilt[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+
+    return bytes(rebuilt)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_encrypted_member_is_rejected_as_packageverificationerror(snapshot, keypair):
+    private_key, public_key = keypair
+    registry = _fake_registry()
+    package_bytes = build_package(snapshot, registry, private_key)
+
+    encrypted = _rewrite_member_with_encrypted_flag(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageVerificationError) as excinfo:
+        verify_package(encrypted, registry, public_key)
+
+    assert "encrypted" in str(excinfo.value).lower()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unsupported_compression_member_is_rejected_as_packageverificationerror(snapshot, keypair):
+    private_key, public_key = keypair
+    registry = _fake_registry()
+    package_bytes = build_package(snapshot, registry, private_key)
+
+    corrupted = _rewrite_member_with_unsupported_compression(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageVerificationError) as excinfo:
+        verify_package(corrupted, registry, public_key)
+
+    assert "compression" in str(excinfo.value).lower()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_corrupt_bzip2_member_is_rejected_as_packageverificationerror(snapshot, keypair):
+    private_key, public_key = keypair
+    registry = _fake_registry()
+    package_bytes = build_package(snapshot, registry, private_key)
+
+    corrupted = _corrupt_bzip2_member(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageVerificationError) as excinfo:
+        verify_package(corrupted, registry, public_key)
+
+    assert "zlib" not in str(excinfo.value).lower()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_corrupt_lzma_member_is_rejected_as_packageverificationerror(snapshot, keypair):
+    """Regression guard only (Section 11): a corrupted LZMA member
+    already reaches PackageVerificationError on current HEAD, via
+    zipfile's own CRC-32 check (LZMA's own decompressor tolerates the
+    corrupted stream enough to decompress to unexpected content, so the
+    rejection surfaces as a `zipfile.BadZipFile: Bad CRC-32` -- already
+    inside the existing `except (zipfile.BadZipFile, ...)` clause) --
+    pinned here so the FA-I1 exception-handling restructure cannot
+    regress it."""
+    with zipfile.ZipFile(BytesIO(build_package(snapshot, _fake_registry(), keypair[0]))) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(PAYLOAD_MEMBER)
+    assert info.compress_type == zipfile.ZIP_LZMA
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+    compressed_size = info.compress_size
+    rebuilt[data_start : data_start + compressed_size] = b"\xff" * compressed_size
+
+    with pytest.raises(PackageVerificationError):
+        verify_package(bytes(rebuilt), _fake_registry(), keypair[1])
+
+
 # --- Critical: unsaved / mutated / hash-corrupt source --------------------
 
 

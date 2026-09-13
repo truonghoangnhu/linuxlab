@@ -93,6 +93,14 @@ PAYLOAD_MEMBER = "payload.json"
 SIGNATURE_MEMBER = "signature.bin"
 _REQUIRED_MEMBERS = frozenset({MANIFEST_MEMBER, PAYLOAD_MEMBER, SIGNATURE_MEMBER})
 
+# ZIP general-purpose bit flag bits (ZIP APPNOTE section 4.4.4): bit 0 is
+# traditional PKWARE encryption, bit 6 is the (rarer) strong-encryption
+# flag. LinuxLab .llpkg packages are Central-built and never encrypted --
+# checked explicitly against member metadata, rather than relying on
+# zipfile's own password-prompt RuntimeError, so an encrypted member is a
+# deliberate domain rejection, not an incidental side effect.
+_ZIP_ENCRYPTED_FLAG_BITS = (1 << 0) | (1 << 6)
+
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -456,15 +464,46 @@ def _read_exact_members(archive):
             f"(missing={missing}, extra={extra})"
         )
 
+    # Reject encryption deliberately, from member metadata, before ever
+    # attempting to read a byte of member content -- not by letting
+    # zipfile's own password-prompt RuntimeError leak through
+    # incidentally (Corrective A final review FA-I1).
+    for name in _REQUIRED_MEMBERS:
+        if archive.getinfo(name).flag_bits & _ZIP_ENCRYPTED_FLAG_BITS:
+            raise PackageVerificationError(f"package member {name!r} is encrypted")
+
     try:
         return {name: archive.read(name) for name in _REQUIRED_MEMBERS}
-    except (zipfile.BadZipFile, zlib.error) as exc:
-        # archive.read() decompresses each member; a structurally
-        # well-formed ZIP container can still hold an invalid DEFLATE
-        # byte stream for one member, which raises zlib.error directly
-        # from the decompressor rather than zipfile.BadZipFile. Both are
-        # the same trust boundary here: malformed compressed package
-        # content, normalized to one domain rejection.
+    except NotImplementedError as exc:
+        # archive.read() dispatches to a decompressor purely by the
+        # member's declared compression-method NUMBER (zipfile's
+        # _get_decompressor()); a well-formed container can declare a
+        # method zipfile does not implement, which is untrusted-input
+        # rejection, not a LinuxLab programming defect -- this package
+        # was never producible by build_package(), which always uses
+        # ZIP_DEFLATED.
+        raise PackageVerificationError(
+            "package member uses an unsupported archive compression method"
+        ) from exc
+    except RuntimeError as exc:
+        # Defense in depth alongside the explicit flag_bits check above:
+        # covers any zipfile-internal encryption rejection (e.g. the
+        # strong-encryption combination) the metadata pre-check did not
+        # anticipate. Never reachable for the two flag bits checked
+        # above, since those are rejected before archive.read() runs.
+        raise PackageVerificationError("package member is encrypted") from exc
+    except (zipfile.BadZipFile, zlib.error, OSError) as exc:
+        # archive.read() decompresses each member entirely in memory
+        # (package_bytes is a BytesIO, never a real file), so an OSError
+        # here can only be a decompressor's own data-validity check --
+        # e.g. bz2's `OSError: Invalid data stream` on a corrupted BZIP2
+        # member -- never a genuine filesystem error. A structurally
+        # well-formed ZIP container can similarly hold an invalid
+        # DEFLATE byte stream for one member, which raises zlib.error
+        # directly from the decompressor rather than zipfile.BadZipFile.
+        # All three are the same trust boundary here: malformed
+        # compressed package content, normalized to one domain
+        # rejection.
         raise PackageVerificationError("corrupt archive member") from exc
 
 
