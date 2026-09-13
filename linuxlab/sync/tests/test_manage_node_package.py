@@ -144,6 +144,37 @@ def _corrupt_bzip2_member(package_bytes, member_name):
     return bytes(rebuilt)
 
 
+def _corrupt_lzma_filter_properties(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _corrupt_lzma_filter_properties (residual FA-I1, Corrective A
+    final-review fix round 2): rebuild with every member re-compressed
+    as ZIP_LZMA (real, valid LZMA framing), then corrupt only the first
+    byte of the target member's embedded LZMA1 filter-properties block
+    -- never the compressed stream itself."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_LZMA
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+
+    psize = struct.unpack_from("<H", rebuilt, data_start + 2)[0]
+    assert psize >= 1
+    rebuilt[data_start + 4] = 0xFF
+
+    return bytes(rebuilt)
+
+
 @pytest.fixture
 def signed_package(tmp_path, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -330,6 +361,26 @@ def test_verify_rejects_corrupt_bzip2_member(settings, signed_package):
         call_command("manage_node_package", "verify", "--file", str(corrupted_path))
 
     message = str(excinfo.value)
+    assert "package verification failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_verify_rejects_malformed_lzma_filter_properties(settings, signed_package):
+    """Residual FA-I1 (Corrective A final-review fix round 2): a real
+    ZIP_LZMA member with valid framing but malformed embedded LZMA1
+    filter properties must surface as a normal package-verification
+    CommandError, never a raw lzma.LZMAError."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupt-lzma.llpkg")
+    corrupted_path.write_bytes(
+        _corrupt_lzma_filter_properties(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "verify", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "lzma" not in message.lower()
     assert "package verification failed" in message
     assert InstalledPackage.objects.count() == 0
 
@@ -610,6 +661,30 @@ def test_import_rejects_corrupt_bzip2_member_with_zero_mutation(settings, signed
         call_command("manage_node_package", "import", "--file", str(corrupted_path))
 
     message = str(excinfo.value)
+    assert "package import failed" in message
+    assert InstalledPackage.objects.count() == 0
+
+
+def test_import_rejects_malformed_lzma_filter_properties_with_zero_mutation(
+    settings, signed_package
+):
+    """Residual FA-I1 (Corrective A final-review fix round 2), at the
+    command layer: a real ZIP_LZMA member with malformed embedded LZMA1
+    filter properties must flow verify_package ->
+    PackageVerificationError -> import_package -> PackageImportError ->
+    CommandError, never a raw lzma.LZMAError, and must never persist
+    any InstalledPackage row."""
+    settings.LINUXLAB_CAN_IMPORT_PACKAGES = True
+    corrupted_path = signed_package["path"].with_name("corrupt-lzma.llpkg")
+    corrupted_path.write_bytes(
+        _corrupt_lzma_filter_properties(signed_package["bytes"], PAYLOAD_MEMBER)
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command("manage_node_package", "import", "--file", str(corrupted_path))
+
+    message = str(excinfo.value)
+    assert "lzma" not in message.lower()
     assert "package import failed" in message
     assert InstalledPackage.objects.count() == 0
 

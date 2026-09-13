@@ -730,6 +730,70 @@ def test_corrupt_lzma_member_is_rejected_as_packageverificationerror(snapshot, k
         verify_package(bytes(rebuilt), _fake_registry(), keypair[1])
 
 
+# --- Residual FA-I1 (Corrective A final-review fix round 2): a real ZIP_LZMA
+# --- member with VALID framing but MALFORMED LZMA filter properties raises a
+# --- raw lzma.LZMAError, distinct from the corrupted-compressed-stream case
+# --- above (which happens to already surface as zipfile.BadZipFile) --------
+
+
+def _corrupt_lzma_filter_properties(package_bytes, member_name):
+    """Rebuild the archive with every member re-compressed as ZIP_LZMA
+    (real, valid LZMA framing), then corrupt only the FIRST byte of the
+    target member's embedded LZMA1 filter-properties block (the
+    `lclppb` byte encoding lc/lp/pb) -- never the compressed stream
+    itself. Python's zipfile.LZMADecompressor reads this properties
+    header directly off the member's own compressed-data bytes (2 bytes
+    LZMA SDK version, 2 bytes property size, then the properties) and
+    calls `lzma._decode_filter_properties()` on it before ever touching
+    the LZMA1 stream; an invalid lclppb byte fails that decode
+    immediately with a raw `lzma.LZMAError`, never a CRC/BadZipFile
+    mismatch (that only happens once real stream data is fed through a
+    successfully-constructed decompressor, which malformed properties
+    never reach)."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_LZMA
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+
+    # Compressed data layout for a ZIP_LZMA member (zipfile.LZMADecompressor):
+    # bytes[0:2] LZMA SDK version, bytes[2:4] little-endian property size,
+    # bytes[4:4+psize] the raw LZMA1 filter properties. Corrupt only the
+    # first properties byte, at data_start + 4.
+    psize = struct.unpack_from("<H", rebuilt, data_start + 2)[0]
+    assert psize >= 1
+    rebuilt[data_start + 4] = 0xFF
+
+    return bytes(rebuilt)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_malformed_lzma_filter_properties_is_rejected_as_packageverificationerror(
+    snapshot, keypair
+):
+    private_key, public_key = keypair
+    registry = _fake_registry()
+    package_bytes = build_package(snapshot, registry, private_key)
+
+    corrupted = _corrupt_lzma_filter_properties(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageVerificationError) as excinfo:
+        verify_package(corrupted, registry, public_key)
+
+    assert "lzma" not in str(excinfo.value).lower()
+
+
 # --- Critical: unsaved / mutated / hash-corrupt source --------------------
 
 

@@ -70,6 +70,7 @@ equivalent to a verified one.
 """
 
 import json
+import lzma
 import uuid
 import zipfile
 import zlib
@@ -492,7 +493,7 @@ def _read_exact_members(archive):
         # anticipate. Never reachable for the two flag bits checked
         # above, since those are rejected before archive.read() runs.
         raise PackageVerificationError("package member is encrypted") from exc
-    except (zipfile.BadZipFile, zlib.error, OSError) as exc:
+    except (zipfile.BadZipFile, zlib.error, OSError, lzma.LZMAError) as exc:
         # archive.read() decompresses each member entirely in memory
         # (package_bytes is a BytesIO, never a real file), so an OSError
         # here can only be a decompressor's own data-validity check --
@@ -501,9 +502,14 @@ def _read_exact_members(archive):
         # well-formed ZIP container can similarly hold an invalid
         # DEFLATE byte stream for one member, which raises zlib.error
         # directly from the decompressor rather than zipfile.BadZipFile.
-        # All three are the same trust boundary here: malformed
-        # compressed package content, normalized to one domain
-        # rejection.
+        # A ZIP_LZMA member with valid framing but a malformed embedded
+        # LZMA1 filter-properties block (zipfile.LZMADecompressor calls
+        # lzma._decode_filter_properties() on those bytes before ever
+        # touching the compressed stream) raises lzma.LZMAError directly
+        # -- a plain Exception subclass, not an OSError, so it needs its
+        # own explicit entry here (residual FA-I1, round 2). All four are
+        # the same trust boundary here: malformed compressed package
+        # content, normalized to one domain rejection.
         raise PackageVerificationError("corrupt archive member") from exc
 
 

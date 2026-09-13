@@ -297,6 +297,52 @@ def test_corrupt_bzip2_member_creates_no_rows(quiz_world, keypair):
     _assert_no_installed_rows()
 
 
+def _corrupt_lzma_filter_properties(package_bytes, member_name):
+    """Same technique as linuxlab/publication/tests/test_package.py::
+    _corrupt_lzma_filter_properties (residual FA-I1, Corrective A
+    final-review fix round 2): rebuild with every member re-compressed
+    as ZIP_LZMA (real, valid LZMA framing), then corrupt only the first
+    byte of the target member's embedded LZMA1 filter-properties block
+    -- never the compressed stream itself -- so decoding those
+    properties raises a raw lzma.LZMAError before any stream data is
+    ever touched."""
+    with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_LZMA) as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    rebuilt = bytearray(buffer.getvalue())
+
+    with zipfile.ZipFile(BytesIO(bytes(rebuilt))) as archive:
+        info = archive.getinfo(member_name)
+    assert info.compress_type == zipfile.ZIP_LZMA
+
+    header_offset = info.header_offset
+    filename_len, extra_len = struct.unpack_from("<HH", rebuilt, header_offset + 26)
+    data_start = header_offset + 30 + filename_len + extra_len
+
+    psize = struct.unpack_from("<H", rebuilt, data_start + 2)[0]
+    assert psize >= 1
+    rebuilt[data_start + 4] = 0xFF
+
+    return bytes(rebuilt)
+
+
+@override_settings(LINUXLAB_CAN_IMPORT_PACKAGES=True)
+def test_malformed_lzma_filter_properties_creates_no_rows(quiz_world, keypair):
+    private_key, public_key = keypair
+    package_bytes = _package_bytes(quiz_world, private_key)
+    corrupted = _corrupt_lzma_filter_properties(package_bytes, PAYLOAD_MEMBER)
+
+    with pytest.raises(PackageImportError) as excinfo:
+        import_package(corrupted, quiz_world["activity_registry"], public_key)
+
+    assert "lzma" not in str(excinfo.value).lower()
+    _assert_no_installed_rows()
+
+
 # --- staging is all-or-nothing ----------------------------------------------
 
 
