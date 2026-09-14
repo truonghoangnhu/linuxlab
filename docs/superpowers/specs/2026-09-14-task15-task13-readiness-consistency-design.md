@@ -6,6 +6,10 @@ Repository: LinuxLab
 Branch: `feature/phase1-learning-foundation`
 Baseline: `cd040cefc62f34f30840361577d4454d47d0bdac`
 
+Amended after human review from `d4573c4ddbd83211323a8340e5b6e3d548958569`:
+logical-node-only external identity, dedicated read-only probe retained,
+Outbox-only requeue, and conservative legacy retry-age migration.
+
 ## 1. Authority, context, and scope
 
 Corrective A solved the Phase-1 package operator-surface blocker and is closed
@@ -63,7 +67,7 @@ are context for B's bounded corrections; this does not start or close Task14.
 | Readiness | `readyz`, `evaluate_readiness`, `ReadinessResult`; `/readyz` also checks sync configuration | `/ready/` is local readiness; retain `/readyz` as a direct alias to the same evaluator |
 | Diagnostics | No canonical diagnostic report or command | `linuxlab.core.diagnostics` public contracts; `manage.py diagnose_deployment` |
 | Release gate | `scripts/phase1_release_gate.py`; `scripts.release_gate.gate_runner.run_release_gate`; `processes.wait_ready` polls `/readyz` | Keep these entry points; consume canonical RELEASE diagnostics in the readiness/capability decision |
-| Registration | `linuxlab.sync.models.NodeRegistration`; unique `node_id`; `enabled`, `revoked_at`; mutable current/previous secret hashes | Preserve logical `node_id`; add registration `public_id` and `state`; multiple historical rows, at most one ACTIVE |
+| Registration | `linuxlab.sync.models.NodeRegistration`; unique `node_id`; `enabled`, `revoked_at`; mutable current/previous secret hashes | Preserve logical `node_id`; add `state`; historical rows retain local DB identity, at most one ACTIVE |
 | Registration services | `linuxlab.sync.authentication.issue_node_registration`, `rotate_node_credential`, `revoke_node_registration`, `authenticate_node` | Keep names and ownership; replace in-place/grace authentication with the approved lifecycle |
 | Delivery authority | `linuxlab.sync.models.OutboxMessage`; `attempts`, `next_attempt_at`, claim/lease/token fields | Reuse this record and these fields; add failure-cycle metadata, not another queue |
 | Delivery states | `OUTBOX_PENDING`, `OUTBOX_IN_FLIGHT`, `OUTBOX_DELIVERED`, `OUTBOX_DEAD_LETTER` | Reuse `pending`, `in_flight`, `delivered`, `dead_letter`; dead letter means operator attention |
@@ -234,7 +238,7 @@ Central registration inventory is PASS with a bounded zero count: there is no
 logical node whose registration is required yet. Historical SUPERSEDED/REVOKED
 rows alongside a valid ACTIVE create no warning. A history-only logical node
 has zero ACTIVE and fails, as does an explicitly revoked node with no replacement.
-A structurally usable ACTIVE has a valid logical UUID and registration UUID
+A structurally usable ACTIVE has a valid logical node UUID
 and a usable supported Django password hash; this does not prove possession
 of the secret.
 
@@ -406,8 +410,11 @@ isolated fixtures only; they must not modify production `/etc/linuxlab` files.
 
 `sync.NodeRegistration` remains Central-owned. `node_id` is the logical node
 UUID used by `source_node_id` and authentication headers; rotation preserves
-it. Add immutable unique UUID `public_id` for the individual registration
-record. Remove unconditional uniqueness of `node_id`, retaining an index.
+it. Historical registration rows use local DB identity plus lifecycle state;
+no additional public/distributed identifier is introduced. Operator commands
+address the logical node by `node_id`; a local PK must never become an external
+or operator selector. Remove unconditional uniqueness of `node_id`, retaining
+an index.
 Historical `InboxMessage.source_node` foreign keys continue pointing to the
 registration originally used; rows and local PKs are not rewritten or exposed
 as distributed identity. Existing canonical envelope reconstruction through
@@ -466,7 +473,7 @@ bounded explicit remediation after revocation or ambiguous migration; it never
 reactivates a historical row and never runs automatically.
 
 `rotate_node_credential(node_id)` requires exactly one usable ACTIVE A. Generate
-a fresh registration UUID and fresh high-entropy bearer secret; mark A
+a new registration row with a fresh high-entropy bearer secret; mark A
 SUPERSEDED and insert B as ACTIVE in the same locked transaction. Physically
 supersede A before inserting ACTIVE B to satisfy immediate partial uniqueness;
 credential preparation in memory is not runtime authority. Any insertion or
@@ -491,8 +498,8 @@ new registration is issued. REVOKED and SUPERSEDED records are retained.
 Keep `manage_sync_node issue --name NAME`, adding optional `--node-id UUID` for
 explicit replacement in a zero-ACTIVE scope; retain `revoke <node_uuid>`.
 `IssuedNodeCredential` continues returning the logical node ID and one-time
-plaintext secret, adds the registration UUID for exact identity, and excludes
-secret from repr. Only explicit issue/rotate may display a new secret once,
+plaintext secret only, and excludes secret from repr. Only explicit issue/rotate
+may display a new secret once,
 as already authorized by their existing command contract. Diagnostics never do.
 
 ## 11. Deterministic registration migration
@@ -503,13 +510,10 @@ contradictory enabled flag. Non-revoked means `enabled=True AND revoked_at IS
 NULL`. This is the mapping of the approved abstract `revoked=true/false` rules
 to current schema, not an assumption that a nonexistent field exists.
 
-Schema support introduces registration UUIDs and lifecycle state without
-premature ACTIVE defaults. Backfill each existing registration's `public_id`
-as a deterministic UUIDv5 using `uuid.NAMESPACE_URL` and the name
-`linuxlab:sync:node-registration:legacy:{node_id}:{pk}`, with canonical
-lowercase hyphenated node UUID and decimal local PK. This is a new registration
-identifier, never a replacement logical-node UUID or an authority selector.
-Newly issued registrations use fresh UUIDv4 identities. Then group by `node_id`:
+Schema support introduces lifecycle state without premature ACTIVE defaults.
+Retain existing local row identities and logical `node_id` values; no identity
+backfill or new distributed registration identifier is introduced. Group by
+`node_id`:
 
 | Legacy group | Result |
 |---|---|
@@ -521,9 +525,9 @@ Newly issued registrations use fresh UUIDv4 identities. Then group by `node_id`:
 No timestamp, PK ordering, token age or version selects an ACTIVE candidate.
 The baseline unique `node_id` makes multiple candidates impossible in an intact
 baseline DB, but the data migration still handles them after schema expansion;
-actual migration tests must seed that intermediate historical state. PK usage
-for a deterministic registration identifier does not confer authentication
-authority or export a local PK.
+actual migration tests must seed that intermediate historical state. Local
+PKs remain private row identities and never select current authority or become
+operator selectors.
 
 Preserve historical rows, hashes, timestamps and Inbox foreign keys. Do not
 create credentials, rotate secrets, contact Central, provision replacements or
@@ -628,11 +632,14 @@ claim tokens. Delivered/dead-letter rows remain terminal. The baseline records
 no first-failure timestamp, so do not invent an exact history or reset retries
 to zero. For retryable legacy rows with attempts > 0, conservatively seed
 `first_failure_at=created_at`; document that this is an upper-bound age anchor,
-not an observed failure time. Rows with attempts=0 retain null first failure.
-Unknown historical category remains empty until the next actual failure.
-At the first worker eligibility evaluation, already-exhausted rows enter
-operator attention without sending. This is a forward-safe conservative
-migration, not silent retry-budget renewal.
+not the actual first failure time. It intentionally grants no fresh retry-age
+budget and must not use the migration-time timestamp. Rows with attempts=0
+retain null first failure. Unknown historical category remains empty until the
+next actual failure. At the first worker eligibility evaluation, already-exhausted
+rows may enter operator attention without another send after upgrade;
+`attempts > 0` alone does not unconditionally dead-letter a row. Apply the configured
+attempt/age budget. This migration is fail-closed and deterministic, not silent
+retry-budget renewal.
 
 ## 14. Retry budget, jitter, and Retry-After
 
@@ -708,19 +715,30 @@ sends the event itself. There is no bulk-all or automatic reset mode.
 
 Requeue locks the exact dead-letter row, validates required typed configuration,
 and fails without mutation for unknown, pending, in-flight or delivered rows.
-In one transaction it records the prior cycle's safe evidence through existing
-`core.events.publish_event` (`sync.outbox.requeued`, aggregate_id=event_id),
-then sets state pending, attempts 0, first_failure_at null, next_attempt_at now,
-and clears claim/lease/token and current-cycle failure fields. Audit payload
-contains only event UUID, previous failure count/timestamp/category, bounded
-error code/status and action timestamp. It never includes the event payload,
-credential or raw reason. This local operator audit event is not a registered
-sync export type and must not itself create an outbound sync event.
+In one transaction it sets state pending, attempts 0, first_failure_at null,
+next_attempt_at now, and clears claim/lease/token and current-cycle failure
+fields. The only persistent mutation is this OutboxMessage state transition;
+a failed transition rolls back completely.
 
-Retain the original immutable Outbox envelope, event UUID and domain-event link.
-Do not edit another app's rows or build a workflow/audit subsystem. Failed audit
-or reset rolls back both. Diagnostics never call requeue. Operator remediation
-can repair credentials/configuration first; remote proof of repair is not a
+Repository audit-pattern decision: `NO_EXISTING_PATTERN_EVENT_REMOVED`.
+`linuxlab/core/events.py:publish_event` is a generic DomainEvent creation helper,
+not an operator-remediation audit contract. Its production callers in
+`linuxlab/learning/services.py` emit `activity.completed` for learning results.
+`linuxlab/sync/authentication.py:revoke_node_registration` and
+`linuxlab/sync/outbox.py:mark_dead_letter` use controlled model writers without
+publishing an operator audit event. Existing command reporting uses stdout/stderr
+(`manage_sync_node.Command.handle`, `sync_events.Command._report`). None
+establishes a standardized operator-remediation DomainEvent pattern.
+
+Preserve the existing safe command-reporting/logging mechanisms and any evidence
+already retained through them; do not create a new persistent audit record or
+a domain-event contract for requeue. Retain the original immutable Outbox
+envelope, event UUID and existing domain-event trace link. Resetting current-cycle
+fields does not delete that trace or any pre-existing domain history. Requeue
+must not publish a DomainEvent, create another outbound event, cause event
+recursion, or introduce a new distributed contract. Do not edit another app's
+rows or build a workflow/audit subsystem. Diagnostics never call requeue.
+Operator remediation can repair credentials/configuration first; remote proof of repair is not a
 new mandatory online dependency for the explicit local reset action.
 
 ## 16. Required behavioral verification for later implementation
@@ -751,7 +769,7 @@ reconciliation remains C.
 
 ### Registration and migration
 
-- Rotation creates a distinct registration UUID and new secret; A becomes
+- Rotation creates a distinct local registration row and new secret; A becomes
   SUPERSEDED, B ACTIVE, same logical UUID, exactly one ACTIVE. Old and previous
   secrets fail immediately; no grace argument is silently honored.
 - Revoke yields REVOKED with no replacement; zero ACTIVE fails auth/diagnostics.
@@ -766,8 +784,10 @@ reconciliation remains C.
 - Execute actual historical migrations: legacy revoked, exactly one candidate,
   zero candidate and 2+ candidates. Vary insertion order, timestamps and PKs
   to prove no current-row heuristic; every ambiguous group has zero ACTIVE.
-- Preserve logical UUIDs and Inbox foreign keys; deterministic backfill,
-  irreversible semantics and post-migration rejection of two ACTIVE are proven.
+- Preserve logical node UUIDs, local row identities and Inbox foreign keys;
+  no new registration identity or external PK selector. Prove deterministic
+  lifecycle migration, irreversible semantics and post-migration rejection of
+  two ACTIVE.
   No migration contacts Central, generates credentials or performs remediation.
 
 ### Retry and delivery
@@ -786,10 +806,15 @@ reconciliation remains C.
   failure, cap and overflow behavior, with real production randomness retained.
 - Future due rows not selected; terminal rows never auto-selected; restart
   preserves persisted schedule/count/age; expired leases retain fencing.
-- Explicit requeue creates a new retry cycle and atomic safe local audit,
-  preserves UUID/envelope, refuses wrong states and never sends immediately.
-- Actual retry-state migration preserves old due times/counts/terminal states;
-  legacy unknown failure age is conservative, never a fabricated retry reset.
+- Explicit requeue creates a new retry cycle through an atomic Outbox-only
+  transition, preserves event UUID/envelope and existing domain-event trace,
+  refuses wrong states and never sends immediately. Prove zero new DomainEvent
+  or outbound event, no event recursion, and rollback on transition failure.
+- Actual retry-state migration preserves old due times/counts/terminal states.
+  Retryable legacy rows with attempts > 0 use first_failure_at=created_at;
+  attempts=0 keeps NULL. Prove no migration-time budget renewal, exhausted rows
+  cannot send, and nonexhausted rows are not unconditionally dead-lettered.
+  The anchor is an age upper bound, never a claim of actual first failure time.
 - 2xx with missing/malformed/duplicate ACK is not delivery; partial ACKs remain
   per-event; repeated accepted event UUID has one Central effect. Bounded 413
   splits honor counters/budgets and singleton EVENT_TOO_LARGE remains terminal.
@@ -854,6 +879,8 @@ checklists. It does not start Corrective C or Task14, or declare Task13 closed.
 - Machines use stable codes/statuses, never human message prose; adapters never
   recalculate overall status.
 - Module ownership and one-codebase deployment profiles are preserved.
+- `node_id` is the sole external registration selector; historical rows use
+  local DB identity plus lifecycle state, with no external/operator PK selector.
 - One logical node has at most one ACTIVE registration; REVOKED never resurrects.
 - Rotation creates a new ACTIVE and supersedes the old ACTIVE.
 - Current registration is never inferred by latest, PK, timestamp or version.
@@ -865,7 +892,8 @@ checklists. It does not start Corrective C or Task14, or declare Task13 closed.
 - Exponential full jitter is used, including the first-failure exponent zero.
 - Retry-After cannot bypass retry budget; max_attempts OR max_retry_age ends it.
 - Permanent/auth failures do not auto-retry; operator attention requires explicit
-  requeue, which starts a new cycle without erasing required historical evidence.
+  requeue, which is an atomic Outbox-only transition retaining existing history
+  and trace evidence without a new DomainEvent or outbound event.
 - Malformed sync config fails the required sync capability closed; malformed
   sync-only configuration alone does not destroy healthy offline local readiness.
 - Diagnostics, reports, logs and persisted retry errors contain no secrets.
@@ -879,14 +907,19 @@ checklists. It does not start Corrective C or Task14, or declare Task13 closed.
 
 The concrete names above distinguish existing interfaces from B additions.
 Registration migration translates actual enabled/revoked_at fields, preserves
-logical UUID and Inbox history, and grants no authority by ordering. Rotation
+logical node UUID, local row identity and Inbox history, introduces no additional
+distributed registration identity, and grants no authority by ordering. Rotation
 has no hidden grace compatibility. Retry reuses existing Outbox state and
 fencing, defines failed-attempt counting, safe legacy age handling, finite
 budget and Retry-After boundaries without weakening ACK semantics. Local
 readiness is independent of diagnostics and sync-only configuration. Release
 requirements and aggregation have one canonical source. Secret handling,
-read-only diagnosis and explicit remediation remain distinct. No architecture
-invariant requires an ADR change; no operator documentation, Corrective C or
+read-only diagnosis and explicit remediation remain distinct. Requeue follows
+the verified absence of an operator-remediation event pattern: Outbox-only
+mutation, existing safe reporting, no new DomainEvent or outbound event. Legacy
+retry-age migration retains the deterministic created_at upper-bound anchor,
+never a fresh migration-time budget. No architecture invariant requires an ADR
+change; no operator documentation, Corrective C or
 Task14 work is included.
 
 Open Questions: None
