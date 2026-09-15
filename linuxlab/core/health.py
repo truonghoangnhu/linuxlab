@@ -1,20 +1,18 @@
 """Task 15 liveness/readiness endpoints (T15-D15).
 
-/healthz is process liveness only: it never queries the database and
-never inspects external services or configuration.
+/health/ and /healthz share process liveness: no database queries or
+external service/configuration inspection.
 
-/readyz checks database connectivity, migration-state compatibility
+/ready/ and /readyz check database connectivity, migration-state compatibility
 (read-only -- it never runs `migrate`), and that the active deployment
 profile is one this codebase recognizes. It never mutates schema or
 configuration, and the HTTP response body carries only a generic
 `{"status": "ok"|"not_ready"}` -- no exception text, host, credential,
-key path, or settings dump. Detailed diagnosis belongs in sanitized
-internal logs, not this response.
+key path, or settings dump. Capability diagnostics are separate; local
+readiness never depends on sync, keys, registration or Central connectivity.
 """
 
-import uuid
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from django.conf import settings
 from django.db import DEFAULT_DB_ALIAS, connections
@@ -33,7 +31,7 @@ class ReadinessResult:
     reason_code: str | None = None
 
 
-def _check_database():
+def check_database() -> bool:
     try:
         connections[DEFAULT_DB_ALIAS].ensure_connection()
     except Exception:  # noqa: BLE001 -- any DB failure means not_ready, never a leaked traceback
@@ -41,10 +39,12 @@ def _check_database():
     return True
 
 
-def _check_migrations_applied():
+def check_schema_state() -> bool:
     """Read-only: migration_plan() only inspects state, it never calls
     MigrationExecutor.migrate()."""
     try:
+        if not _check_profile() or not check_profile_configuration():
+            return False
         executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
         plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
     except Exception:  # noqa: BLE001 -- any inspection failure means not_ready
@@ -53,50 +53,27 @@ def _check_migrations_applied():
 
 
 def _check_profile():
-    return getattr(settings, "LINUXLAB_PROFILE", None) in _VALID_PROFILES
+    profile = getattr(settings, "LINUXLAB_PROFILE", None)
+    return isinstance(profile, str) and profile in _VALID_PROFILES
 
 
-def _check_profile_configuration():
+def check_profile_configuration() -> bool:
     """The active profile's own required configuration is present --
     at minimum, its database name resolved to a non-empty value (a
     profile settings module that failed to load a required value would
     otherwise silently target an unnamed database)."""
-    return bool(settings.DATABASES.get(DEFAULT_DB_ALIAS, {}).get("NAME"))
-
-
-def _check_sync_configuration():
-    """Checkpoint corrective (finding #4): a Node instance with sync
-    enabled but missing/malformed sync configuration must not be
-    reported ready. Gated on LINUXLAB_CAN_RUN_SYNC_WORKER -- a fixed
-    profile capability that is False on Central -- rather than a
-    LINUXLAB_PROFILE string comparison, so Central can never be made to
-    require Node-only settings. A sync-disabled Node (the default, per
-    T14-D38) may omit this configuration entirely. This check reads
-    settings only -- it never opens a network connection to Central."""
-    if not (settings.LINUXLAB_CAN_RUN_SYNC_WORKER and settings.LINUXLAB_SYNC_ENABLED):
-        return True
-
-    node_id = settings.LINUXLAB_NODE_ID
-    if not node_id:
+    databases = getattr(settings, "DATABASES", None)
+    if not isinstance(databases, dict):
         return False
-    try:
-        uuid.UUID(str(node_id))
-    except (ValueError, AttributeError, TypeError):
+    database = databases.get(DEFAULT_DB_ALIAS)
+    if not isinstance(database, dict):
         return False
-
-    secret = settings.LINUXLAB_SYNC_SECRET
-    if not secret or not str(secret).strip():
-        return False
-
-    central_url = settings.LINUXLAB_CENTRAL_URL
-    if not central_url:
-        return False
-    parsed = urlparse(central_url)
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    name = database.get("NAME")
+    return isinstance(name, str) and bool(name.strip())
 
 
 def evaluate_readiness() -> ReadinessResult:
-    # Each _check_*() already catches its own expected failure modes, but
+    # Each local check handles its expected failure modes, but
     # this outer guard is deliberate defense in depth: readiness must
     # degrade to not_ready rather than ever let an unexpected exception
     # (from a check itself, not just the thing it checks) escape into an
@@ -105,13 +82,11 @@ def evaluate_readiness() -> ReadinessResult:
     try:
         if not _check_profile():
             return ReadinessResult(ready=False, reason_code="invalid_profile")
-        if not _check_profile_configuration():
+        if not check_profile_configuration():
             return ReadinessResult(ready=False, reason_code="missing_profile_configuration")
-        if not _check_sync_configuration():
-            return ReadinessResult(ready=False, reason_code="invalid_sync_configuration")
-        if not _check_database():
+        if not check_database():
             return ReadinessResult(ready=False, reason_code="database_unavailable")
-        if not _check_migrations_applied():
+        if not check_schema_state():
             return ReadinessResult(ready=False, reason_code="migrations_pending")
     except Exception:  # noqa: BLE001 -- see comment above
         return ReadinessResult(ready=False, reason_code="unexpected_error")

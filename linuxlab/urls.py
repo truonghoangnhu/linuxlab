@@ -10,7 +10,9 @@ urlpatterns = [
     path("django-admin/", admin.site.urls),
     path("admin/", include(wagtailadmin_urls)),
     path("documents/", include(wagtaildocs_urls)),
+    path("health/", healthz, name="health"),
     path("healthz", healthz, name="healthz"),
+    path("ready/", readyz, name="ready"),
     path("readyz", readyz, name="readyz"),
     path("api/v1/learning/", include("linuxlab.learning.urls")),
     # Task 13: must precede wagtail_urls' catch-all page-serving route below.
