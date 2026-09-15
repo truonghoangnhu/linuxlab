@@ -30,6 +30,7 @@
 - Never expose bearer secrets, Authorization headers, private signing/trust material, DB passwords, raw sensitive responses or learner payloads through diagnostics, repr, logs or persisted failure fields. Only explicit issue/rotate may print a new secret once.
 - Keep A's fixed signing/trust paths and single-key trust model. No private key ships to Node; production never imports release-harness key machinery.
 - Preserve guest-first learning, anonymous progress local by default, exact immutable Activity versions, published package artifacts and server-side answer secrecy.
+- Plan Task 14 means Corrective B final verification only; it does not authorize the deferred project Task14.
 - No FA-M1 or Task-7 M2 cleanup. No Corrective C or Task14 work. Operator manuals, env documentation, libpq prose, checklist paths, release invocation prose, HTTP/backoff documentation and documentation-only contract tests are excluded.
 - No Celery, RabbitMQ, Kafka, microservices, distributed scheduler, generic policy engine, automatic provisioning/self-healing, dashboards or admin diagnostics UI.
 
@@ -37,14 +38,15 @@
 
 Planning baseline: `6a1d17ff6a88d7729e8c621624143352ab7e5c98` on
 `feature/phase1-learning-foundation`. This file is the only change made by
-plan authoring. At execution, begin Task 1 from the reviewed plan commit;
+plan authoring. Review-amendment baseline is
+`53613bb0e2336b577562ff9272d07c49397e6cb6`. At execution, begin Task 1 from the reviewed plan commit;
 subsequent tasks begin from the preceding cleared implementation commit.
 
 Execution is **Codex implementer → Claude independent exact-range review →
 ChatGPT adjudication → next task only after clearance**. No automatic continuation
 between tasks. Record each task's start and end full SHA, changed files,
-migrations, exact test counts, check results and concerns. Tasks 1–12 each end
-in one primary commit with a clean tree. Task 13 is verification only: no edit
+migrations, exact test counts, check results and concerns. Tasks 1–13 each end
+in one primary commit with a clean tree. Task 14 is verification only: no edit
 or commit. Review uses `git diff <start-sha>..<end-sha>` and the binding spec.
 
 Every task begins with `git rev-parse HEAD`, `git branch --show-current`,
@@ -78,14 +80,15 @@ unrelated edits.
 | 3 | New `linuxlab/sync/configuration.py`: typed/deferred policy; `linuxlab/settings/base.py`: safe setting decoding; `linuxlab/sync/outbox.py`: delegate old backoff bounds; `linuxlab/sync/management/commands/sync_events.py`: worker preflight; `linuxlab/sync/api.py`: typed inbound limits | New `linuxlab/sync/tests/test_configuration.py`; `linuxlab/sync/tests/test_task15_backoff_settings.py`; `linuxlab/sync/tests/test_task14_command.py`; `linuxlab/core/tests/test_settings_profiles.py`: configuration/import boundary |
 | 4 | `linuxlab/sync/models.py`: registration schema; new `linuxlab/sync/migrations/0005_registration_lifecycle_schema.py`, `0006_registration_lifecycle_data.py`, `0007_registration_lifecycle_constraints.py` | New `linuxlab/sync/tests/_migration_db.py`, `linuxlab/sync/tests/test_registration_migrations.py`; `linuxlab/sync/tests/test_task14_models.py`: historical migration/constraints |
 | 5 | `linuxlab/sync/authentication.py`, `linuxlab/sync/models.py`, `linuxlab/sync/api.py`, `linuxlab/sync/management/commands/manage_sync_node.py`: lifecycle authority | New `linuxlab/sync/tests/test_registration_concurrency.py`; modify `linuxlab/sync/tests/test_task14_authentication.py`, `test_task14_models.py`, `test_task14_api.py`, `test_task14_profiles.py`, `test_task14_ingestion.py`, `test_task14_processing.py`, `test_task14_e2e.py` in that same directory: lifecycle and explicitly authorized fixture provisioning |
-| 6 | `linuxlab/sync/contracts.py`, `linuxlab/sync/transports.py`: outcomes, Retry-After, safe HTTP | `linuxlab/sync/tests/test_task14_contracts.py`, `linuxlab/sync/tests/test_task14_transports.py`: transport/ACK contracts |
+| 6 | `linuxlab/sync/contracts.py`, `linuxlab/sync/transports.py`: outcomes, Retry-After, safe HTTP | `linuxlab/sync/tests/test_task14_contracts.py`, `linuxlab/sync/tests/test_task14_transports.py`: transport/ACK contracts; `linuxlab/sync/tests/test_task14_flush.py`: explicit protocol-error fixture metadata only |
 | 7 | `linuxlab/sync/models.py`; new `linuxlab/sync/migrations/0008_outbox_retry_state.py`, `0009_outbox_retry_age_data.py` | New `linuxlab/sync/tests/test_retry_migrations.py`; `linuxlab/sync/tests/test_task14_models.py`: persisted retry fields |
 | 8 | `linuxlab/sync/outbox.py`, `linuxlab/sync/management/commands/sync_events.py`; `scripts/release_gate/scenarios.py`: correct existing auth-failure scenario expectation | New `linuxlab/sync/tests/test_retry_policy.py`; modify `linuxlab/sync/tests/test_task14_outbox.py`, `test_task14_flush.py`, `test_task15_backoff_settings.py`, `test_task14_command.py`, `test_task14_e2e.py`, `test_retry_migrations.py`; `scripts/tests/test_release_gate_negative_scenarios.py`: retry/fencing/real auth outcome |
 | 9 | `linuxlab/sync/outbox.py`, `linuxlab/sync/management/commands/sync_events.py`: explicit reset | New `linuxlab/sync/tests/test_requeue.py`; `linuxlab/sync/tests/test_task14_command.py`: reset service/CLI |
 | 10 | New `linuxlab/core/local_diagnostics.py`, `linuxlab/publication/diagnostics.py`, `linuxlab/sync/diagnostics.py`; `linuxlab/core/diagnostics.py`; `linuxlab/core/apps.py`, `linuxlab/publication/apps.py`, `linuxlab/sync/apps.py`: provider composition; new `linuxlab/core/management/__init__.py`, `linuxlab/core/management/commands/__init__.py`, `linuxlab/core/management/commands/diagnose_deployment.py`: adapter | New `linuxlab/core/tests/test_local_diagnostics.py`, `linuxlab/core/tests/test_diagnose_deployment.py`, `linuxlab/publication/tests/test_diagnostics.py`, `linuxlab/sync/tests/test_diagnostics.py` |
 | 11 | `linuxlab/sync/api.py`, `linuxlab/sync/urls.py`; new `linuxlab/sync/probe.py`; `linuxlab/sync/diagnostics.py`, `linuxlab/core/management/commands/diagnose_deployment.py`: remote endpoint/client/mode | New `linuxlab/sync/tests/test_probe.py`; `linuxlab/sync/tests/test_diagnostics.py`, `linuxlab/core/tests/test_diagnose_deployment.py` |
-| 12 | `linuxlab/core/management/commands/diagnose_deployment.py`, `linuxlab/sync/diagnostics.py`; new `scripts/release_gate/diagnostics.py`; `scripts/release_gate/cli.py`, `scripts/release_gate/e2e_support.py`, `scripts/release_gate/actions.py`, `scripts/release_gate/scenarios.py`: canonical release consumption and existing registration evidence adaptation | New `scripts/tests/test_release_diagnostics.py`, `scripts/tests/test_release_diagnostics_integration.py`; modify `linuxlab/core/tests/test_diagnose_deployment.py`, `linuxlab/sync/tests/test_diagnostics.py`, `scripts/tests/test_release_gate_actions.py`, `scripts/tests/test_release_gate_gate_runner.py`, `scripts/tests/test_phase1_release_gate_cli.py` |
-| 13 | None | Existing and newly added suites, verification only |
+| 12 | New `linuxlab/core/release_diagnostics.py`: pure canonical release validator/error; `linuxlab/core/management/commands/diagnose_deployment.py`, `linuxlab/sync/diagnostics.py`: RELEASE policy/command | New `linuxlab/core/tests/test_release_diagnostics.py`; modify `linuxlab/core/tests/test_diagnose_deployment.py`, `linuxlab/sync/tests/test_diagnostics.py`: canonical semantics |
+| 13 | New `scripts/release_gate/diagnostics.py`: target-process bridge; `scripts/release_gate/cli.py`, `scripts/release_gate/e2e_support.py`, `scripts/release_gate/actions.py`, `scripts/release_gate/scenarios.py`: harness/startup and ACTIVE evidence | New `scripts/tests/test_release_diagnostics.py`, `scripts/tests/test_release_diagnostics_integration.py`; modify `scripts/tests/test_release_gate_actions.py`, `scripts/tests/test_release_gate_gate_runner.py`, `scripts/tests/test_phase1_release_gate_cli.py`: integration boundary |
+| 14 | None | Existing and newly added suites, verification only |
 
 Read-only anchors: `linuxlab/settings/central.py`, `node.py`, `test.py` keep
 existing profile capabilities; `linuxlab/publication/signing.py` and
@@ -274,6 +277,9 @@ auth callers but grants no previous-secret grace. `get_active_node_registration`
 raises NodeRegistrationError on zero and NodeRegistrationInvariantError on
 multiple ACTIVE; no choice by order. `registration_is_usable` validates UUID and
 supported usable Django password hash without modifying/upgrading it.
+NodeAuthenticationError retains the fixed message "authentication failed" and
+exposes no historical-state reason or state-dependent HTTP status. Credential
+failures map uniformly to 401 in the API; profile-disabled 403 stays separate.
 
 ### Transport and retry — Tasks 6 and 8
 
@@ -310,10 +316,20 @@ def requeue_outbox_message(event_id: UUID) -> OutboxMessage: ...
 upper-case constants as aliases of their enum members. TransportError retains
 safe string construction for existing fakes, adds `.failure: DeliveryFailure`,
 and never stores raw exceptions/response bodies. AuthTransportError maps auth,
-ProtocolTransportError maps permanent, TransientTransportError maps transient,
+ProtocolTransportError requires an explicit DeliveryFailure with no default
+category; TransientTransportError maps transient,
 RateLimitedTransportError subclasses TransientTransportError and maps rate-limit.
 RequestTooLargeError retains its subclass relationship and 413 split meaning;
 its metadata category is TRANSIENT_FAILURE with safe BATCH_TOO_LARGE code.
+RequestTooLargeError's constructor supplies that explicit failure to ProtocolTransportError.
+The exact protocol constructor is
+`ProtocolTransportError(message: str = "protocol failure", *, failure: DeliveryFailure)`.
+DeliveryFailure.category alone is authoritative for retry decisions, never the
+exception class or message. classify_http_failure(400) returns a protocol error
+with explicit PERMANENT_REJECTION. Malformed/missing/ambiguous ACK evidence,
+including conflicting duplicate ACKs, carries TRANSIENT_FAILURE. A valid
+per-event rejection with a rejection code remains PERMANENT_REJECTION for that
+event; bare 2xx never proves delivery. No second taxonomy is introduced.
 Task 8 turns the singleton case into PERMANENT_REJECTION once, without counting
 the same send twice.
 
@@ -324,7 +340,7 @@ Returned row is freshly loaded after the fenced write; None means stale claim.
 No caller may count the same failed send twice or reuse stale in-memory attempts.
 Requeue rejects invalid state with `OutboxRequeueError(ValueError)` from outbox.
 
-### Providers/probe/release — Tasks 10–12
+### Providers/probe/release — Tasks 10–13
 
 `CoreDiagnosticProvider`, `PublicationDiagnosticProvider`, `SyncDiagnosticProvider`
 implement Task 1's protocol in their mapped modules, with zero-argument
@@ -345,19 +361,21 @@ def probe_central(credentials: NodeCredentials, *, opener=None) -> CentralProbeR
 class SyncProbeView(View):
     def get(self, request): ...
 
-# scripts.release_gate.diagnostics, Task 12:
+# linuxlab.core.release_diagnostics, Task 12:
 class ReleaseDiagnosticsError(RuntimeError):
     pass
 
 def validate_release_diagnostics(stdout: str, returncode: int, *, context: DiagnosticContext, providers: Sequence[DiagnosticProvider]) -> DiagnosticReport: ...
+# scripts.release_gate.diagnostics, Task 13; imports the Task 12 validator/error:
 def run_release_diagnostics(profile_env: Mapping[str, str], *, expected_profile: Profile, repo_root: Path, fixture_key_paths: tuple[Path | None, Path | None] | None = None) -> DiagnosticReport: ...
+def target_release_diagnostics(expected_profile: Profile, *, fixture_key_paths: tuple[Path | None, Path | None] | None = None) -> int: ...
 ```
 
 Release validation derives requirements from canonical providers in the target
 Django process. `fixture_key_paths` is harness-only: existing isolated gate
 key fixtures, never a management-command/configuration override. The tuple is
 (Central signing path, Node trust path), only the matching profile's element
-may be populated. Task 12 defines the isolated bridge and transport of validated
+may be populated. Task 13 defines the isolated bridge and transport of validated
 output; the gate performs no key parsing or domain inspection.
 
 ## Verification Command Conventions
@@ -372,7 +390,7 @@ operator's production DB as a test fixture.
 
 For every configuration/model/URL/app-registration task, run these exact
 profile checks; migration tasks also run both drift checks. Drift checks are
-also run in Task 13:
+also run in Task 14:
 
 ```sh
 DJANGO_SETTINGS_MODULE=linuxlab.settings.central .venv/bin/python manage.py check
@@ -702,11 +720,26 @@ def lock_registration_scope(node_id):
   hash only, without password upgrade writes. Structural usability uses
   is_password_usable, identify_hasher and the supported hasher's decode method;
   malformed encoding produces safe failure, never a raw hash in an exception. Catch zero/multiple/unusable
-  authority as generic NodeAuthenticationError. Keep safe HTTP status on the
-  auth error (`http_status`, 401 default, 403 for revoked/no-active historical
-  scope); resolve this inside authentication, not a second API ORM authority.
-  `_authenticate_request` consumes this error and removes its enabled=False
-  lookup. Never leak raw hash, secret, headers, SQL or exception chain.
+  authority as generic NodeAuthenticationError("authentication failed").
+  Baseline evidence at 53613bb: linuxlab/sync/authentication.py:22
+  (NodeAuthenticationError) and authenticate_node
+  already use that identical message for unknown, disabled and wrong-secret
+  failures. linuxlab/sync/api.py:33 (_AUTH_FAILED_BODY) is {"detail": "authentication failed"};
+  _authenticate_request at api.py:57–71 performs an enabled=False existence query to
+  choose 403 instead of 401. That history-based distinction is not a safe
+  distinction to preserve under this review. Remove that lookup and map every
+  credential failure to generic 401, including unknown, zero ACTIVE, REVOKED,
+  SUPERSEDED, unusable or ambiguous authority. Keep the established unrelated
+  receive-capability/profile-disabled 403 in SyncEventsView.post (api.py:134). Do not move an
+  existence/status lookup into authentication. No state-dependent status field
+  on NodeAuthenticationError, detailed body/message/log, or raw exception chain.
+- [ ] Test unknown node and historical-only revoked/superseded/zero-ACTIVE
+  nodes with non-authenticating credentials: identical 401 and exact generic
+  body; identical safe service exception text and no historical-state details
+  in stdout/stderr/repr/logs. Test wrong secret and malformed credentials too.
+  Replace baseline disabled-node 403 assertions with uniform credential 401;
+  retain profile-disabled 403 assertions. Assert no extra history query solely
+  to select status, and no raw hash, secret, Authorization header or SQL leak.
 - [ ] Remove grace_period/--grace-hours. CLI UUID parsers feed logical UUIDs;
   optional `issue --node-id` permits explicit zero-ACTIVE replacement.
   `IssuedNodeCredential` remains `(node_id, secret)` with secret repr=False.
@@ -745,7 +778,7 @@ def lock_registration_scope(node_id):
 **Files:**
 - Create: none.
 - Modify: `linuxlab/sync/contracts.py`, `linuxlab/sync/transports.py`.
-- Test: `linuxlab/sync/tests/test_task14_contracts.py`, `linuxlab/sync/tests/test_task14_transports.py`.
+- Test: `linuxlab/sync/tests/test_task14_contracts.py`, `linuxlab/sync/tests/test_task14_transports.py`; `linuxlab/sync/tests/test_task14_flush.py` only to adapt existing protocol-error constructor fixtures.
 
 **Interfaces:**
 - Consumes: existing SyncTransport.send_batch, BatchAck/EventAck/ACK parser, urllib.
@@ -766,19 +799,31 @@ def test_429_carries_semantic_retry_after():
 
 - [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/sync/tests/test_task14_transports.py::test_429_carries_semantic_retry_after -q`; record RED missing semantic classifier.
 - [ ] Implement the enum/metadata and error hierarchy in contracts. Preserve
-  existing fake transport error construction with a safe fixed default message;
+  safe fixed messages for existing fake transports; update protocol-error fakes
+  to pass the mandatory explicit failure argument. In test_task14_flush.py,
+  existing HTTP-400/request-rejected fakes carry PERMANENT_REJECTION metadata;
+  preserve their pre-Task-8 worker assertions in this constructor-only update;
   `.failure` is generated from explicit safe fields, not parsed from message.
   Reject SUCCESS as a DeliveryFailure category. Map status as follows:
 
 ```python
 # classify_http_failure returns an error; the caller raises it.
-# 400 -> ProtocolTransportError(PERMANENT_REJECTION)
+# 400 -> ProtocolTransportError(failure=DeliveryFailure(SyncOutcome.PERMANENT_REJECTION, http_status=400))
 # 401/403 -> AuthTransportError(AUTH_OR_REGISTRATION_FAILURE)
 # 413 -> RequestTooLargeError (existing bounded split signal)
 # 429 -> RateLimitedTransportError(RATE_LIMITED, parsed retry_after)
 # 408/5xx/other unknown non-2xx -> TransientTransportError(TRANSIENT_FAILURE)
 ```
 
+  ProtocolTransportError has no default category. HTTP 400 constructs it with
+  failure=DeliveryFailure(SyncOutcome.PERMANENT_REJECTION, http_status=400).
+  Response-protocol failures without permanent-rejection evidence construct it
+  with explicit TRANSIENT_FAILURE, including malformed/missing ACK, malformed
+  JSON and ambiguous/conflicting duplicates. Per-event valid rejection with a
+  code stays permanent for that event only; rejected-without-code is unconfirmed.
+  Preserve valid per-event ACK evidence in partial batches: missing/ambiguous
+  entries produce transient metadata only for the unconfirmed events, not
+  batch-wide rejection of independently valid accepted/duplicate ACKs.
   Successful HTTP response still returns parsed BatchAck. Network/DNS/TLS/
   timeout/OSError become fixed transient failure, never `str(exc)`. Use a
   no-redirect urllib opener (`HTTPRedirectHandler.redirect_request` returns
@@ -793,6 +838,11 @@ def test_429_carries_semantic_retry_after():
 - [ ] Rerun focused test GREEN; cover each status, network/TLS/timeout, unknown
   code, redirects with a spy proving zero second-origin Authorization,
   delta/date/negative/expired/malformed/excessive Retry-After and missing ACK.
+  Add explicit cases asserting HTTP 400 ProtocolTransportError.failure.category
+  is PERMANENT_REJECTION, while malformed ACK ProtocolTransportError carries
+  TRANSIENT_FAILURE. Missing ACK and conflicting duplicate ACK evidence each
+  produce TRANSIENT_FAILURE for unconfirmed events. Assert a protocol error
+  without the required failure argument is rejected, not defaulted permanent.
   Existing ACK ambiguity tests must still pass: rejected-without-code,
   duplicate/conflicting entries and malformed JSON do not imply delivery.
   Assert stdout/stderr/log/repr/error metadata never expose sentinels for secret,
@@ -918,8 +968,10 @@ def retry_budget_remaining(attempts, first_failure_at, *, policy, now):
   resurrect an expired/terminal row. Network calls stay outside transactions.
 - [ ] Update `_send_claimed_rows`: map typed failures to record_delivery_failure,
   no HTTP-number checks in retry policy. Remove 400 bisection and twice-cap
-  helper; protocol failure terminalizes attempted rows. Auth failure also
-  terminalizes. Existing `release_transient` and `release_auth_failure` remain
+  helper; consume error.failure.category exclusively for retry policy, never
+  isinstance(ProtocolTransportError) or another Python exception class. Explicit
+  permanent category terminalizes attempted rows; transient protocol/ACK
+  evidence retries within budget. Auth category also terminalizes. Existing `release_transient` and `release_auth_failure` remain
   thin wrappers for callers, delegating counting/policy. `mark_dead_letter`
   delegates permanent failure recording for a failed delivery; avoid double
   counting at its call sites. Accepted/duplicate ACKs mark only their exact
@@ -953,7 +1005,12 @@ def retry_budget_remaining(attempts, first_failure_at, *, policy, now):
   only claimed event UUIDs and states: exhausted rows are dead_letter/unclaimed,
   nonexhausted due rows are claimed. Close the child before scratch teardown.
   Add real separate-connection stale-result/reclaim tests, insertion-free
-  terminalization, multi-413 accounting and mixed ACK outcomes. Replace baseline
+  terminalization, multi-413 accounting and mixed ACK outcomes. In test_task14_flush.py,
+  parameterize the SAME ProtocolTransportError class with permanent vs transient
+  DeliveryFailure: HTTP 400 becomes dead_letter; malformed ACK remains pending
+  within budget. Assert one increment and the embedded persisted category for
+  each. Missing ACK and conflicting duplicate ACK remain transient/pending;
+  valid rejected-with-code is permanent for that event, bare 2xx not delivered. Replace baseline
   unlimited/auth-released/singleton-400 expectations instead of duplicating them.
   Secret sentinels must be absent from DB failure fields, repr, stdout/stderr,
   JSON/log output and raw-body/header-derived errors.
@@ -1138,7 +1195,7 @@ for model, values in before.items():
   in sync URLs beside events before catch-all. Check receive capability first;
   parse same headers and use same `_authenticate_request`/authenticate_node as
   ingestion. GET returns fixed 200 body; malformed/missing/rejected credential
-  returns safe 401/403. Wrong profile 403. Other methods 405. No session login,
+  returns generic 401 per Task 5. Wrong profile retains unrelated 403. Other methods 405. No session login,
   password-hash upgrade, event ingestion or persistent state write.
 - [ ] Implement probe_central: build configured URL plus `/api/v1/sync/probe/`,
   GET with headers only, no query/body secrets, no-redirect urllib opener,
@@ -1170,6 +1227,10 @@ for model, values in before.items():
   408/429/5xx, DNS/TLS/timeout, redirects with no forwarded secret, bad/oversize
   body and 30-second timeout assertion. Compare full DB/session rows and retry
   metadata before/after both server and client diagnostic success/failure.
+  Unknown and historical-only revoked/superseded nodes must return identical
+  401/body with no sensitive reason text/state in logs or repr. Client tests
+  accept either upstream 401 or 403 as reachable=True, accepted=False without
+  inferring registration existence. Profile-disabled 403 remains independent.
   Assert zero key/credential creation, no sync retry, readiness unchanged while
   opener fails. Sentinel assertions cover stdout/stderr/repr/JSON/logs and DB
   failures, including exception bodies containing token/Authorization values.
@@ -1179,16 +1240,16 @@ for model, values in before.items():
   Stage only Files paths; commit `feat: add read-only Central sync probe`.
   Record clean end/range and stop for review/adjudication.
 
-### Task 12: RELEASE Diagnostics + Release-Gate Integration
+### Task 12: RELEASE Diagnostics + Canonical Release Validation
 
 **Files:**
-- Create: `scripts/release_gate/diagnostics.py`.
-- Modify: `linuxlab/core/management/commands/diagnose_deployment.py`, `linuxlab/sync/diagnostics.py`, `scripts/release_gate/cli.py`, `scripts/release_gate/e2e_support.py`, `scripts/release_gate/actions.py`, `scripts/release_gate/scenarios.py`.
-- Test: create `scripts/tests/test_release_diagnostics.py`, `scripts/tests/test_release_diagnostics_integration.py`; modify `linuxlab/core/tests/test_diagnose_deployment.py`, `linuxlab/sync/tests/test_diagnostics.py`, `scripts/tests/test_release_gate_actions.py`, `scripts/tests/test_release_gate_gate_runner.py`, `scripts/tests/test_phase1_release_gate_cli.py`.
+- Create: `linuxlab/core/release_diagnostics.py`.
+- Modify: `linuxlab/core/management/commands/diagnose_deployment.py`, `linuxlab/sync/diagnostics.py`.
+- Test: create `linuxlab/core/tests/test_release_diagnostics.py`; modify `linuxlab/core/tests/test_diagnose_deployment.py`, `linuxlab/sync/tests/test_diagnostics.py`.
 
 **Interfaces:**
-- Consumes: core canonical contracts/orchestration, module providers, sync typed release policy, probe; existing dual_deployment lifecycle and gate StartupError.
-- Produces: both release helper signatures in the ledger; RELEASE command semantics. Existing `scripts/phase1_release_gate.py`, `run_release_gate` signature, evidence schema and exit-code algebra are preserved.
+- Consumes: core report contract/orchestration, provider requirements, typed release policy and cleared remote probe.
+- Produces: RELEASE command semantics; ReleaseDiagnosticsError and pure validate_release_diagnostics from the ledger in linuxlab.core.release_diagnostics. No harness integration in this task.
 
 - [ ] Write `test_release_validator_rejects_missing_required_code` with an
   explicit context and pure fake provider implementing Task 1 protocol:
@@ -1208,7 +1269,7 @@ def test_release_validator_rejects_missing_required_code():
         validate_release_diagnostics(text, 0, context=context, providers=(RequiredTrustProvider(),))
 ```
 
-- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_release_diagnostics.py::test_release_validator_rejects_missing_required_code -q`; record missing release helper RED.
+- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/core/tests/test_release_diagnostics.py::test_release_validator_rejects_missing_required_code -q`; record missing release helper RED.
 - [ ] Enable RELEASE in the management command. In SyncDiagnosticProvider,
   canonical purpose=release configuration decides requirements: Node policy
   false omits both remote checks, true requires both and probe prerequisites;
@@ -1222,7 +1283,57 @@ def test_release_validator_rejects_missing_required_code():
   codes come from `required_check_codes(context, providers)` and never from the
   supplied report. Pass raw stdout into `validate_diagnostic_report` so core
   performs duplicate-member-safe JSON decoding; no script aggregation,
-  HTTP mapping, model query or human-message parsing. WARN passes.
+  HTTP mapping, model query or human-message parsing. WARN passes. Translate
+  DiagnosticContractError to ReleaseDiagnosticsError with fixed safe text and
+  suppressed raw exception context; reject context.mode != "release" explicitly.
+- [ ] Rerun focused test GREEN. Add boundary tests for PASS/WARN acceptance,
+  FAIL rejection, malformed JSON/duplicate members, unsupported/bool schema,
+  wrong profile/mode, missing/duplicate/invalid codes/status, nonzero returncode,
+  oversized output and inconsistent overall status. Human message changes do
+  not change validation. Pure fake providers supply required codes; core never
+  imports sync/publication internals or performs HTTP/model inspection.
+- [ ] Command/provider tests cover Node policy=false omitting remote checks,
+  true requiring both checks and prerequisites, Central ignoring Node policy,
+  malformed policy failing closed, disabled sync selection, policy=true with
+  offline/rejecting Central, and policy=false offline success. Assert no CLI
+  override, local readiness unchanged, no DB/file mutations. Inject secrets,
+  private keys, passwords, Authorization and raw-body sentinels: none appear in
+  stdout/stderr/JSON/log/repr or persisted failure fields. No subprocess bridge
+  or release-harness startup changes belong to this commit.
+- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/core/tests/test_release_diagnostics.py linuxlab/core/tests/test_diagnose_deployment.py linuxlab/sync/tests/test_diagnostics.py -q`, then `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/core/tests linuxlab/sync/tests/test_probe.py linuxlab/sync/tests/test_diagnostics.py -q`.
+- [ ] Run `.venv/bin/ruff check linuxlab/core/release_diagnostics.py linuxlab/core/management/commands/diagnose_deployment.py linuxlab/sync/diagnostics.py linuxlab/core/tests/test_release_diagnostics.py linuxlab/core/tests/test_diagnose_deployment.py linuxlab/sync/tests/test_diagnostics.py`, `.venv/bin/ruff check .`, both profile and drift checks.
+- [ ] Run `git diff --check`; self-review spec §§5,6,8 and canonical policy/code
+  completeness. Stage only Files paths; commit `feat: add canonical release diagnostics`.
+  Record clean end/range and stop for review/adjudication. Task 13 may begin
+  only after independent review clearance of this commit.
+
+### Task 13: Release-Gate / Harness Integration
+
+**Files:**
+- Create: `scripts/release_gate/diagnostics.py`.
+- Modify: `scripts/release_gate/cli.py`, `scripts/release_gate/e2e_support.py`, `scripts/release_gate/actions.py`, `scripts/release_gate/scenarios.py`.
+- Test: create `scripts/tests/test_release_diagnostics.py`, `scripts/tests/test_release_diagnostics_integration.py`; modify `scripts/tests/test_release_gate_actions.py`, `scripts/tests/test_release_gate_gate_runner.py`, `scripts/tests/test_phase1_release_gate_cli.py`.
+
+**Interfaces:**
+- Consumes: cleared Task 12 linuxlab.core.release_diagnostics validator/error, core context/provider APIs, existing dual_deployment and StartupError.
+- Produces: run_release_diagnostics and target_release_diagnostics, fixture-only diagnose-release action and startup integration. No application RELEASE semantics change.
+
+- [ ] Write `test_target_bridge_rejects_missing_required_code` using a Node
+  target process and existing isolated fixture setup. Replace its inner command
+  runner at the subprocess boundary to return an otherwise valid canonical
+  report missing a required TRUST_KEY; do not fake the canonical validator.
+
+```python
+# Integration fixture configures the target Node and its canonical providers.
+with pytest.raises(ReleaseDiagnosticsError):
+    run_release_diagnostics(profile_env, expected_profile="node", repo_root=repo_root,
+                            fixture_key_paths=(None, trust_path))
+```
+
+- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_release_diagnostics.py::test_target_bridge_rejects_missing_required_code -q`; record RED missing bridge, not a fixture/database failure.
+- [ ] Import validate_release_diagnostics and ReleaseDiagnosticsError from
+  linuxlab.core.release_diagnostics. Keep canonical policy and validator code
+  unchanged. Implement the harness bridge using those cleared interfaces.
 - [ ] Implement the exact target-process bridge below so deployment policy
   validation is not reconstructed by the outer gate process's Central settings:
 
@@ -1267,8 +1378,9 @@ run_release_diagnostics(profile_env, expected_profile, repo_root, fixture_key_pa
   supplies its already-created key paths; no fixture setup or key generation
   runs in diagnostics. Do not expose secrets/paths in command failures.
 - [ ] Bound command child timeout to 60 seconds and supervisor to 120 seconds;
-  capture output through bounded reads, fail if stdout exceeds 65536 bytes,
-  discard raw stderr after a fixed safe error. Do not reuse `run_action`'s
+  capture output through bounded reads; stdout and stderr each have a 65536-byte
+  ceiling. Fail on overflow of either stream, drain concurrently to avoid pipe
+  deadlock, and discard raw stderr after a fixed safe error. Do not reuse `run_action`'s
   last-line JSON parsing/error echo. Treat crash/timeout/nonzero/malformed output
   as ReleaseDiagnosticsError with fixed message/code; no raw stdout/stderr,
   env, authorization, key material or response text in exception/repr/logs.
@@ -1287,7 +1399,7 @@ run_release_diagnostics(profile_env, expected_profile, repo_root, fixture_key_pa
   preserve this mapping and cleanup precedence without modifying its authority
   machinery. `wait_ready` remains local `/readyz`; `_run_validation_checks`
   remains separate model/drift checks. Verify the real factory invokes
-  both canonical checks and failure maps to exit 3 with cleanup intact.
+  both canonical checks and failure maps to STARTUP_FAILURE (exit 3) with cleanup intact.
 - [ ] Adapt existing registration evidence: actions.find_node_registration
   calls sync.authentication.get_active_node_registration, returns None for
   zero ACTIVE, propagates invariant error; no `.first()`/direct registration
@@ -1295,10 +1407,11 @@ run_release_diagnostics(profile_env, expected_profile, repo_root, fixture_key_pa
   of legacy enabled. Keep existing evidence proof/assertion names and schema.
   These reads are separate E2E evidence, never diagnostic remediation. No
   direct signing/trust/auth/HTTP inspection in the release validator.
-- [ ] Rerun focused test GREEN. Matrix tests include supported PASS/WARN,
-  overall FAIL, malformed JSON, unsupported/bool schema, wrong profile/mode,
-  duplicate JSON members/check codes, required missing check, invalid status,
-  command crash/timeout/nonzero, inconsistent aggregate and message changes.
+- [ ] Rerun focused test GREEN. Integration tests corrupt inner command stdout
+  (malformed JSON, missing/duplicate required codes, wrong profile/mode), force
+  nonzero/crash/timeout and verify the cleared canonical validator rejects them.
+  Test WARN passes and FAIL maps to startup failure without reimplementing
+  Task 12 policy or validator semantics.
   Integrations use two real isolated DB/profile processes and fixture keys;
   require_probe=false with Central stopped gives local-ready and local RELEASE
   success; true gives local-ready but remote/gate FAIL; rejected credential
@@ -1309,21 +1422,22 @@ run_release_diagnostics(profile_env, expected_profile, repo_root, fixture_key_pa
   Inject secret/private-key/password/Authorization/raw-body sentinels into
   command failures and verify absence in stdout/stderr/JSON/repr/logs, existing
   release evidence and DB error fields.
-- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_release_diagnostics.py scripts/tests/test_release_diagnostics_integration.py linuxlab/core/tests/test_diagnose_deployment.py linuxlab/sync/tests/test_diagnostics.py -q`, then `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests linuxlab/core/tests linuxlab/sync/tests/test_probe.py -q`.
-- [ ] Run `.venv/bin/ruff check scripts/release_gate/diagnostics.py scripts/release_gate/cli.py scripts/release_gate/e2e_support.py scripts/release_gate/actions.py scripts/release_gate/scenarios.py scripts/tests/test_release_diagnostics.py scripts/tests/test_release_diagnostics_integration.py linuxlab/sync/diagnostics.py linuxlab/core/management/commands/diagnose_deployment.py`, `.venv/bin/ruff check .`, both profile and drift checks.
-- [ ] Run `git diff --check`; review spec §§5,7,8 and unchanged release evidence
-  schema/exit algebra. Stage only Files paths; commit
-  `feat: gate releases on canonical diagnostics`. Record clean end/range and
-  stop for review/adjudication.
+- [ ] Run `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests/test_release_diagnostics.py scripts/tests/test_release_diagnostics_integration.py scripts/tests/test_release_gate_actions.py scripts/tests/test_release_gate_gate_runner.py scripts/tests/test_phase1_release_gate_cli.py -q`, then `env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest scripts/tests linuxlab/core/tests/test_release_diagnostics.py linuxlab/core/tests/test_diagnose_deployment.py -q`.
+- [ ] Run `.venv/bin/ruff check scripts/release_gate/diagnostics.py scripts/release_gate/cli.py scripts/release_gate/e2e_support.py scripts/release_gate/actions.py scripts/release_gate/scenarios.py scripts/tests`, `.venv/bin/ruff check .`, both profile and drift checks.
+- [ ] Run `git diff --check`; self-review spec §8, target-profile execution,
+  unchanged evidence schema/exit algebra and cleanup. Stage only Files paths;
+  commit `feat: integrate canonical diagnostics with release gate`. Record clean
+  end/range and stop for review/adjudication. Plan Task 14 requires independent
+  review clearance of this integration commit.
 
-### Task 13: Integrated Verification / Corrective B Final Gate
+### Task 14: Integrated Verification / Corrective B Final Gate
 
 **Files:** none. **Interfaces:** consume all completed behavior; produce only an
 execution report. No edits, no commits, no automatic fixes in this task. If a
 check fails, report the exact failing HEAD/test and return it to adjudication;
 do not hide it with skipped tests or fold a fix into verification.
 
-- [ ] Require exact reviewed Task 12 HEAD and clean tree; record full SHA,
+- [ ] Require exact reviewed Task 13 HEAD and clean tree; record full SHA,
   branch and `git diff --check` result. Snapshot residual DB names using the
   read-only query below before tests, so pre-existing user databases are never
   mistaken for this run's residue. Credentials stay in environment.
@@ -1342,7 +1456,7 @@ PY
 - [ ] Run focused core diagnostics/readiness/command tests:
 
 ```sh
-env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/core/tests/test_diagnostics.py linuxlab/core/tests/test_health.py linuxlab/core/tests/test_local_diagnostics.py linuxlab/core/tests/test_diagnose_deployment.py -q
+env -u DJANGO_SETTINGS_MODULE .venv/bin/pytest linuxlab/core/tests/test_diagnostics.py linuxlab/core/tests/test_health.py linuxlab/core/tests/test_local_diagnostics.py linuxlab/core/tests/test_diagnose_deployment.py linuxlab/core/tests/test_release_diagnostics.py -q
 ```
 
 - [ ] Run registration, PostgreSQL concurrency and actual migrations:
@@ -1382,7 +1496,7 @@ DJANGO_SETTINGS_MODULE=linuxlab.settings.node .venv/bin/python manage.py makemig
   produces ignored evidence artifacts, preserve its existing cleanup policy;
   no tracked/untracked repository changes may remain.
 - [ ] Run `git rev-parse HEAD`, `git branch --show-current`, `git status --short`,
-  `git diff --check`; require unchanged exact Task 12 SHA and clean branch.
+  `git diff --check`; require unchanged exact Task 13 SHA and clean branch.
   Report all commands, exact results, migration names and review concerns.
   **NO COMMIT.** Stop for independent final verification review/adjudication.
 
@@ -1391,29 +1505,29 @@ DJANGO_SETTINGS_MODULE=linuxlab.settings.node .venv/bin/python manage.py makemig
 | Binding spec section | Implementation/review responsibility |
 |---|---|
 | §§1–2 authority, scope, concrete names | Global Constraints, File Responsibility Map, all task review boundaries |
-| §3 hybrid readiness | Task 2; fresh-process config regression Task 3; offline release Task 12 |
-| §4 diagnostic contract, ownership, read-only, limits | Tasks 1 and 10; mutation/secrecy tests Tasks 10–12 |
+| §3 hybrid readiness | Task 2; fresh-process config regression Task 3; offline release Tasks 12–13 |
+| §4 diagnostic contract, ownership, read-only, limits | Tasks 1 and 10; mutation/secrecy tests Tasks 10–13 |
 | §5 capabilities/modes/command | Tasks 10–12; typed source Task 3 |
 | §6 typed deployment policy | Task 3; capability failures Tasks 8,10,12 |
 | §7 dedicated remote probe | Task 11; policy consumption Task 12 |
-| §8 thin release gate | Task 12; full verification Task 13 |
+| §8 thin release gate | Task 12 canonical validation; Task 13 harness integration; full verification Task 14 |
 | §§9–11 registration identity/lifecycle/migration | Tasks 4–5; diagnostic inventory Task 10 |
 | §12 semantic transport/ACK | Task 6; consumer behavior and 413 budget Task 8 |
 | §13 persisted retry/legacy migration | Task 7; actual migrated-row eligibility Task 8 |
 | §14 finite budget, jitter, Retry-After | Task 8, consuming Task 6 metadata |
 | §15 worker/fencing/requeue | Tasks 8–9; no new DomainEvent enforced Task 9 |
-| §16 behavioral verification | Every focused/broader test checklist; integrated Task 13 |
-| §17 rollout dependency order | Tasks 1–13, with explicit schema/behavior review boundary clarifications |
+| §16 behavioral verification | Every focused/broader test checklist; integrated Task 14 |
+| §17 rollout dependency order | Tasks 1–14, with explicit schema/behavior review boundary clarifications |
 | §18 deferred scope | Global Constraints only; no implementation tasks for excluded work |
-| §19 acceptance invariants | Global Constraints; per-task self-review and Task 13 |
+| §19 acceptance invariants | Global Constraints; per-task self-review and Task 14 |
 | §20 self-review conclusion | This plan's consistency audit and each independent review |
 
 ## Plan Consistency and Review Audit
 
-The 12 implementation commits isolate contract, local HTTP semantics, typed
+The 13 implementation commits isolate contract, local HTTP semantics, typed
 configuration, registration schema, registration services, transport taxonomy,
-retry schema, retry behavior, reset, local providers, remote probe and release
-consumption. Task 13 tests the integrated exact HEAD without modifying it.
+retry schema, retry behavior, reset, local providers, remote probe, canonical release validation and harness
+integration. Task 14 tests the integrated exact HEAD without modifying it.
 Schema tasks exercise real forward historical migrations in independently
 created scratch DBs; the application DB is never rewound through an irreversible
 migration. Migration chain is 0004 → 0005 → 0006 → 0007 → 0008 → 0009; only
@@ -1440,10 +1554,23 @@ commit is represented as the final Corrective B runtime release.
 
 Task 8 is one cohesive state-machine review: splitting counting, fencing and
 selection across independently accepted behavior commits would leave unsafe
-retry paths. Task 12 is one cohesive trust-boundary review: command invocation,
-canonical requirement validation and gate failure mapping are verified together.
+retry paths. Task 12 reviews application RELEASE selection and pure canonical
+validation. Task 13 consumes its cleared interfaces and separately reviews
+process execution, harness startup/failure mapping and cleanup. Each ends in its
+own clean commit and independent review clearance before the next starts.
+The Task 6 fixture-only constructor update keeps the transport commit testable
+before Task 8 replaces worker scheduling semantics.
 Their focused suites precede broader regressions; neither includes unrelated
-refactoring or evidence-schema redesign.
+refactoring or evidence-schema redesign. There are 14 plan tasks in total.
+Plan Task 14 is verification only, not the deferred project Task14 work.
+
+Transport retry authority is DeliveryFailure.category, never the Python
+exception class. ProtocolTransportError requires explicit metadata: HTTP 400
+is permanent, malformed/missing/ambiguous ACK evidence is transient. Task 8
+proves the same exception class drives different outcomes solely from category.
+Authentication preserves generic safe error text and removes the baseline
+history-dependent API status lookup; all credential failures are 401 while
+profile-disabled 403 remains unrelated to registration history.
 
 No architectural question is delegated to the implementer. New findings that
 make the approved spec literally impossible must stop execution with exact
