@@ -419,6 +419,17 @@ INBOX_STATE_CHOICES = [
 ]
 
 
+REGISTRATION_ACTIVE = "active"
+REGISTRATION_SUPERSEDED = "superseded"
+REGISTRATION_REVOKED = "revoked"
+
+REGISTRATION_STATE_CHOICES = [
+    (REGISTRATION_ACTIVE, "Active"),
+    (REGISTRATION_SUPERSEDED, "Superseded"),
+    (REGISTRATION_REVOKED, "Revoked"),
+]
+
+
 class NodeRegistration(ImmutableArtifact):
     """Central-issued, Central-owned Node identity and credential state
     (T14-D18, T14-D19, T14-D23, T14-D28). `node_id`/`display_name`/
@@ -429,7 +440,10 @@ class NodeRegistration(ImmutableArtifact):
     -- never through ordinary save()/QuerySet.update(). Never stores
     plaintext; only Django password hashes (T14-D19, T14-D37)."""
 
-    node_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    node_id = models.UUIDField(default=uuid.uuid4, db_index=True, editable=False)
+    state = models.CharField(
+        max_length=10, choices=REGISTRATION_STATE_CHOICES, default=REGISTRATION_REVOKED
+    )
     display_name = models.CharField(max_length=255)
     current_secret_hash = models.TextField()
     previous_secret_hash = models.TextField(blank=True, default="")
@@ -440,7 +454,19 @@ class NodeRegistration(ImmutableArtifact):
     revoked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta(ImmutableArtifact.Meta):
-        pass
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            models.CheckConstraint(
+                condition=Q(
+                    state__in=[REGISTRATION_ACTIVE, REGISTRATION_SUPERSEDED, REGISTRATION_REVOKED]
+                ),
+                name="node_registration_state_allowed_values",
+            ),
+            models.UniqueConstraint(
+                fields=["node_id"],
+                condition=Q(state=REGISTRATION_ACTIVE),
+                name="unique_active_node_registration_per_node",
+            ),
+        ]
 
 
 class OutboxMessage(ImmutableArtifact):

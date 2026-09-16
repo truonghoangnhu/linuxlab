@@ -20,6 +20,9 @@ from linuxlab.sync.models import (
     OUTBOX_DELIVERED,
     OUTBOX_IN_FLIGHT,
     OUTBOX_PENDING,
+    REGISTRATION_ACTIVE,
+    REGISTRATION_REVOKED,
+    REGISTRATION_SUPERSEDED,
     InboxMessage,
     NodeRegistration,
     OutboxMessage,
@@ -80,12 +83,33 @@ def _make_inbox_message(**overrides):
 # --- NodeRegistration --------------------------------------------------------
 
 
-def test_node_registration_node_id_is_unique():
+def test_node_registration_only_active_node_id_is_unique():
     node_id = uuid.uuid4()
-    _make_node_registration(node_id=node_id)
+    _make_node_registration(node_id=node_id, state=REGISTRATION_ACTIVE)
+    _make_node_registration(node_id=node_id, state=REGISTRATION_REVOKED)
+    _make_node_registration(node_id=node_id, state=REGISTRATION_SUPERSEDED)
 
     with pytest.raises(IntegrityError), transaction.atomic():
-        _make_node_registration(node_id=node_id)
+        _make_node_registration(node_id=node_id, state=REGISTRATION_ACTIVE)
+
+
+def test_registration_schema_retains_logical_identity_and_safe_default():
+    row = _make_node_registration()
+    assert row.state == REGISTRATION_REVOKED
+    assert isinstance(row.node_id, uuid.UUID)
+    identity = NodeRegistration._meta.get_field("node_id")
+    assert identity.db_index and not identity.unique and not identity.editable
+    assert identity.default is uuid.uuid4
+    state = NodeRegistration._meta.get_field("state")
+    assert state.max_length == 10 and not state.null
+    assert {value for value, _label in state.choices} == {"active", "superseded", "revoked"}
+    assert "public_id" not in {field.name for field in NodeRegistration._meta.fields}
+
+
+@pytest.mark.parametrize("state", [None, "invalid"])
+def test_registration_database_rejects_invalid_state(state):
+    with pytest.raises(IntegrityError), transaction.atomic():
+        _make_node_registration(state=state)
 
 
 def test_node_registration_ordinary_create_is_blocked():
