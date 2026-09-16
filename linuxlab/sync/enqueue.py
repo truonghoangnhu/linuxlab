@@ -13,11 +13,15 @@ submit_attempt() (both immediately after Result.objects.create(), in the
 same transaction). No other event type is registered/syncable.
 """
 
+import logging
 import uuid
 
+from .configuration import DeferredSyncSettingError, parse_sync_setting
 from .contracts import SyncEventContract, WireEventEnvelope
 from .models import OutboxMessage, _insert_immutable_row
 from .registry import get_current_sync_event_contract, register_sync_event_contract
+
+logger = logging.getLogger(__name__)
 
 
 class SyncConfigurationError(Exception):
@@ -32,7 +36,8 @@ def enqueue_sync_event(domain_event, *, node_id, sync_enabled):
     caller must invoke this itself, in the same transaction.atomic()
     block that recorded the domain mutation and domain_event.
 
-    Returns None (a safe no-op) if sync is disabled, or if
+    Returns None if optional sync admission is malformed (with a safe
+    operator warning), if sync is disabled, or if
     domain_event.event_type has no registered contract (LOCAL-ONLY by
     default, T14-D20). Raises SyncConfigurationError if sync is enabled
     but node_id is missing/falsy -- a configuration error must never
@@ -40,7 +45,13 @@ def enqueue_sync_event(domain_event, *, node_id, sync_enabled):
     revoked secret is a transport-layer concern (see authentication.py/
     transports.py), never a reason to refuse local enqueue.
     """
-    if not sync_enabled:
+    admission = parse_sync_setting("LINUXLAB_SYNC_ENABLED", sync_enabled)
+    if isinstance(admission, DeferredSyncSettingError):
+        # Isolate only optional admission. Keep the original setting invalid
+        # for strict consumers; do not catch serialization or database errors.
+        logger.warning("SYNC_ENQUEUE_SKIPPED_INVALID_ENABLED: optional sync export skipped.")
+        return None
+    if not admission:
         return None
 
     contract = get_current_sync_event_contract(domain_event.event_type)
