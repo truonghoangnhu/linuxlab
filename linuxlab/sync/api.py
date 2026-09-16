@@ -17,7 +17,6 @@ import json
 import uuid
 from datetime import datetime
 
-from django.conf import settings
 from django.http import JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -25,6 +24,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .authentication import NodeAuthenticationError, authenticate_node
 from .capabilities import can_receive_sync_events
+from .configuration import SyncConfigurationError, load_inbound_limits
 from .contracts import WireEventEnvelope
 from .ingestion import ingest_event
 from .models import NodeRegistration
@@ -135,7 +135,12 @@ class SyncEventsView(View):
         if node is None:
             return JsonResponse(_AUTH_FAILED_BODY, status=error_status)
 
-        if len(request.body) > settings.LINUXLAB_SYNC_BATCH_MAX_BYTES:
+        try:
+            max_events, max_bytes = load_inbound_limits()
+        except SyncConfigurationError:
+            return JsonResponse({"detail": "sync configuration unavailable"}, status=503)
+
+        if len(request.body) > max_bytes:
             return JsonResponse({"detail": "request too large"}, status=413)
 
         try:
@@ -147,7 +152,7 @@ class SyncEventsView(View):
             return JsonResponse({"detail": "malformed batch"}, status=400)
 
         events = parsed["events"]
-        if len(events) > settings.LINUXLAB_SYNC_BATCH_MAX_EVENTS:
+        if len(events) > max_events:
             return JsonResponse({"detail": "too many events"}, status=413)
 
         try:

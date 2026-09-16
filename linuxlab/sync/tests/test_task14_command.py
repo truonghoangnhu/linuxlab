@@ -168,3 +168,34 @@ def test_protocol_fault_pauses_longer_than_idle_and_warns_operator(settings):
 
     sleep_mock.assert_called_with(60)
     assert "malformed" in command.stderr.getvalue().lower()
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("LINUXLAB_SYNC_ENABLED", "SECRET_SENTINEL"),
+        ("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", "SECRET_SENTINEL"),
+        ("LINUXLAB_SYNC_BATCH_MAX_EVENTS", "SECRET_SENTINEL"),
+        ("LINUXLAB_SYNC_LEASE_SECONDS", 0),
+        ("LINUXLAB_SYNC_ALLOW_INSECURE_HTTP", "SECRET_SENTINEL"),
+    ],
+)
+def test_invalid_worker_configuration_rejected_before_transport(settings, name, value, caplog):
+    from linuxlab.sync.models import OutboxMessage
+
+    _configure_sync_settings(settings)
+    setattr(settings, name, value)
+    before = list(OutboxMessage.objects.values())
+    out, err = io.StringIO(), io.StringIO()
+    with (
+        patch("linuxlab.sync.management.commands.sync_events.HttpSyncTransport") as transport,
+        patch("linuxlab.sync.management.commands.sync_events.flush_outbox") as flush,
+        pytest.raises(CommandError) as caught,
+    ):
+        call_command("sync_events", "--once", stdout=out, stderr=err)
+    transport.assert_not_called()
+    flush.assert_not_called()
+    assert list(OutboxMessage.objects.values()) == before
+    assert (
+        "SECRET_SENTINEL" not in str(caught.value) + out.getvalue() + err.getvalue() + caplog.text
+    )

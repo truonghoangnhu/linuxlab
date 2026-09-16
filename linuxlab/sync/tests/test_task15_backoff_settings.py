@@ -233,3 +233,13 @@ def test_release_transient_accepts_a_valid_boundary_adjacent_configuration(setti
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
     assert refreshed.state == OUTBOX_PENDING
+
+
+def test_backoff_uses_canonical_error_and_retry_validation(settings):
+    from linuxlab.sync.configuration import SyncConfigurationError
+    from linuxlab.sync.outbox import _validated_backoff_bounds
+
+    assert BackoffConfigurationError is SyncConfigurationError
+    settings.LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS = True
+    with pytest.raises(SyncConfigurationError):
+        _validated_backoff_bounds()

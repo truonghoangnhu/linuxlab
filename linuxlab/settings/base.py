@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+from linuxlab.sync.configuration import parse_sync_setting
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-local-development-only")
@@ -104,7 +106,9 @@ LINUXLAB_CAN_RUN_SYNC_WORKER = False
 # default of "disabled" everywhere, including Node -- a Node must be
 # explicitly provisioned and configured before it enqueues syncable
 # events (T14-D38).
-LINUXLAB_SYNC_ENABLED = os.environ.get("LINUXLAB_SYNC_ENABLED", "false").lower() == "true"
+LINUXLAB_SYNC_ENABLED = parse_sync_setting(
+    "LINUXLAB_SYNC_ENABLED", os.environ.get("LINUXLAB_SYNC_ENABLED", "false")
+)
 LINUXLAB_NODE_ID = os.environ.get("LINUXLAB_NODE_ID") or None
 
 # Task 14 Node-side transport/worker configuration (T14-D01, T14-D02,
@@ -112,17 +116,34 @@ LINUXLAB_NODE_ID = os.environ.get("LINUXLAB_NODE_ID") or None
 # configuration only -- never in the database (T14-D18).
 LINUXLAB_SYNC_SECRET = os.environ.get("LINUXLAB_SYNC_SECRET") or None
 LINUXLAB_CENTRAL_URL = os.environ.get("LINUXLAB_CENTRAL_URL") or None
-LINUXLAB_SYNC_ALLOW_INSECURE_HTTP = (
-    os.environ.get("LINUXLAB_SYNC_ALLOW_INSECURE_HTTP", "false").lower() == "true"
+LINUXLAB_SYNC_ALLOW_INSECURE_HTTP = parse_sync_setting(
+    "LINUXLAB_SYNC_ALLOW_INSECURE_HTTP",
+    os.environ.get("LINUXLAB_SYNC_ALLOW_INSECURE_HTTP", "false"),
 )
-LINUXLAB_SYNC_BATCH_MAX_EVENTS = int(os.environ.get("LINUXLAB_SYNC_BATCH_MAX_EVENTS", "100"))
-LINUXLAB_SYNC_BATCH_MAX_BYTES = int(os.environ.get("LINUXLAB_SYNC_BATCH_MAX_BYTES", "1000000"))
-LINUXLAB_SYNC_LEASE_SECONDS = int(os.environ.get("LINUXLAB_SYNC_LEASE_SECONDS", "300"))
-LINUXLAB_SYNC_BACKOFF_BASE_SECONDS = float(
-    os.environ.get("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", "5")
+LINUXLAB_SYNC_BATCH_MAX_EVENTS = parse_sync_setting(
+    "LINUXLAB_SYNC_BATCH_MAX_EVENTS", os.environ.get("LINUXLAB_SYNC_BATCH_MAX_EVENTS", "100")
 )
-LINUXLAB_SYNC_BACKOFF_CAP_SECONDS = float(
-    os.environ.get("LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", "3600")
+LINUXLAB_SYNC_BATCH_MAX_BYTES = parse_sync_setting(
+    "LINUXLAB_SYNC_BATCH_MAX_BYTES", os.environ.get("LINUXLAB_SYNC_BATCH_MAX_BYTES", "1000000")
+)
+LINUXLAB_SYNC_LEASE_SECONDS = parse_sync_setting(
+    "LINUXLAB_SYNC_LEASE_SECONDS", os.environ.get("LINUXLAB_SYNC_LEASE_SECONDS", "300")
+)
+LINUXLAB_SYNC_BACKOFF_BASE_SECONDS = parse_sync_setting(
+    "LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", os.environ.get("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", "5")
+)
+LINUXLAB_SYNC_BACKOFF_CAP_SECONDS = parse_sync_setting(
+    "LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", os.environ.get("LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", "3600")
+)
+LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS = parse_sync_setting(
+    "LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS", os.environ.get("LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS", "10")
+)
+LINUXLAB_SYNC_RETRY_MAX_AGE = parse_sync_setting(
+    "LINUXLAB_SYNC_RETRY_MAX_AGE", os.environ.get("LINUXLAB_SYNC_RETRY_MAX_AGE", "86400")
+)
+LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = parse_sync_setting(
+    "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE",
+    os.environ.get("LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE", "false"),
 )
 
 

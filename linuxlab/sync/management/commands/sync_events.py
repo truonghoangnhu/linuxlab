@@ -11,10 +11,9 @@ this is a separate, explicitly supervised process.
 import signal
 import time
 
-from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from linuxlab.sync.capabilities import can_run_sync_worker
+from linuxlab.sync.configuration import SyncConfigurationError, load_sync_configuration
 from linuxlab.sync.outbox import flush_outbox
 from linuxlab.sync.transports import HttpSyncTransport
 
@@ -32,24 +31,20 @@ class Command(BaseCommand):
             "--once", action="store_true", help="Run a single flush cycle and exit."
         )
 
-    def _build_transport(self):
-        if not can_run_sync_worker():
-            raise CommandError(
-                "the outbound sync worker is not enabled on this deployment profile"
-            )
-        if not settings.LINUXLAB_SYNC_ENABLED:
-            raise CommandError("LINUXLAB_SYNC_ENABLED is false; sync_events refuses to run")
-        if not settings.LINUXLAB_NODE_ID:
-            raise CommandError("LINUXLAB_NODE_ID is not configured")
-        if not settings.LINUXLAB_SYNC_SECRET:
-            raise CommandError("LINUXLAB_SYNC_SECRET is not configured")
-        if not settings.LINUXLAB_CENTRAL_URL:
-            raise CommandError("LINUXLAB_CENTRAL_URL is not configured")
+    def _load_configuration(self):
+        try:
+            return load_sync_configuration(purpose="worker")
+        except SyncConfigurationError as exc:
+            raise CommandError(str(exc)) from None
+
+    def _build_transport(self, configuration=None):
+        configuration = configuration if configuration is not None else self._load_configuration()
+        credentials = configuration.credentials
         return HttpSyncTransport(
-            settings.LINUXLAB_CENTRAL_URL,
-            settings.LINUXLAB_NODE_ID,
-            settings.LINUXLAB_SYNC_SECRET,
-            allow_insecure_http=settings.LINUXLAB_SYNC_ALLOW_INSECURE_HTTP,
+            credentials.central_url,
+            credentials.node_id,
+            credentials.secret,
+            allow_insecure_http=credentials.allow_insecure_http,
         )
 
     def _handle_stop_signal(self, signum, frame):
@@ -85,7 +80,8 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         del args
-        transport = self._build_transport()
+        configuration = self._load_configuration()
+        transport = self._build_transport(configuration)
         self._running = True
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
         signal.signal(signal.SIGINT, self._handle_stop_signal)
@@ -93,9 +89,9 @@ class Command(BaseCommand):
         while self._running:
             summary = flush_outbox(
                 transport,
-                max_events=settings.LINUXLAB_SYNC_BATCH_MAX_EVENTS,
-                max_bytes=settings.LINUXLAB_SYNC_BATCH_MAX_BYTES,
-                lease_seconds=settings.LINUXLAB_SYNC_LEASE_SECONDS,
+                max_events=configuration.batch_max_events,
+                max_bytes=configuration.batch_max_bytes,
+                lease_seconds=configuration.lease_seconds,
             )
             self._report(summary)
 

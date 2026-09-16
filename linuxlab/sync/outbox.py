@@ -31,17 +31,16 @@ instead of resurrecting DELIVERED/DEAD_LETTER or clobbering the
 reclaiming worker's own transition.
 """
 
-import math
 import random
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from .configuration import SyncConfigurationError, load_sync_configuration
 from .contracts import (
     ACCEPTED,
     DUPLICATE,
@@ -61,48 +60,13 @@ from .models import (
     _bulk_write_immutable_rows,
 )
 
-
-class BackoffConfigurationError(Exception):
-    """Raised when LINUXLAB_SYNC_BACKOFF_BASE_SECONDS/CAP_SECONDS are not
-    both finite positive numbers with BASE strictly less than CAP.
-    Checkpoint corrective (finding #5): base.py only parses these into
-    floats -- it never validated the values themselves, so a
-    pathological configuration (e.g. BASE=999 > CAP=5, BASE == CAP, a
-    non-positive value, or NaN/Infinity) would otherwise be silently
-    accepted and could produce an immediate/past retry schedule or break
-    the T14-D41 strict-ordering guarantee below. Fails closed: raising
-    here leaves the caller's row(s) untouched rather than ever compute a
-    bogus delay."""
+BackoffConfigurationError = SyncConfigurationError
 
 
 def _validated_backoff_bounds():
-    """The single point every backoff computation in this module reads
-    LINUXLAB_SYNC_BACKOFF_BASE_SECONDS/CAP_SECONDS through. Read (and
-    re-validated) at call time so a test/operator settings change takes
-    effect immediately, same as before this corrective -- the only
-    change is that the values are now actually checked, not just
-    parsed."""
-    base = settings.LINUXLAB_SYNC_BACKOFF_BASE_SECONDS
-    cap = settings.LINUXLAB_SYNC_BACKOFF_CAP_SECONDS
-    for setting_name, value in (
-        ("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", base),
-        ("LINUXLAB_SYNC_BACKOFF_CAP_SECONDS", cap),
-    ):
-        if (
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(value)
-            or value <= 0
-        ):
-            raise BackoffConfigurationError(
-                f"{setting_name} must be a finite positive number, got {value!r}"
-            )
-    if not base < cap:
-        raise BackoffConfigurationError(
-            f"LINUXLAB_SYNC_BACKOFF_BASE_SECONDS ({base}) must be strictly less "
-            f"than LINUXLAB_SYNC_BACKOFF_CAP_SECONDS ({cap})"
-        )
-    return base, cap
+    """Read current bounds through the canonical retry configuration authority."""
+    policy = load_sync_configuration(purpose="retry").retry_policy
+    return policy.base_delay, policy.max_delay
 
 
 def _configured_backoff_base_seconds():
@@ -255,7 +219,9 @@ def mark_dead_letter(claimed_row, code, reason, now=None):
     dead-letter never affects any other event in the same batch. Fenced
     the same way mark_delivered() is."""
     del now  # no timestamp field beyond rejection_code/reason is required
-    _write_fenced(claimed_row, state=OUTBOX_DEAD_LETTER, rejection_code=code, rejection_reason=reason)
+    _write_fenced(
+        claimed_row, state=OUTBOX_DEAD_LETTER, rejection_code=code, rejection_reason=reason
+    )
 
 
 def release_transient(claimed_rows, error_kind, now=None):

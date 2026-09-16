@@ -131,3 +131,108 @@ def test_identity_initial_migration_is_recorded_and_applied():
     assert ("identity", "0001_initial") in loader.disk_migrations
     assert ("identity", "0001_initial") in loader.graph.nodes
     assert ("identity", "0001_initial") in loader.applied_migrations
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("profile", ["central", "node"])
+@pytest.mark.parametrize(
+    "bad_setting",
+    [
+        "LINUXLAB_SYNC_BACKOFF_BASE_SECONDS",
+        "LINUXLAB_SYNC_BACKOFF_CAP_SECONDS",
+        "LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS",
+        "LINUXLAB_SYNC_RETRY_MAX_AGE",
+        "LINUXLAB_SYNC_BATCH_MAX_EVENTS",
+        "LINUXLAB_SYNC_BATCH_MAX_BYTES",
+        "LINUXLAB_SYNC_LEASE_SECONDS",
+        "LINUXLAB_SYNC_ENABLED",
+        "LINUXLAB_SYNC_ALLOW_INSECURE_HTTP",
+        "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE",
+    ],
+)
+def test_malformed_sync_environment_preserves_local_readiness(profile, bad_setting):
+    # Pin every database component to pytest's live, migrated database.
+    env = dict(os.environ)
+    for name in list(env):
+        if (
+            name.startswith("LINUXLAB_SYNC_")
+            or name == "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE"
+        ):
+            del env[name]
+    for name in ("NAME", "USER", "PASSWORD", "HOST", "PORT"):
+        env["POSTGRES_DB" if name == "NAME" else "POSTGRES_" + name] = str(
+            connection.settings_dict[name]
+        )
+    env.update(
+        DJANGO_SETTINGS_MODULE=f"linuxlab.settings.{profile}",
+        DJANGO_ALLOWED_HOSTS="testserver,localhost",
+        LINUXLAB_SYNC_ENABLED="true",
+        LINUXLAB_NODE_ID="b3f6a6e2-9b1a-4e3e-9f2a-8f6a2f1c4a10",
+        LINUXLAB_SYNC_SECRET="SECRET_SENTINEL",
+        LINUXLAB_CENTRAL_URL="https://central.example.org",
+    )
+    env[bad_setting] = "REJECTED_SENTINEL"
+    code = """
+import io, json, sys
+from unittest.mock import patch
+import django
+django.setup()
+from django.conf import settings
+from django.test import Client
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from linuxlab.sync.configuration import load_sync_configuration, load_inbound_limits, SyncConfigurationError
+from linuxlab.sync.models import OutboxMessage, InboxMessage, NodeRegistration
+from linuxlab.core.models import DomainEvent
+models = (OutboxMessage, InboxMessage, NodeRegistration, DomainEvent)
+def snapshot():
+    return {model: list(model.objects.order_by("pk").values()) for model in models}
+before = snapshot()
+with patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("no Central HTTP")):
+    for path in ("/health/", "/healthz", "/ready/", "/readyz"):
+        response = Client().get(path)
+        assert response.status_code == 200 and response.json() == {"status":"ok"}
+    name = sys.argv[1]
+    if "BATCH_MAX" in name:
+        load = load_inbound_limits
+    elif "BACKOFF" in name or "RETRY" in name:
+        load = lambda: load_sync_configuration(purpose="retry")
+    else:
+        load = lambda: load_sync_configuration(purpose="release")
+    relevant = settings.LINUXLAB_PROFILE == "node" or "BATCH_MAX" in name or "BACKOFF" in name or "RETRY" in name
+    try:
+        load()
+    except SyncConfigurationError as exc:
+        assert relevant
+        assert "SENTINEL" not in str(exc) + repr(exc)
+        outcome = "rejected"
+    else:
+        assert not relevant
+        outcome = "irrelevant"
+    with patch("linuxlab.sync.management.commands.sync_events.HttpSyncTransport") as transport, patch("linuxlab.sync.management.commands.sync_events.flush_outbox") as flush:
+        # The release-only flag does not gate the worker; all other Node values do.
+        if name != "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE" or settings.LINUXLAB_PROFILE == "central":
+            try:
+                call_command("sync_events", "--once", stdout=io.StringIO(), stderr=io.StringIO())
+            except CommandError as exc:
+                assert "SENTINEL" not in str(exc)
+            else:
+                raise AssertionError("worker accepted invalid configuration")
+            transport.assert_not_called()
+            flush.assert_not_called()
+assert snapshot() == before
+print(json.dumps({"startup":"ok", "readiness":"ok", "capability":outcome}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, bad_setting],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SENTINEL" not in result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["startup"] == report["readiness"] == "ok"
+    assert report["capability"] in ("rejected", "irrelevant")
