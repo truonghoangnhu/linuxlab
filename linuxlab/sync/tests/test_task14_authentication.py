@@ -501,27 +501,62 @@ def test_manage_sync_node_rotate_and_revoke_round_trip():
         get_active_node_registration(uuid.UUID(node_id))
 
 
-# --- fix round I3: the CLI must translate every NodeRegistrationError into
-# a FIXED, CLI-owned CommandError message per action -- never the service
-# layer's own str(exc) text -- so the CLI's user-facing contract is not
-# coupled to internal service wording and never varies by failure reason.
+# --- fix round 2 I3: the CLI's FAILURE text must be a fixed, state-free
+# literal per action -- identical regardless of WHICH underlying lifecycle
+# condition (unknown node, already-active, unusable ACTIVE, or any other
+# NodeRegistrationError) triggered it, and must never expose lifecycle
+# state, the node UUID, a secret/hash, an Authorization header, SQL, or
+# the service layer's own exception text. SUCCESS output (issue/rotate's
+# one-time secret print, revoke's success line) is unchanged by this fix
+# and is covered by the tests above.
+
+_ISSUE_FAILED_MESSAGE = "node registration issue failed"
+_ROTATE_FAILED_MESSAGE = "node credential rotation failed"
+_REVOKE_FAILED_MESSAGE = "node registration revoke failed"
+
+_FORBIDDEN_FAILURE_SUBSTRINGS = (
+    "active",
+    "inactive",
+    "revoked",
+    "superseded",
+    "registration state",
+    "node uuid",
+    "secret",
+    "hash",
+    "authorization",
+    "sql",
+)
 
 
-def test_manage_sync_node_rotate_unknown_node_raises_fixed_safe_command_error():
-    with pytest.raises(
-        CommandError, match=r"^unable to rotate: that node_id has no active registration$"
-    ):
-        call_command("manage_sync_node", "rotate", str(uuid.uuid4()), stdout=io.StringIO())
+def _assert_state_free_failure_text(message):
+    lowered = message.lower()
+    for forbidden in _FORBIDDEN_FAILURE_SUBSTRINGS:
+        assert forbidden not in lowered, f"{forbidden!r} leaked through failure text: {message!r}"
 
 
-def test_manage_sync_node_revoke_unknown_node_raises_fixed_safe_command_error():
-    with pytest.raises(
-        CommandError, match=r"^unable to revoke: that node_id has no active registration$"
-    ):
-        call_command("manage_sync_node", "revoke", str(uuid.uuid4()), stdout=io.StringIO())
+def _patch_service_failure(monkeypatch, command_symbol, message):
+    """Force the named manage_sync_node service call to fail with an
+    adversarially state-revealing NodeRegistrationError -- proving the
+    CLI's fixed failure text is invariant no matter what the underlying
+    message says, not merely for the specific messages the service
+    happens to raise today."""
+
+    def _boom(*args, **kwargs):
+        del args, kwargs
+        raise NodeRegistrationError(message)
+
+    monkeypatch.setattr(
+        f"linuxlab.sync.management.commands.manage_sync_node.{command_symbol}", _boom
+    )
 
 
-def test_manage_sync_node_issue_against_active_raises_fixed_safe_command_error():
+_ADVERSARIAL_UNDERLYING_MESSAGE = (
+    "ACTIVE inactive REVOKED superseded registration state node UUID "
+    "secret=topsecret hash=deadbeef Authorization: Bearer xyz SQL DROP TABLE"
+)
+
+
+def test_manage_sync_node_issue_failure_text_is_fixed_and_state_free_across_causes(monkeypatch):
     node_id = uuid.uuid4()
     call_command(
         "manage_sync_node",
@@ -533,9 +568,8 @@ def test_manage_sync_node_issue_against_active_raises_fixed_safe_command_error()
         stdout=io.StringIO(),
     )
 
-    with pytest.raises(
-        CommandError, match=r"^unable to issue a Node registration for that node_id$"
-    ):
+    # Real underlying failure: the node_id already has an ACTIVE registration.
+    with pytest.raises(CommandError) as excinfo_real:
         call_command(
             "manage_sync_node",
             "issue",
@@ -545,6 +579,79 @@ def test_manage_sync_node_issue_against_active_raises_fixed_safe_command_error()
             str(node_id),
             stdout=io.StringIO(),
         )
+    assert str(excinfo_real.value) == _ISSUE_FAILED_MESSAGE
+    assert "already has an active registration" not in str(excinfo_real.value)
+    assert str(node_id) not in str(excinfo_real.value)
+    _assert_state_free_failure_text(str(excinfo_real.value))
+    assert excinfo_real.value.__cause__ is None
+
+    # Synthetic underlying failure with every banned word deliberately
+    # embedded in its message.
+    _patch_service_failure(
+        monkeypatch, "issue_node_registration", _ADVERSARIAL_UNDERLYING_MESSAGE
+    )
+    with pytest.raises(CommandError) as excinfo_synthetic:
+        call_command("manage_sync_node", "issue", "--name", "Lab X", stdout=io.StringIO())
+    assert str(excinfo_synthetic.value) == _ISSUE_FAILED_MESSAGE
+    _assert_state_free_failure_text(str(excinfo_synthetic.value))
+    assert excinfo_synthetic.value.__cause__ is None
+
+    assert str(excinfo_real.value) == str(excinfo_synthetic.value)
+
+
+def test_manage_sync_node_rotate_failure_text_is_fixed_and_state_free_across_causes():
+    # Real underlying failure #1: unknown node_id (zero ACTIVE).
+    with pytest.raises(CommandError) as excinfo_unknown:
+        call_command("manage_sync_node", "rotate", str(uuid.uuid4()), stdout=io.StringIO())
+    assert str(excinfo_unknown.value) == _ROTATE_FAILED_MESSAGE
+    _assert_state_free_failure_text(str(excinfo_unknown.value))
+    assert excinfo_unknown.value.__cause__ is None
+
+    # Real underlying failure #2: an ACTIVE registration with a
+    # structurally unusable hash (the I2 case) -- rotate must reject it
+    # with the exact same fixed text, never "not usable"/the hash value.
+    node_id = uuid.uuid4()
+    _insert_immutable_row(
+        NodeRegistration,
+        node_id=node_id,
+        display_name="Corrupt",
+        state=REGISTRATION_ACTIVE,
+        current_secret_hash="!unusable",
+        previous_secret_hash="",
+        previous_valid_until=None,
+        enabled=True,
+    )
+    with pytest.raises(CommandError) as excinfo_unusable:
+        call_command("manage_sync_node", "rotate", str(node_id), stdout=io.StringIO())
+    assert str(excinfo_unusable.value) == _ROTATE_FAILED_MESSAGE
+    assert "not usable" not in str(excinfo_unusable.value)
+    assert "!unusable" not in str(excinfo_unusable.value)
+    _assert_state_free_failure_text(str(excinfo_unusable.value))
+    assert excinfo_unusable.value.__cause__ is None
+
+    assert str(excinfo_unknown.value) == str(excinfo_unusable.value)
+
+
+def test_manage_sync_node_revoke_failure_text_is_fixed_and_state_free_across_causes(monkeypatch):
+    # Real underlying failure: unknown node_id (zero ACTIVE).
+    with pytest.raises(CommandError) as excinfo_real:
+        call_command("manage_sync_node", "revoke", str(uuid.uuid4()), stdout=io.StringIO())
+    assert str(excinfo_real.value) == _REVOKE_FAILED_MESSAGE
+    _assert_state_free_failure_text(str(excinfo_real.value))
+    assert excinfo_real.value.__cause__ is None
+
+    # Synthetic underlying failure with every banned word deliberately
+    # embedded in its message.
+    _patch_service_failure(
+        monkeypatch, "revoke_node_registration", _ADVERSARIAL_UNDERLYING_MESSAGE
+    )
+    with pytest.raises(CommandError) as excinfo_synthetic:
+        call_command("manage_sync_node", "revoke", str(uuid.uuid4()), stdout=io.StringIO())
+    assert str(excinfo_synthetic.value) == _REVOKE_FAILED_MESSAGE
+    _assert_state_free_failure_text(str(excinfo_synthetic.value))
+    assert excinfo_synthetic.value.__cause__ is None
+
+    assert str(excinfo_real.value) == str(excinfo_synthetic.value)
 
 
 def test_manage_sync_node_rotate_rejects_non_uuid_node_id():

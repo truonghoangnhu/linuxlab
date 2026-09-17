@@ -21,14 +21,16 @@ from linuxlab.sync.authentication import (
 )
 from linuxlab.sync.capabilities import can_receive_sync_events
 
-# Fixed, safe, CLI-owned CommandError text per action (Corrective B Task 5
-# fix round: never interpolate str(exc) -- the service layer's exact
-# wording is an internal implementation detail, not a CLI contract, and
-# a fixed message per action cannot accidentally grow to say more than
-# intended as that wording evolves).
-_ISSUE_FAILED_MESSAGE = "unable to issue a Node registration for that node_id"
-_ROTATE_FAILED_MESSAGE = "unable to rotate: that node_id has no active registration"
-_REVOKE_FAILED_MESSAGE = "unable to revoke: that node_id has no active registration"
+# Fixed, safe, state-free, CLI-owned CommandError text per action
+# (Corrective B Task 5 fix round 2 / I3): never interpolate str(exc) --
+# the service layer's exact wording is an internal implementation
+# detail, not a CLI contract -- and never describe WHY, since the same
+# text must stay accurate (and non-disclosing) across every underlying
+# NodeRegistrationError cause for that action (unknown node, already
+# active, an unusable ACTIVE registration, a disabled capability, etc).
+_ISSUE_FAILED_MESSAGE = "node registration issue failed"
+_ROTATE_FAILED_MESSAGE = "node credential rotation failed"
+_REVOKE_FAILED_MESSAGE = "node registration revoke failed"
 
 
 class Command(BaseCommand):
@@ -75,23 +77,23 @@ class Command(BaseCommand):
                 credential = issue_node_registration(
                     options["name"], node_id=options["node_id"]
                 )
-            except NodeRegistrationError as exc:
-                raise CommandError(_ISSUE_FAILED_MESSAGE) from exc
+            except NodeRegistrationError:
+                raise CommandError(_ISSUE_FAILED_MESSAGE) from None
             self._print_secret_once(credential)
             return
 
         if action == "rotate":
             try:
                 credential = rotate_node_credential(options["node_id"])
-            except NodeRegistrationError as exc:
-                raise CommandError(_ROTATE_FAILED_MESSAGE) from exc
+            except NodeRegistrationError:
+                raise CommandError(_ROTATE_FAILED_MESSAGE) from None
             self._print_secret_once(credential)
             return
 
         if action == "revoke":
             try:
                 revoke_node_registration(options["node_id"])
-            except NodeRegistrationError as exc:
-                raise CommandError(_REVOKE_FAILED_MESSAGE) from exc
+            except NodeRegistrationError:
+                raise CommandError(_REVOKE_FAILED_MESSAGE) from None
             self.stdout.write(self.style.SUCCESS(f"revoked {options['node_id']}"))
             return
