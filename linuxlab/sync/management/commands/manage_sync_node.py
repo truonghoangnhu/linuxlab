@@ -21,6 +21,15 @@ from linuxlab.sync.authentication import (
 )
 from linuxlab.sync.capabilities import can_receive_sync_events
 
+# Fixed, safe, CLI-owned CommandError text per action (Corrective B Task 5
+# fix round: never interpolate str(exc) -- the service layer's exact
+# wording is an internal implementation detail, not a CLI contract, and
+# a fixed message per action cannot accidentally grow to say more than
+# intended as that wording evolves).
+_ISSUE_FAILED_MESSAGE = "unable to issue a Node registration for that node_id"
+_ROTATE_FAILED_MESSAGE = "unable to rotate: that node_id has no active registration"
+_REVOKE_FAILED_MESSAGE = "unable to revoke: that node_id has no active registration"
+
 
 class Command(BaseCommand):
     help = "Issue, rotate, or revoke a Node sync credential."
@@ -67,7 +76,7 @@ class Command(BaseCommand):
                     options["name"], node_id=options["node_id"]
                 )
             except NodeRegistrationError as exc:
-                raise CommandError(str(exc)) from exc
+                raise CommandError(_ISSUE_FAILED_MESSAGE) from exc
             self._print_secret_once(credential)
             return
 
@@ -75,7 +84,7 @@ class Command(BaseCommand):
             try:
                 credential = rotate_node_credential(options["node_id"])
             except NodeRegistrationError as exc:
-                raise CommandError(str(exc)) from exc
+                raise CommandError(_ROTATE_FAILED_MESSAGE) from exc
             self._print_secret_once(credential)
             return
 
@@ -83,6 +92,6 @@ class Command(BaseCommand):
             try:
                 revoke_node_registration(options["node_id"])
             except NodeRegistrationError as exc:
-                raise CommandError(str(exc)) from exc
+                raise CommandError(_REVOKE_FAILED_MESSAGE) from exc
             self.stdout.write(self.style.SUCCESS(f"revoked {options['node_id']}"))
             return

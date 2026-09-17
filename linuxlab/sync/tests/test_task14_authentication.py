@@ -5,11 +5,14 @@ plaintext; only Django password hashes."""
 
 import io
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from django.contrib.auth.hashers import make_password
 from django.core.management import CommandError, call_command
+from django.utils import timezone
 
+import linuxlab.sync.authentication as auth_module
 from linuxlab.sync.authentication import (
     IssuedNodeCredential,
     NodeAuthenticationError,
@@ -18,7 +21,9 @@ from linuxlab.sync.authentication import (
     authenticate_node,
     get_active_node_registration,
     issue_node_registration,
+    lock_registration_scope,
     registration_advisory_key,
+    registration_is_usable,
     revoke_node_registration,
     rotate_node_credential,
 )
@@ -150,6 +155,69 @@ def test_malformed_secret_never_authenticates():
             authenticate_node(credential.node_id, bogus)
 
 
+# --- fix round I1: a hasher-internal failure on a "usable"-looking hash
+# must never escape the authenticate_node() boundary as a raw exception.
+# registration_is_usable() only proves decode() succeeds; it does not
+# call verify(), so check_password() itself can still fail for reasons
+# decode() alone would never catch -- that failure must be swallowed here,
+# not re-raised, and never carry the raw hash value.
+
+
+def test_check_password_internal_failure_never_escapes_the_auth_boundary(monkeypatch):
+    credential = issue_node_registration("Lab A")
+
+    def _boom(raw_secret, encoded):
+        del raw_secret, encoded
+        raise RuntimeError("simulated hasher internal failure: TOP-SECRET-HASH-VALUE")
+
+    monkeypatch.setattr(auth_module, "check_password", _boom)
+
+    with pytest.raises(NodeAuthenticationError) as excinfo:
+        authenticate_node(credential.node_id, credential.secret)
+
+    assert "TOP-SECRET-HASH-VALUE" not in str(excinfo.value)
+    assert str(excinfo.value) == "authentication failed"
+
+
+def test_registration_is_usable_never_raises_on_hasher_internal_failure(monkeypatch):
+    credential = issue_node_registration("Lab A")
+    registration = NodeRegistration.objects.get(node_id=credential.node_id)
+
+    def _boom(encoded):
+        del encoded
+        raise RuntimeError("simulated identify_hasher failure")
+
+    monkeypatch.setattr(auth_module, "identify_hasher", _boom)
+
+    assert registration_is_usable(registration) is False
+
+
+# --- fix round M3: legacy previous-secret/grace-window columns retained
+# from before this corrective must never confer authority again, even
+# when previous_valid_until is still in the future (i.e. what would have
+# been "inside the grace window" under the old model).
+
+
+def test_legacy_previous_secret_never_authenticates_even_within_the_old_grace_window():
+    node_id = uuid.uuid4()
+    old_secret = "legacy-previous-secret"
+    new_secret = "current-active-secret"
+    _insert_immutable_row(
+        NodeRegistration,
+        node_id=node_id,
+        display_name="Legacy",
+        state=REGISTRATION_ACTIVE,
+        current_secret_hash=make_password(new_secret),
+        previous_secret_hash=make_password(old_secret),
+        previous_valid_until=timezone.now() + timedelta(hours=24),
+        enabled=True,
+    )
+
+    authenticate_node(node_id, new_secret)
+    with pytest.raises(NodeAuthenticationError):
+        authenticate_node(node_id, old_secret)
+
+
 def test_registration_row_never_created_through_ordinary_orm():
     # Sanity check that authentication.py relies on the Task 14 trust
     # boundary in models.py, not a parallel unguarded path.
@@ -187,6 +255,36 @@ def test_rotate_after_revoke_fails_with_zero_active():
 
     with pytest.raises(NodeRegistrationError):
         rotate_node_credential(credential.node_id)
+
+
+# --- fix round I2: rotate must require the current ACTIVE row to be
+# structurally usable (design spec §10: "requires exactly one usable
+# ACTIVE A") -- an ACTIVE row with a malformed hash (e.g. left over from
+# an ambiguous historical migration) must be rejected, not silently
+# superseded by a fresh credential.
+
+
+def test_rotate_rejects_an_unusable_active_registration():
+    node_id = uuid.uuid4()
+    _insert_immutable_row(
+        NodeRegistration,
+        node_id=node_id,
+        display_name="Corrupt",
+        state=REGISTRATION_ACTIVE,
+        current_secret_hash="!unusable",
+        previous_secret_hash="",
+        previous_valid_until=None,
+        enabled=True,
+    )
+
+    with pytest.raises(NodeRegistrationError):
+        rotate_node_credential(node_id)
+
+    # No mutation: still exactly the same unusable ACTIVE row, never
+    # superseded and never partially rotated.
+    registration = NodeRegistration.objects.get(node_id=node_id, state=REGISTRATION_ACTIVE)
+    assert registration.current_secret_hash == "!unusable"
+    assert NodeRegistration.objects.filter(node_id=node_id).count() == 1
 
 
 def test_revoke_disables_the_active_registration_immediately():
@@ -307,6 +405,23 @@ def test_registration_advisory_key_differs_for_different_nodes():
     assert registration_advisory_key(uuid.uuid4()) != registration_advisory_key(uuid.uuid4())
 
 
+# --- fix round M2: the lock helpers are public/reusable primitives, so
+# they must validate node_id themselves -- never trust every caller to
+# pre-validate -- and fail with the same safe NodeRegistrationError a
+# caller would get anywhere else, not a raw AttributeError from calling
+# `.bytes` on a non-UUID.
+
+
+def test_registration_advisory_key_rejects_a_non_uuid_node_id():
+    with pytest.raises(NodeRegistrationError):
+        registration_advisory_key("not-a-uuid")
+
+
+def test_lock_registration_scope_rejects_a_non_uuid_node_id_even_outside_a_transaction():
+    with pytest.raises(NodeRegistrationError):
+        lock_registration_scope("not-a-uuid")
+
+
 # --- Inbox foreign key preserved across lifecycle transitions --------------
 
 
@@ -386,14 +501,50 @@ def test_manage_sync_node_rotate_and_revoke_round_trip():
         get_active_node_registration(uuid.UUID(node_id))
 
 
-def test_manage_sync_node_rotate_unknown_node_raises_command_error():
-    with pytest.raises(CommandError):
+# --- fix round I3: the CLI must translate every NodeRegistrationError into
+# a FIXED, CLI-owned CommandError message per action -- never the service
+# layer's own str(exc) text -- so the CLI's user-facing contract is not
+# coupled to internal service wording and never varies by failure reason.
+
+
+def test_manage_sync_node_rotate_unknown_node_raises_fixed_safe_command_error():
+    with pytest.raises(
+        CommandError, match=r"^unable to rotate: that node_id has no active registration$"
+    ):
         call_command("manage_sync_node", "rotate", str(uuid.uuid4()), stdout=io.StringIO())
 
 
-def test_manage_sync_node_revoke_unknown_node_raises_command_error():
-    with pytest.raises(CommandError):
+def test_manage_sync_node_revoke_unknown_node_raises_fixed_safe_command_error():
+    with pytest.raises(
+        CommandError, match=r"^unable to revoke: that node_id has no active registration$"
+    ):
         call_command("manage_sync_node", "revoke", str(uuid.uuid4()), stdout=io.StringIO())
+
+
+def test_manage_sync_node_issue_against_active_raises_fixed_safe_command_error():
+    node_id = uuid.uuid4()
+    call_command(
+        "manage_sync_node",
+        "issue",
+        "--name",
+        "Lab A",
+        "--node-id",
+        str(node_id),
+        stdout=io.StringIO(),
+    )
+
+    with pytest.raises(
+        CommandError, match=r"^unable to issue a Node registration for that node_id$"
+    ):
+        call_command(
+            "manage_sync_node",
+            "issue",
+            "--name",
+            "Lab A2",
+            "--node-id",
+            str(node_id),
+            stdout=io.StringIO(),
+        )
 
 
 def test_manage_sync_node_rotate_rejects_non_uuid_node_id():

@@ -106,7 +106,9 @@ def registration_advisory_key(node_id: UUID) -> int:
     node, namespaced independently from publication's own advisory lock
     (linuxlab.publication.snapshots) -- a hash collision only serializes
     two unrelated logical nodes against each other, never merges their
-    authority."""
+    authority. Public and reusable, so it validates `node_id` itself
+    rather than trusting every caller to pre-validate."""
+    _require_node_id(node_id)
     digest = hashlib.sha256(_ADVISORY_LOCK_NAMESPACE + node_id.bytes).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
@@ -115,7 +117,9 @@ def lock_registration_scope(node_id: UUID) -> None:
     """Take PostgreSQL's transaction-scoped advisory lock for this
     logical node's registration scope. Must run inside an open
     transaction -- this covers a scope with zero rows, which ordinary
-    row locking cannot protect."""
+    row locking cannot protect. Public and reusable, so it validates
+    `node_id` itself rather than trusting every caller to pre-validate."""
+    _require_node_id(node_id)
     if not connection.in_atomic_block:
         raise NodeRegistrationError("registration transaction required")
     with connection.cursor() as cursor:
@@ -139,7 +143,11 @@ def registration_is_usable(registration: NodeRegistration) -> bool:
     """Structural usability only: a real UUID identity and a hash string
     Django's password-hasher framework can actually decode -- never
     upgrades/rewrites the hash, and never re-raises a malformed encoding
-    with the raw hash value attached."""
+    with the raw hash value attached. Catches every exception type, not
+    just the common ones (a hasher's decode()/identify_hasher() is not
+    guaranteed to fail with a specific exception class for every possible
+    malformed encoding) -- a hash this cannot structurally validate is
+    unusable, full stop, never a crash."""
     if not isinstance(registration.node_id, UUID):
         return False
     if not is_password_usable(registration.current_secret_hash):
@@ -147,7 +155,7 @@ def registration_is_usable(registration: NodeRegistration) -> bool:
     try:
         hasher = identify_hasher(registration.current_secret_hash)
         hasher.decode(registration.current_secret_hash)
-    except (ValueError, KeyError, IndexError, TypeError):
+    except Exception:  # noqa: BLE001 -- any decode failure means "not usable", never re-raised
         return False
     return True
 
@@ -191,12 +199,15 @@ def issue_node_registration(
 
 def rotate_node_credential(node_id: UUID) -> IssuedNodeCredential:
     """Rotate a Node's bearer secret: requires exactly one usable ACTIVE
-    registration, which is superseded, while a brand new row is inserted
-    ACTIVE with a fresh secret -- in the same locked transaction, old row
-    superseded before the new row is inserted so the partial unique
-    constraint is satisfied at every intermediate point. There is no
-    grace window: the old secret stops authenticating the instant this
-    transaction commits."""
+    registration (structurally usable per registration_is_usable() --
+    an ACTIVE row with a malformed/unusable hash, e.g. from an ambiguous
+    historical migration, is rejected rather than silently superseded),
+    which is superseded, while a brand new row is inserted ACTIVE with a
+    fresh secret -- in the same locked transaction, old row superseded
+    before the new row is inserted so the partial unique constraint is
+    satisfied at every intermediate point. There is no grace window: the
+    old secret stops authenticating the instant this transaction
+    commits."""
     _require_provisioning_capability()
     _require_node_id(node_id)
     secret = _generate_secret()
@@ -205,6 +216,10 @@ def rotate_node_credential(node_id: UUID) -> IssuedNodeCredential:
     with transaction.atomic():
         lock_registration_scope(node_id)
         current = get_active_node_registration(node_id)
+        if not registration_is_usable(current):
+            raise NodeRegistrationError(
+                f"active registration for node {node_id} is not usable"
+            )
         _write_immutable_row_fields(current, state=REGISTRATION_SUPERSEDED, rotated_at=now)
         replacement = _insert_immutable_row(
             NodeRegistration,
@@ -254,7 +269,14 @@ def authenticate_node(node_id, bearer_secret, now=None):
     if not registration_is_usable(registration):
         raise NodeAuthenticationError("authentication failed")
 
-    if not check_password(bearer_secret, registration.current_secret_hash):
+    try:
+        secret_matches = check_password(bearer_secret, registration.current_secret_hash)
+    except Exception:  # noqa: BLE001 -- a hasher-internal failure on a "usable"-looking
+        # hash (registration_is_usable() only checks decode(), not verify()) is still
+        # an authentication failure, never a raw exception escaping this boundary.
+        secret_matches = False
+
+    if not secret_matches:
         raise NodeAuthenticationError("authentication failed")
 
     return registration
