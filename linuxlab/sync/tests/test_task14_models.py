@@ -135,11 +135,11 @@ def test_node_registration_ordinary_delete_is_blocked():
 
 
 def test_write_immutable_row_fields_updates_only_allowed_node_registration_fields():
-    node = _make_node_registration(enabled=True)
+    node = _make_node_registration(state=REGISTRATION_ACTIVE)
 
-    _write_immutable_row_fields(node, enabled=False)
+    _write_immutable_row_fields(node, state=REGISTRATION_SUPERSEDED)
 
-    assert NodeRegistration.objects.get(pk=node.pk).enabled is False
+    assert NodeRegistration.objects.get(pk=node.pk).state == REGISTRATION_SUPERSEDED
 
 
 def test_write_immutable_row_fields_rejects_non_allowlisted_field():
@@ -171,6 +171,10 @@ def test_old_caller_supplied_allow_list_signature_is_no_longer_callable():
         ("node_id", uuid.uuid4()),
         ("display_name", "hacked"),
         ("created_at", datetime.now(UTC)),
+        ("current_secret_hash", "hacked-hash"),
+        ("previous_secret_hash", "hacked-previous-hash"),
+        ("previous_valid_until", datetime.now(UTC)),
+        ("enabled", False),
     ],
 )
 def test_node_registration_immutable_fields_are_all_individually_rejected(field_name, new_value):
@@ -184,31 +188,24 @@ def test_node_registration_immutable_fields_are_all_individually_rejected(field_
 
 
 def test_node_registration_legitimate_rotation_metadata_still_works():
-    node = _make_node_registration()
+    node = _make_node_registration(state=REGISTRATION_ACTIVE)
     now = datetime.now(UTC)
 
-    _write_immutable_row_fields(
-        node,
-        current_secret_hash="new-hash",
-        previous_secret_hash="old-hash",
-        previous_valid_until=now,
-        rotated_at=now,
-    )
+    _write_immutable_row_fields(node, state=REGISTRATION_SUPERSEDED, rotated_at=now)
 
     reloaded = NodeRegistration.objects.get(pk=node.pk)
-    assert reloaded.current_secret_hash == "new-hash"
-    assert reloaded.previous_secret_hash == "old-hash"
+    assert reloaded.state == REGISTRATION_SUPERSEDED
     assert reloaded.rotated_at == now
 
 
 def test_node_registration_legitimate_revoke_metadata_still_works():
-    node = _make_node_registration()
+    node = _make_node_registration(state=REGISTRATION_ACTIVE)
     now = datetime.now(UTC)
 
-    _write_immutable_row_fields(node, enabled=False, revoked_at=now)
+    _write_immutable_row_fields(node, state=REGISTRATION_REVOKED, revoked_at=now)
 
     reloaded = NodeRegistration.objects.get(pk=node.pk)
-    assert reloaded.enabled is False
+    assert reloaded.state == REGISTRATION_REVOKED
     assert reloaded.revoked_at == now
 
 

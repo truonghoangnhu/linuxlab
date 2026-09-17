@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from django.db import close_old_connections, connection
+from django.test import override_settings
 from django.utils import timezone
 
 from linuxlab.sync.authentication import issue_node_registration
@@ -18,8 +19,17 @@ from linuxlab.sync.models import InboxMessage, NodeRegistration
 pytestmark = pytest.mark.django_db
 
 
+def _issue(name):
+    """Node registration provisioning is Central-only; these tests only
+    need the resulting registration row, so the capability is enabled
+    just for the explicit issue call and restored immediately after
+    (never enabled globally in conftest)."""
+    with override_settings(LINUXLAB_CAN_RECEIVE_SYNC_EVENTS=True):
+        return issue_node_registration(name)
+
+
 def _make_node():
-    credential = issue_node_registration("Test Node")
+    credential = _issue("Test Node")
     return NodeRegistration.objects.get(node_id=credential.node_id)
 
 
@@ -191,7 +201,7 @@ def test_same_event_id_different_payload_is_idempotency_conflict():
 
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_ingest_of_the_same_new_event_id_normalizes_to_one_accepted_one_duplicate():
-    credential = issue_node_registration("Concurrent Node")
+    credential = _issue("Concurrent Node")
     node_id = credential.node_id
     envelope = _make_envelope(source_node_id=node_id)
 

@@ -99,12 +99,23 @@ def test_wrong_secret_is_401(client):
     assert response.status_code == 401
 
 
-def test_disabled_registration_is_403(client):
+def test_revoked_registration_is_401(client):
     credential = issue_node_registration("Node A")
     revoke_node_registration(credential.node_id)
     envelope = _make_envelope(source_node_id=credential.node_id)
     response = _post_events(client, credential.node_id, credential.secret, [envelope])
-    assert response.status_code == 403
+    assert response.status_code == 401
+
+
+def test_superseded_registration_is_401(client):
+    from linuxlab.sync.authentication import rotate_node_credential
+
+    credential = issue_node_registration("Node A")
+    old_secret = credential.secret
+    rotate_node_credential(credential.node_id)
+    envelope = _make_envelope(source_node_id=credential.node_id)
+    response = _post_events(client, credential.node_id, old_secret, [envelope])
+    assert response.status_code == 401
 
 
 def test_authenticated_node_continues_to_ingestion(client):

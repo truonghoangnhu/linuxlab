@@ -6,6 +6,7 @@ semantics.
 import uuid
 
 import pytest
+from django.test import override_settings
 from django.utils import timezone
 
 from linuxlab.sync.authentication import issue_node_registration
@@ -16,7 +17,11 @@ pytestmark = pytest.mark.django_db
 
 
 def _make_inbox_message(**overrides):
-    credential = issue_node_registration("Test Node")
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call and let it restore
+    # immediately after (never enabled globally in conftest).
+    with override_settings(LINUXLAB_CAN_RECEIVE_SYNC_EVENTS=True):
+        credential = issue_node_registration("Test Node")
     from linuxlab.sync.models import NodeRegistration, _insert_immutable_row
 
     node = NodeRegistration.objects.get(node_id=credential.node_id)

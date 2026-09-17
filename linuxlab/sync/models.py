@@ -432,10 +432,14 @@ REGISTRATION_STATE_CHOICES = [
 
 class NodeRegistration(ImmutableArtifact):
     """Central-issued, Central-owned Node identity and credential state
-    (T14-D18, T14-D19, T14-D23, T14-D28). `node_id`/`display_name`/
-    `created_at` are permanent identity; `current_secret_hash`,
-    `previous_secret_hash`, `previous_valid_until`, `enabled`,
-    `rotated_at`, and `revoked_at` are credential-lifecycle state, mutable
+    (T14-D18, T14-D19, T14-D23, T14-D28; Corrective B Task 5). `node_id`
+    is the logical identity shared across a rotation history -- it is
+    intentionally not unique; `state` (ACTIVE/SUPERSEDED/REVOKED) is the
+    sole runtime authority, enforced by a partial unique constraint
+    allowing at most one ACTIVE row per `node_id`. `current_secret_hash`,
+    `previous_secret_hash`, `previous_valid_until`, `enabled`, and
+    `display_name` are written once at insertion and are historical
+    thereafter; only `state`, `rotated_at`, and `revoked_at` are mutable,
     only through linuxlab.sync.authentication's private controlled writer
     -- never through ordinary save()/QuerySet.update(). Never stores
     plaintext; only Django password hashes (T14-D19, T14-D37)."""
@@ -588,10 +592,7 @@ _MUTABLE_FIELDS_BY_MODEL = MappingProxyType(
     {
         NodeRegistration: frozenset(
             {
-                "current_secret_hash",
-                "previous_secret_hash",
-                "previous_valid_until",
-                "enabled",
+                "state",
                 "rotated_at",
                 "revoked_at",
             }

@@ -132,7 +132,12 @@ def _package_inventory_counts():
 
 
 def test_real_activity_completion_flows_end_to_end_to_delivered(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Vertical Slice Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -168,7 +173,12 @@ def test_real_activity_completion_flows_end_to_end_to_delivered(settings):
 
 
 def test_commit_then_ack_lost_replay_yields_one_inbox_row_and_eventual_delivery(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Replay Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -205,7 +215,12 @@ def test_commit_then_ack_lost_replay_yields_one_inbox_row_and_eventual_delivery(
 
 
 def test_poison_neighbor_does_not_block_good_events_in_the_same_batch(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Poison Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -242,7 +257,12 @@ def test_poison_neighbor_does_not_block_good_events_in_the_same_batch(settings):
 
 
 def test_repeated_transient_failures_never_delete_or_dead_letter_then_eventually_deliver(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Offline Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -289,7 +309,12 @@ def test_repeated_transient_failures_never_delete_or_dead_letter_then_eventually
 
 
 def test_processor_failure_after_ack_never_requires_node_retransmission(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Processor Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -322,7 +347,12 @@ def test_processor_failure_after_ack_never_requires_node_retransmission(settings
 
 
 def test_full_cycle_never_touches_package_inventory_or_creates_reverse_transport(settings):
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Regression Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -367,7 +397,12 @@ def test_413_split_and_singleton_dead_letter_through_real_http_transport(setting
     import json
     import urllib.error
 
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("413 Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 
@@ -418,7 +453,12 @@ def test_ack_lost_replay_with_non_utc_offset_becomes_duplicate_not_conflict(sett
     same event as its UTC-normalized replica on retry -- through the
     REAL flush_outbox() -> Central authenticate_node()/ingest_event()
     path, not just a direct ingest_event() unit call."""
+    # Node registration provisioning is Central-only; enable the
+    # capability just for this explicit issue call, then restore this
+    # test's intended Node-worker profile immediately after.
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
     credential = issue_node_registration("Offset Node")
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
     settings.LINUXLAB_SYNC_ENABLED = True
     settings.LINUXLAB_NODE_ID = str(credential.node_id)
 

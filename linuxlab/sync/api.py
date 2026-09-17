@@ -27,7 +27,6 @@ from .capabilities import can_receive_sync_events
 from .configuration import SyncConfigurationError, load_inbound_limits
 from .contracts import WireEventEnvelope
 from .ingestion import ingest_event
-from .models import NodeRegistration
 
 _BEARER_PREFIX = "Bearer "
 _AUTH_FAILED_BODY = {"detail": "authentication failed"}
@@ -55,18 +54,15 @@ def _parse_bearer_credential(request):
 
 
 def _authenticate_request(node_id, secret):
-    """Returns (NodeRegistration, None) on success, or (None, status)
-    on failure: 401 for missing/unknown Node or a wrong secret, 403 for
-    a known but disabled/revoked registration. The response BODY stays
-    generic either way (T14-D09) -- only the status code differs, and a
-    disabled/revoked registration is checked only AFTER
-    authenticate_node() has already failed, so it never changes the
-    outcome of the underlying (deliberately uniform) credential check."""
+    """Returns (NodeRegistration, None) on success, or (None, 401) on
+    every credential failure (T14-D09; Corrective B Task 5): unknown
+    node_id, zero/multiple ACTIVE, REVOKED/SUPERSEDED history, or a
+    wrong secret are all indistinguishable to the caller -- there is no
+    separate history-based status lookup here. The unrelated
+    receive-capability/profile-disabled 403 stays in SyncEventsView.post."""
     try:
         registration = authenticate_node(node_id, secret)
     except NodeAuthenticationError:
-        if NodeRegistration.objects.filter(node_id=node_id, enabled=False).exists():
-            return None, 403
         return None, 401
     return registration, None
 
