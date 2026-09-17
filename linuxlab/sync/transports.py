@@ -111,22 +111,32 @@ def parse_retry_after(value: str | None, *, now: datetime) -> int | float | None
             return None
         return max(seconds, 0)
 
-    # 2. Then an HTTP-date.
+    # 2. Then an HTTP-date. Fix round 2 I3: the ENTIRE date path -- parsing,
+    # naive-timezone handling, UTC normalization, and the subtraction
+    # against `now` -- is one safe unit inside a single try/except. A
+    # value can parse as a syntactically valid date (year and offset each
+    # individually in bounds) and still be unrepresentable once actually
+    # normalized to UTC: "Fri, 31 Dec 9999 23:59:59 -0100" parses fine,
+    # but ADDING the 1-hour offset to reach UTC pushes the result past
+    # datetime.MAXYEAR, and .astimezone(UTC) raises an untyped
+    # OverflowError -- previously unguarded, since only
+    # parsedate_to_datetime() itself and the final subtraction had their
+    # own separate try/except. Any of parsing, UTC normalization, or the
+    # subtraction raising ValueError/TypeError/OverflowError/IndexError
+    # means the date is not safely usable -- never a crash, never partial
+    # state, and the raw header text is never part of the safe None result.
     try:
         parsed = parsedate_to_datetime(stripped)
-    except (TypeError, ValueError, OverflowError, IndexError):
-        return None
-    if parsed is None:
-        return None
-
-    # 3. Convert to aware UTC safely -- parsedate_to_datetime() returns a
-    # naive datetime when the header omits a timezone (Python >= 3.10),
-    # never assume it is already UTC/local without making that explicit.
-    parsed_utc = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-
-    try:
+        if parsed is None:
+            return None
+        # Convert to aware UTC safely -- parsedate_to_datetime() returns a
+        # naive datetime when the header omits a timezone (Python >= 3.10),
+        # never assume it is already UTC/local without making that explicit.
+        parsed_utc = (
+            parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        )
         delta = (parsed_utc - now).total_seconds()
-    except (TypeError, OverflowError):
+    except (TypeError, ValueError, OverflowError, IndexError):
         return None
     if not math.isfinite(delta):
         return None

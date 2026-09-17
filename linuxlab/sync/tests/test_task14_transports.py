@@ -859,6 +859,53 @@ def test_parse_retry_after_extreme_date_offset_still_returns_none_safely():
     assert parse_retry_after(f"Fri, 31 Dec {huge_year_digits} 23:59:59 GMT", now=now) is None
 
 
+# --- Fix round 2 I3: parsedate_to_datetime() itself accepts "Fri, 31 Dec
+# 9999 23:59:59 -0100" (year 9999 and a small, in-bounds offset are both
+# individually valid), but converting it to UTC by ADDING the offset pushes
+# the result past datetime.MAXYEAR -- astimezone(UTC) then raises an
+# untyped OverflowError that was not covered by any guard.
+
+
+def test_parse_retry_after_utc_normalization_overflow_returns_none():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("Fri, 31 Dec 9999 23:59:59 -0100", now=now) is None
+
+
+def test_classify_http_failure_429_utc_normalization_overflow_stays_typed():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    error = classify_http_failure(
+        429, retry_after="Fri, 31 Dec 9999 23:59:59 -0100", now=now
+    )
+
+    assert isinstance(error, RateLimitedTransportError)
+    assert error.failure.category is SyncOutcome.RATE_LIMITED
+    assert error.failure.retry_after_seconds is None
+
+
+def test_http_transport_429_utc_normalization_overflow_stays_typed():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    headers = Message()
+    headers["Retry-After"] = "Fri, 31 Dec 9999 23:59:59 -0100"
+    error = urllib.error.HTTPError(
+        url="https://central.example.org/api/v1/sync/events/",
+        code=429,
+        msg="Too Many Requests",
+        hdrs=headers,
+        fp=None,
+    )
+    error.read = lambda: b"{}"
+
+    with (
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
+        pytest.raises(RateLimitedTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert excinfo.value.failure.category is SyncOutcome.RATE_LIMITED
+    assert excinfo.value.failure.retry_after_seconds is None
+
+
 def test_parse_retry_after_expired_date_still_clamps_to_zero():
     now = datetime(2026, 9, 15, 0, 5, 0, tzinfo=UTC)
     assert parse_retry_after("Tue, 15 Sep 2026 00:00:00 GMT", now=now) == 0
