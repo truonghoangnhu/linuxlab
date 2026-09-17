@@ -16,9 +16,11 @@ from linuxlab.sync.contracts import (
     REJECTED,
     AuthTransportError,
     BatchAck,
+    DeliveryFailure,
     EventAck,
     ProtocolTransportError,
     RequestTooLargeError,
+    SyncOutcome,
     TransientTransportError,
 )
 from linuxlab.sync.models import (
@@ -32,6 +34,19 @@ from linuxlab.sync.outbox import flush_outbox
 from linuxlab.sync.transports import FileSyncTransport
 
 pytestmark = pytest.mark.django_db
+
+# Corrective B Task 6: ProtocolTransportError now requires an explicit
+# DeliveryFailure -- these existing fixtures all represent an HTTP-400-style
+# protocol fault, so they carry PERMANENT_REJECTION metadata (the same
+# category classify_http_failure(400) itself constructs). This is a
+# constructor-only adaptation: it does not change any of these tests'
+# pre-Task-8 worker assertions (outbox.py still dispatches by exception
+# class, unchanged, until Task 8).
+_HTTP_400_FAILURE = DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, http_status=400)
+
+
+def _protocol_error(message="400"):
+    return ProtocolTransportError(message, failure=_HTTP_400_FAILURE)
 
 
 def _make_outbox(**overrides):
@@ -207,7 +222,7 @@ def test_transient_transport_error_releases_whole_batch_with_incremented_attempt
 
 def test_protocol_transport_error_also_releases_as_transient_never_dead_letters():
     row = _make_outbox()
-    transport = _ScriptedTransport(exception=ProtocolTransportError("request too large"))
+    transport = _ScriptedTransport(exception=_protocol_error("request too large"))
 
     summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
 
@@ -429,7 +444,7 @@ def test_flush_through_real_http_transport_never_delivers_a_masked_duplicate_id(
 
 def test_deterministic_400_on_singleton_releases_retryable_without_dead_lettering():
     row = _make_outbox()
-    transport = _ScriptedTransport(exception=ProtocolTransportError("malformed request"))
+    transport = _ScriptedTransport(exception=_protocol_error("malformed request"))
 
     summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
 
@@ -444,7 +459,7 @@ def test_deterministic_400_on_singleton_releases_retryable_without_dead_letterin
 
 def test_deterministic_400_does_not_tight_loop_the_identical_request():
     row = _make_outbox()
-    transport = _ScriptedTransport(exception=ProtocolTransportError("malformed request"))
+    transport = _ScriptedTransport(exception=_protocol_error("malformed request"))
     now = timezone.now()
 
     first = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60, now=now)
@@ -476,11 +491,11 @@ def test_multi_event_400_bisects_and_isolates_the_offending_singleton():
     def _decide(envelopes):
         ids = {e.event_id for e in envelopes}
         if len(envelopes) == 4:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         if ids == {a.event_id, b.event_id}:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         if ids == {b.event_id}:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         if ids == {a.event_id}:
             return BatchAck(results=(EventAck(event_id=a.event_id, status=ACCEPTED),))
         if ids == {c.event_id, d.event_id}:
@@ -514,7 +529,7 @@ def test_multi_event_400_bisects_and_isolates_the_offending_singleton():
 def test_multi_event_400_never_dead_letters_any_event():
     a = _make_outbox()
     b = _make_outbox(next_attempt_at=a.next_attempt_at)
-    transport = _ScriptedTransport(exception=ProtocolTransportError("400"))
+    transport = _ScriptedTransport(exception=_protocol_error("400"))
 
     summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
 
@@ -528,7 +543,7 @@ def test_singleton_400_uses_long_protocol_backoff_distinct_from_transient():
     transient_row = _make_outbox(next_attempt_at=protocol_row.next_attempt_at)
     now = timezone.now()
 
-    protocol_transport = _ScriptedTransport(exception=ProtocolTransportError("400"))
+    protocol_transport = _ScriptedTransport(exception=_protocol_error("400"))
     flush_outbox(
         protocol_transport, max_events=1, max_bytes=1_000_000, lease_seconds=60, now=now
     )
@@ -554,11 +569,11 @@ def test_worker_delay_regression_second_cycle_does_not_resend_identical_batch():
     def _decide(envelopes):
         ids = {e.event_id for e in envelopes}
         if ids == {a.event_id, b.event_id}:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         if ids == {a.event_id}:
             return BatchAck(results=(EventAck(event_id=a.event_id, status=ACCEPTED),))
         if ids == {b.event_id}:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         raise AssertionError(f"unexpected batch: {ids}")
 
     transport = _CallableTransport(_decide)
@@ -588,9 +603,9 @@ def test_unrelated_eligible_event_still_progresses_after_singleton_400():
     def _decide(envelopes):
         ids = {e.event_id for e in envelopes}
         if stuck.event_id in ids and len(envelopes) > 1:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         if ids == {stuck.event_id}:
-            raise ProtocolTransportError("400")
+            raise _protocol_error("400")
         return BatchAck(
             results=tuple(EventAck(event_id=e.event_id, status=ACCEPTED) for e in envelopes)
         )

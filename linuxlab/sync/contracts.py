@@ -5,9 +5,11 @@ storage shape. Nothing here is Django-aware.
 """
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
@@ -78,23 +80,99 @@ class SyncTransport(Protocol):
     def send_batch(self, envelopes: tuple[WireEventEnvelope, ...]) -> BatchAck: ...
 
 
+class SyncOutcome(StrEnum):
+    """Stable semantic transport/network outcomes (Corrective B Task 6,
+    approved spec §12). Retry policy (Task 8) consumes these outcomes --
+    it must not inspect HTTP numbers or exception classes; `.category`
+    alone is retry authority."""
+
+    SUCCESS = "SUCCESS"
+    PERMANENT_REJECTION = "PERMANENT_REJECTION"
+    AUTH_OR_REGISTRATION_FAILURE = "AUTH_OR_REGISTRATION_FAILURE"
+    TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
+    RATE_LIMITED = "RATE_LIMITED"
+
+
+# Upper-case aliases of the enum members, as required by the plan's public
+# interface ledger -- exported alongside SyncOutcome itself so callers may
+# import either the enum member or the bare constant.
+SUCCESS = SyncOutcome.SUCCESS
+PERMANENT_REJECTION = SyncOutcome.PERMANENT_REJECTION
+AUTH_OR_REGISTRATION_FAILURE = SyncOutcome.AUTH_OR_REGISTRATION_FAILURE
+TRANSIENT_FAILURE = SyncOutcome.TRANSIENT_FAILURE
+RATE_LIMITED = SyncOutcome.RATE_LIMITED
+
+
+@dataclass(frozen=True)
+class DeliveryFailure:
+    """Safe FAILURE metadata only -- never SUCCESS (rejected below), and
+    never a raw exception, response body, header, or Authorization value
+    (Corrective B Task 6). `error_code` is a short safe machine code
+    (e.g. "BATCH_TOO_LARGE"), never a raw remote reason/response."""
+
+    category: SyncOutcome
+    http_status: int | None = None
+    error_code: str = ""
+    retry_after_seconds: int | float | None = None
+
+    def __post_init__(self):
+        if self.category is SyncOutcome.SUCCESS:
+            raise ValueError("DeliveryFailure cannot represent SUCCESS")
+        if self.http_status is not None:
+            if isinstance(self.http_status, bool) or not isinstance(self.http_status, int):
+                raise TypeError("http_status must be an int or None")
+            if not (100 <= self.http_status <= 599):
+                raise ValueError("http_status must be a valid HTTP status code")
+        if not isinstance(self.error_code, str):
+            raise TypeError("error_code must be a string")
+        if self.retry_after_seconds is not None:
+            if isinstance(self.retry_after_seconds, bool) or not isinstance(
+                self.retry_after_seconds, int | float
+            ):
+                raise TypeError("retry_after_seconds must be an int, float, or None")
+            if not math.isfinite(self.retry_after_seconds):
+                raise ValueError("retry_after_seconds must be finite")
+            if self.retry_after_seconds < 0:
+                raise ValueError("retry_after_seconds must be non-negative")
+
+
 class TransportError(Exception):
     """Base for whole-batch (not per-event) transport failures raised by
     send_batch() -- always classify into exactly one of the subclasses
-    below rather than raising this directly (T14-D29)."""
+    below rather than raising this directly (T14-D29). Every instance
+    carries `.failure: DeliveryFailure` -- safe metadata only, never a
+    raw exception/response body/header (Corrective B Task 6). Retry
+    policy consumes `.failure.category`, never this class or the
+    message text."""
+
+    def __init__(self, message="transport failure", *, failure):
+        super().__init__(message)
+        self.failure = failure
 
 
 class TransientTransportError(TransportError):
     """Timeout, DNS/connect failure, 5xx, or a malformed/unparseable
     response -- always safely retryable; never a reason to dead-letter
-    any event (T14-D14)."""
+    any event (T14-D14). Defaults to TRANSIENT_FAILURE metadata unless
+    the caller supplies a more specific `failure` (e.g. RATE_LIMITED via
+    the RateLimitedTransportError subclass)."""
+
+    def __init__(self, message="transient transport failure", *, failure=None):
+        if failure is None:
+            failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+        super().__init__(message, failure=failure)
 
 
 class AuthTransportError(TransportError):
     """401/403 -- a channel/credential fault, never an individual event's
     fault; callers must release the whole claimed batch back to PENDING
     without dead-lettering and without incrementing per-event attempts
-    (T14-D17)."""
+    (T14-D17). Always AUTH_OR_REGISTRATION_FAILURE metadata."""
+
+    def __init__(self, message="authentication or registration failure", *, failure=None):
+        if failure is None:
+            failure = DeliveryFailure(category=SyncOutcome.AUTH_OR_REGISTRATION_FAILURE)
+        super().__init__(message, failure=failure)
 
 
 class ProtocolTransportError(TransportError):
@@ -103,7 +181,16 @@ class ProtocolTransportError(TransportError):
     orchestrator releases the whole batch as retryable (never falsely
     dead-lettering an event over a request-level fault) and flags the
     result as a protocol fault so a deterministic 400 cannot silently
-    tight-loop the identical request forever (T14-D40 corrective)."""
+    tight-loop the identical request forever (T14-D40 corrective).
+
+    Requires an EXPLICIT `failure` -- no default category (Corrective B
+    Task 6): the same class represents an HTTP 400 (PERMANENT_REJECTION)
+    and other response-protocol faults without permanent-rejection
+    evidence (TRANSIENT_FAILURE); there is no implicit "protocol error
+    means permanent" fallback."""
+
+    def __init__(self, message="protocol failure", *, failure):
+        super().__init__(message, failure=failure)
 
 
 class RequestTooLargeError(ProtocolTransportError):
@@ -114,7 +201,30 @@ class RequestTooLargeError(ProtocolTransportError):
     T14-D40: split a multi-event batch and retry smaller subsets; a
     singleton event that still receives 413 is permanently unsendable
     under the current transport contract and dead-letters with code
-    EVENT_TOO_LARGE."""
+    EVENT_TOO_LARGE. Supplies its own explicit TRANSIENT_FAILURE
+    metadata with the safe BATCH_TOO_LARGE code to ProtocolTransportError
+    -- callers never need to pass `failure` themselves."""
+
+    def __init__(self, message="request too large", *, failure=None):
+        if failure is None:
+            failure = DeliveryFailure(
+                category=SyncOutcome.TRANSIENT_FAILURE, error_code="BATCH_TOO_LARGE"
+            )
+        super().__init__(message, failure=failure)
+
+
+class RateLimitedTransportError(TransientTransportError):
+    """429 -- Central is rate-limiting this Node. A subclass of
+    TransientTransportError (always safely retryable), carrying
+    RATE_LIMITED metadata and, when Central supplied one, a parsed
+    Retry-After delay in `.failure.retry_after_seconds`."""
+
+    def __init__(self, message="rate limited", *, failure=None, retry_after_seconds=None):
+        if failure is None:
+            failure = DeliveryFailure(
+                category=SyncOutcome.RATE_LIMITED, retry_after_seconds=retry_after_seconds
+            )
+        super().__init__(message, failure=failure)
 
 
 @dataclass(frozen=True)

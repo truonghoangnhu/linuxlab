@@ -1,12 +1,16 @@
 """Task 14 SyncTransport implementations (T14-D01, T14-D02, T14-D29,
-T14-D39).
+T14-D39); Corrective B Task 6 adds semantic HTTP failure classification
+and a Retry-After parser.
 
 HttpSyncTransport is the production transport: HTTPS-only (certificate
 verification is `urllib.request`'s unconditional default; there is no
 alternate code path that would fall back to plain HTTP), a Bearer
 secret + Node ID sent as headers only (never in the request body or in
 any log-safe repr), and strict, per-event ACK parsing -- a bare 2xx
-response never implies every event was delivered.
+response never implies every event was delivered. Redirects are never
+followed automatically, so Authorization/Bearer credentials can never
+be silently forwarded to a second origin; a 3xx response is classified
+as a conservative transient failure instead.
 
 FileSyncTransport is dev/test/reference only: it writes a deterministic
 canonical batch file and always returns every event UNCONFIRMED, so it
@@ -14,9 +18,11 @@ can never itself cause a caller to infer DELIVERED.
 """
 
 import json
+import math
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -24,15 +30,141 @@ from uuid import uuid4
 from .contracts import (
     AuthTransportError,
     BatchAck,
+    DeliveryFailure,
     ProtocolTransportError,
+    RateLimitedTransportError,
     RequestTooLargeError,
+    SyncOutcome,
     TransientTransportError,
+    TransportError,
     canonical_event_dict,
     parse_ack_results,
     serialize_sync_batch,
 )
 
 _EVENTS_PATH = "/api/v1/sync/events/"
+
+_MAX_RETRY_AFTER_HEADER_LENGTH = 4096
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow an HTTP redirect automatically (Corrective B Task 6
+    §10/§12): Authorization/Bearer credentials must never be silently
+    forwarded to a second origin. Returning None from redirect_request()
+    causes urllib to surface the 3xx response as an HTTPError instead of
+    transparently re-requesting it at a different URL, so the caller
+    classifies it (conservatively transient) rather than urllib crossing
+    an origin boundary with credentials still attached."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _install_no_redirect_opener():
+    """Install a process-wide urllib opener that never follows a
+    redirect. `linuxlab.sync.transports` is the only urllib user in this
+    codebase (verified by repository search), so this has no effect
+    elsewhere. Idempotent: safe to call more than once."""
+    urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
+_install_no_redirect_opener()
+
+
+def parse_retry_after(value: str | None, *, now: datetime) -> int | float | None:
+    """Parse an HTTP Retry-After header value into a non-negative number
+    of seconds, or None if it cannot be safely interpreted (Corrective B
+    Task 6 §8). Tries integer delta-seconds first, then an HTTP-date via
+    parsedate_to_datetime(), converted to aware UTC before subtracting
+    `now`. Negative/expired results clamp to 0; malformed or nonfinite
+    input returns None. No max_delay/retry-budget policy lives here --
+    that is Task 8's concern. The raw header value is never retained in
+    the result, and a header longer than 4096 characters is ignored
+    outright rather than parsed."""
+    if value is None:
+        return None
+    if len(value) > _MAX_RETRY_AFTER_HEADER_LENGTH:
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    # 1. Integer delta-seconds first. Deliberately stricter than int()'s
+    # own leniency (underscores, surrounding whitespace already
+    # stripped) -- only an optional sign and ASCII digits. Preserved as
+    # a Python int (arbitrary precision) even for an excessively large
+    # value; never routed through float, which could lose precision or
+    # overflow. Task 8 caps this to policy.
+    sign = ""
+    digits = stripped
+    if stripped[0] in "+-":
+        sign, digits = stripped[0], stripped[1:]
+    if digits.isdigit():
+        seconds = int(sign + digits)
+        return max(seconds, 0)
+
+    # 2. Then an HTTP-date.
+    try:
+        parsed = parsedate_to_datetime(stripped)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if parsed is None:
+        return None
+
+    # 3. Convert to aware UTC safely -- parsedate_to_datetime() returns a
+    # naive datetime when the header omits a timezone (Python >= 3.10),
+    # never assume it is already UTC/local without making that explicit.
+    parsed_utc = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    try:
+        delta = (parsed_utc - now).total_seconds()
+    except (TypeError, OverflowError):
+        return None
+    if not math.isfinite(delta):
+        return None
+    return max(0, delta)
+
+
+def classify_http_failure(
+    status: int, *, retry_after: str | None = None, now: datetime | None = None
+) -> TransportError:
+    """Map one concrete HTTP status to a semantic TransportError carrying
+    explicit DeliveryFailure metadata (Corrective B Task 6 §7, approved
+    spec §12). Returns the error; the caller raises it. No retry
+    budget/max_delay/scheduling logic lives here -- that is Task 8's
+    concern, and this classifier never inspects retry policy."""
+    if status in (401, 403):
+        return AuthTransportError(f"authentication rejected (HTTP {status})")
+    if status == 400:
+        return ProtocolTransportError(
+            "request rejected (HTTP 400)",
+            failure=DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, http_status=400),
+        )
+    if status == 413:
+        return RequestTooLargeError("request rejected (HTTP 413)")
+    if status == 429:
+        effective_now = now if now is not None else datetime.now(UTC)
+        retry_after_seconds = parse_retry_after(retry_after, now=effective_now)
+        return RateLimitedTransportError(
+            "rate limited (HTTP 429)",
+            failure=DeliveryFailure(
+                category=SyncOutcome.RATE_LIMITED,
+                http_status=429,
+                retry_after_seconds=retry_after_seconds,
+            ),
+        )
+    if status == 408:
+        return TransientTransportError(f"request timeout (HTTP {status})")
+    if 500 <= status <= 599:
+        return TransientTransportError(f"server error (HTTP {status})")
+    if 300 <= status <= 399:
+        # Redirects are never followed (see _NoRedirectHandler); a 3xx
+        # that still reaches here is classified conservatively transient.
+        return TransientTransportError(f"unexpected redirect (HTTP {status})")
+    # Any other unknown non-2xx status: conservative transient, never
+    # "all 4xx are permanent".
+    return TransientTransportError(f"unexpected HTTP status {status}")
 
 
 class HttpSyncTransport:
@@ -77,23 +209,21 @@ class HttpSyncTransport:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 raw_body = response.read()
         except urllib.error.HTTPError as exc:
-            self._raise_for_status(exc.code)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise TransientTransportError(str(exc)) from exc
+            # Never str(exc)/the raw response body -- only the status code
+            # and a bounded, safe Retry-After header value ever cross into
+            # classify_http_failure() (Corrective B Task 6 §9/§13).
+            retry_after = None
+            if exc.headers is not None:
+                retry_after = exc.headers.get("Retry-After")
+            raise classify_http_failure(
+                exc.code, retry_after=retry_after, now=datetime.now(UTC)
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            # Fixed safe message: never str(exc), which could embed the
+            # target host/URL or other network internals.
+            raise TransientTransportError("network failure") from None
 
         return self._parse_batch_response(raw_body)
-
-    @staticmethod
-    def _raise_for_status(status):
-        if status in (401, 403):
-            raise AuthTransportError(f"authentication rejected (HTTP {status})")
-        if status == 413:
-            raise RequestTooLargeError(f"request rejected (HTTP {status})")
-        if status == 400:
-            raise ProtocolTransportError(f"request rejected (HTTP {status})")
-        # 5xx and any other non-2xx: always safe to treat as retryable
-        # rather than inventing a new terminal failure mode.
-        raise TransientTransportError(f"unexpected HTTP status {status}")
 
     @staticmethod
     def _parse_batch_response(raw_body):

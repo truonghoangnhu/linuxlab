@@ -4,9 +4,14 @@ certificate-verified, per-event ACK parsing); FileSyncTransport is
 dev/test/reference only and can never itself prove production delivery.
 """
 
+import http.server
 import json
+import threading
 import urllib.error
+import urllib.request
 import uuid
+from datetime import UTC, datetime
+from email.message import Message
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,10 +23,19 @@ from linuxlab.sync.contracts import (
     REJECTED,
     AuthTransportError,
     ProtocolTransportError,
+    RateLimitedTransportError,
+    RequestTooLargeError,
+    SyncOutcome,
     TransientTransportError,
     WireEventEnvelope,
 )
-from linuxlab.sync.transports import FileSyncTransport, HttpSyncTransport
+from linuxlab.sync.transports import (
+    FileSyncTransport,
+    HttpSyncTransport,
+    _NoRedirectHandler,
+    classify_http_failure,
+    parse_retry_after,
+)
 
 
 def _make_envelope(**overrides):
@@ -454,6 +468,22 @@ def test_http_transport_generic_2xx_without_results_never_marks_all_delivered():
         transport.send_batch((envelope,))
 
 
+# --- Corrective B Task 6: semantic transport outcome taxonomy --------------
+
+
+def test_429_carries_semantic_retry_after():
+    from datetime import UTC, datetime
+
+    from linuxlab.sync.contracts import RateLimitedTransportError, SyncOutcome
+    from linuxlab.sync.transports import classify_http_failure
+
+    error = classify_http_failure(429, retry_after="120", now=datetime(2026, 9, 15, tzinfo=UTC))
+
+    assert isinstance(error, RateLimitedTransportError)
+    assert error.failure.category is SyncOutcome.RATE_LIMITED
+    assert error.failure.retry_after_seconds == 120
+
+
 # --- HTTP failure classification -------------------------------------------
 
 
@@ -535,6 +565,318 @@ def test_dns_connect_failure_is_transient():
         pytest.raises(TransientTransportError),
     ):
         transport.send_batch((envelope,))
+
+
+def test_network_failure_never_leaks_host_or_credentials_in_error_text():
+    transport = HttpSyncTransport(
+        "https://central.example.org", uuid.uuid4(), "TOP-SECRET-BEARER-VALUE"
+    )
+    envelope = _make_envelope()
+
+    def _boom(request, timeout=None):
+        del request, timeout
+        raise urllib.error.URLError(
+            "Connection refused: TOP-SECRET-BEARER-VALUE at central.example.org:9999"
+        )
+
+    with (
+        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_boom),
+        pytest.raises(TransientTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert "TOP-SECRET-BEARER-VALUE" not in str(excinfo.value)
+    assert "TOP-SECRET-BEARER-VALUE" not in repr(excinfo.value)
+    assert "central.example.org:9999" not in str(excinfo.value)
+    assert "central.example.org:9999" not in repr(excinfo.value)
+
+
+# --- classify_http_failure() status coverage --------------------------------
+
+
+def test_classify_400_is_permanent_rejection_with_http_status():
+    error = classify_http_failure(400)
+
+    assert isinstance(error, ProtocolTransportError)
+    assert error.failure.category is SyncOutcome.PERMANENT_REJECTION
+    assert error.failure.http_status == 400
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_classify_401_403_is_auth_or_registration_failure(status):
+    error = classify_http_failure(status)
+
+    assert isinstance(error, AuthTransportError)
+    assert error.failure.category is SyncOutcome.AUTH_OR_REGISTRATION_FAILURE
+
+
+def test_classify_408_is_transient():
+    error = classify_http_failure(408)
+
+    assert isinstance(error, TransientTransportError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+
+
+def test_classify_413_is_request_too_large_with_transient_and_safe_code():
+    error = classify_http_failure(413)
+
+    assert isinstance(error, RequestTooLargeError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+    assert error.failure.error_code == "BATCH_TOO_LARGE"
+
+
+def test_classify_429_without_retry_after_is_still_rate_limited():
+    error = classify_http_failure(429)
+
+    assert isinstance(error, RateLimitedTransportError)
+    assert error.failure.category is SyncOutcome.RATE_LIMITED
+    assert error.failure.retry_after_seconds is None
+
+
+@pytest.mark.parametrize("status", [500, 501, 502, 503, 599])
+def test_classify_5xx_is_transient(status):
+    error = classify_http_failure(status)
+
+    assert isinstance(error, TransientTransportError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+
+
+@pytest.mark.parametrize("status", [300, 301, 302, 303, 307, 308])
+def test_classify_3xx_is_conservatively_transient(status):
+    error = classify_http_failure(status)
+
+    assert isinstance(error, TransientTransportError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+    assert not isinstance(error, AuthTransportError)
+    assert not isinstance(error, ProtocolTransportError)
+
+
+@pytest.mark.parametrize("status", [402, 404, 409, 422, 451])
+def test_classify_unknown_non_2xx_is_conservatively_transient_never_all_4xx_permanent(status):
+    error = classify_http_failure(status)
+
+    assert isinstance(error, TransientTransportError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+    assert not isinstance(error, ProtocolTransportError)
+
+
+def test_http_transport_429_extracts_retry_after_header_from_the_real_response():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    headers = Message()
+    headers["Retry-After"] = "30"
+    error = urllib.error.HTTPError(
+        url="https://central.example.org/api/v1/sync/events/",
+        code=429,
+        msg="Too Many Requests",
+        hdrs=headers,
+        fp=None,
+    )
+    error.read = lambda: b"{}"
+
+    with (
+        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        pytest.raises(RateLimitedTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert excinfo.value.failure.category is SyncOutcome.RATE_LIMITED
+    assert excinfo.value.failure.retry_after_seconds == 30
+
+
+def test_http_error_classification_never_leaks_raw_response_body():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    error = _http_error(400)
+    error.read = lambda: b'{"detail": "TOP-SECRET-SERVER-BODY", "authorization": "Bearer leaked"}'
+
+    with (
+        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        pytest.raises(ProtocolTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert "TOP-SECRET-SERVER-BODY" not in str(excinfo.value)
+    assert "TOP-SECRET-SERVER-BODY" not in repr(excinfo.value)
+    assert "TOP-SECRET-SERVER-BODY" not in repr(excinfo.value.failure)
+
+
+def test_http_error_with_no_headers_object_still_classifies_safely():
+    """`hdrs=None` (no headers at all on the HTTPError) must never raise
+    an AttributeError while extracting Retry-After -- exercised
+    incidentally by every other _http_error()-based test here, asserted
+    explicitly for the 429 case where Retry-After extraction is load
+    bearing."""
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    error = _http_error(429)
+    error.read = lambda: b"{}"
+
+    with (
+        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        pytest.raises(RateLimitedTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert excinfo.value.failure.retry_after_seconds is None
+
+
+# --- parse_retry_after() -----------------------------------------------
+
+
+def test_parse_retry_after_none_value_returns_none():
+    assert parse_retry_after(None, now=datetime(2026, 9, 15, tzinfo=UTC)) is None
+
+
+def test_parse_retry_after_integer_delta_seconds():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("120", now=now) == 120
+
+
+def test_parse_retry_after_http_date_computes_delta_from_now():
+    now = datetime(2026, 9, 15, 0, 0, 0, tzinfo=UTC)
+    future_date = "Tue, 15 Sep 2026 00:02:00 GMT"
+    result = parse_retry_after(future_date, now=now)
+    assert result == pytest.approx(120, abs=1)
+
+
+def test_parse_retry_after_expired_http_date_clamps_to_zero():
+    now = datetime(2026, 9, 15, 0, 5, 0, tzinfo=UTC)
+    past_date = "Tue, 15 Sep 2026 00:00:00 GMT"
+    assert parse_retry_after(past_date, now=now) == 0
+
+
+def test_parse_retry_after_negative_integer_clamps_to_zero():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("-5", now=now) == 0
+
+
+def test_parse_retry_after_malformed_value_returns_none():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("not-a-valid-retry-after", now=now) is None
+
+
+def test_parse_retry_after_whitespace_only_returns_none():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("   ", now=now) is None
+
+
+def test_parse_retry_after_malformed_http_date_returns_none():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("Not, 99 Foo 9999 99:99:99 ZZZ", now=now) is None
+
+
+def test_parse_retry_after_oversized_header_is_ignored():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("1" * 5000, now=now) is None
+
+
+def test_parse_retry_after_excessive_integer_preserved_as_python_int_never_float():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    huge = 10**30
+    result = parse_retry_after(str(huge), now=now)
+    assert result == huge
+    assert isinstance(result, int)
+
+
+def test_parse_retry_after_never_retains_the_raw_sentinel_value():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    sentinel = "SENTINEL-DO-NOT-LEAK-" + "x" * 50
+
+    result = parse_retry_after(sentinel, now=now)
+
+    assert result is None
+    error = classify_http_failure(429, retry_after=sentinel, now=now)
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.failure)
+
+
+# --- no-redirect / Authorization safety -------------------------------------
+
+
+def test_no_redirect_handler_never_follows_a_redirect():
+    handler = _NoRedirectHandler()
+    req = urllib.request.Request("https://central.example.org/api/v1/sync/events/")
+
+    result = handler.redirect_request(
+        req, None, 302, "Found", {}, "https://evil.example.org/steal"
+    )
+
+    assert result is None
+
+
+class _SilentHTTPServer(http.server.HTTPServer):
+    def handle_error(self, request, client_address):
+        pass
+
+
+def test_redirect_is_never_followed_and_authorization_never_reaches_second_origin():
+    """Real, unmocked end-to-end proof (not just a unit test of the
+    handler): an origin server that answers every POST with a 302 to a
+    second local server, which never receives any request at all -- the
+    strongest possible proof that Authorization is never forwarded to a
+    second origin, since the second origin is never contacted."""
+    target_requests = []
+
+    class _TargetHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            target_requests.append(dict(self.headers.items()))
+            body = b'{"results": []}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format_, *args):
+            del format_, args
+
+    target_server = _SilentHTTPServer(("127.0.0.1", 0), _TargetHandler)
+    target_thread = threading.Thread(target=target_server.serve_forever, daemon=True)
+    target_thread.start()
+    target_port = target_server.server_address[1]
+
+    class _OriginHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{target_port}/api/v1/sync/events/"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, format_, *args):
+            del format_, args
+
+    origin_server = _SilentHTTPServer(("127.0.0.1", 0), _OriginHandler)
+    origin_thread = threading.Thread(target=origin_server.serve_forever, daemon=True)
+    origin_thread.start()
+    origin_port = origin_server.server_address[1]
+
+    try:
+        transport = HttpSyncTransport(
+            f"http://127.0.0.1:{origin_port}",
+            uuid.uuid4(),
+            "TOP-SECRET-BEARER-VALUE",
+            allow_insecure_http=True,
+            timeout=5,
+        )
+        envelope = _make_envelope()
+
+        with pytest.raises(TransientTransportError):
+            transport.send_batch((envelope,))
+
+        assert target_requests == []
+    finally:
+        origin_server.shutdown()
+        target_server.shutdown()
+        origin_thread.join(timeout=5)
+        target_thread.join(timeout=5)
 
 
 # --- FileSyncTransport (dev/test/reference only) ---------------------------

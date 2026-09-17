@@ -10,10 +10,23 @@ import pytest
 
 from linuxlab.sync.contracts import (
     ACCEPTED,
+    AUTH_OR_REGISTRATION_FAILURE,
     DUPLICATE,
+    PERMANENT_REJECTION,
+    RATE_LIMITED,
     REJECTED,
+    SUCCESS,
+    TRANSIENT_FAILURE,
+    AuthTransportError,
     BatchAck,
+    DeliveryFailure,
     EventAck,
+    ProtocolTransportError,
+    RateLimitedTransportError,
+    RequestTooLargeError,
+    SyncOutcome,
+    TransientTransportError,
+    TransportError,
     WireEventEnvelope,
     canonical_event_bytes,
     canonical_event_dict,
@@ -99,3 +112,171 @@ def test_batch_ack_status_for_known_event_id():
 def test_batch_ack_status_for_unknown_event_id_is_none_never_delivered():
     batch = BatchAck(results=())
     assert batch.status_for(uuid.uuid4()) is None
+
+
+# --- Corrective B Task 6: SyncOutcome / DeliveryFailure contract -----------
+
+
+def test_sync_outcome_has_exactly_the_five_approved_members():
+    assert {member.value for member in SyncOutcome} == {
+        "SUCCESS",
+        "PERMANENT_REJECTION",
+        "AUTH_OR_REGISTRATION_FAILURE",
+        "TRANSIENT_FAILURE",
+        "RATE_LIMITED",
+    }
+
+
+def test_sync_outcome_aliases_are_the_enum_members():
+    assert SUCCESS is SyncOutcome.SUCCESS
+    assert PERMANENT_REJECTION is SyncOutcome.PERMANENT_REJECTION
+    assert AUTH_OR_REGISTRATION_FAILURE is SyncOutcome.AUTH_OR_REGISTRATION_FAILURE
+    assert TRANSIENT_FAILURE is SyncOutcome.TRANSIENT_FAILURE
+    assert RATE_LIMITED is SyncOutcome.RATE_LIMITED
+
+
+def test_sync_outcome_is_a_str_enum_and_compares_equal_to_its_string_value():
+    assert SyncOutcome.TRANSIENT_FAILURE == "TRANSIENT_FAILURE"
+    assert isinstance(SyncOutcome.TRANSIENT_FAILURE, str)
+
+
+def test_delivery_failure_is_frozen():
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    with pytest.raises(FrozenInstanceError):
+        failure.category = SyncOutcome.RATE_LIMITED
+
+
+def test_delivery_failure_rejects_success_as_a_category():
+    with pytest.raises(ValueError, match="SUCCESS"):
+        DeliveryFailure(category=SyncOutcome.SUCCESS)
+
+
+def test_delivery_failure_defaults_are_safe_empty_metadata():
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    assert failure.http_status is None
+    assert failure.error_code == ""
+    assert failure.retry_after_seconds is None
+
+
+@pytest.mark.parametrize("status", [100, 200, 599])
+def test_delivery_failure_accepts_valid_http_status_boundaries(status):
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status=status)
+    assert failure.http_status == status
+
+
+@pytest.mark.parametrize("status", [99, 600, -1])
+def test_delivery_failure_rejects_out_of_range_http_status(status):
+    with pytest.raises(ValueError, match="http_status"):
+        DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status=status)
+
+
+def test_delivery_failure_rejects_non_int_http_status():
+    with pytest.raises(TypeError, match="http_status"):
+        DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status="400")
+    with pytest.raises(TypeError, match="http_status"):
+        DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status=True)
+
+
+def test_delivery_failure_accepts_int_or_float_retry_after_seconds():
+    assert DeliveryFailure(
+        category=SyncOutcome.RATE_LIMITED, retry_after_seconds=5
+    ).retry_after_seconds == 5
+    assert DeliveryFailure(
+        category=SyncOutcome.RATE_LIMITED, retry_after_seconds=5.5
+    ).retry_after_seconds == 5.5
+
+
+def test_delivery_failure_rejects_negative_retry_after_seconds():
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=-1)
+
+
+def test_delivery_failure_rejects_nonfinite_retry_after_seconds():
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=float("inf"))
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=float("nan"))
+
+
+def test_delivery_failure_rejects_bool_retry_after_seconds():
+    with pytest.raises(TypeError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=True)
+
+
+def test_delivery_failure_rejects_non_string_error_code():
+    with pytest.raises(TypeError, match="error_code"):
+        DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, error_code=None)
+
+
+# --- Corrective B Task 6: transport error hierarchy -------------------------
+
+
+def test_transport_error_base_requires_explicit_failure():
+    with pytest.raises(TypeError):
+        TransportError("transport failure")
+
+
+def test_transport_error_carries_the_supplied_failure():
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, error_code="X")
+    error = TransportError("boom", failure=failure)
+    assert error.failure is failure
+
+
+def test_transient_transport_error_defaults_to_transient_failure():
+    error = TransientTransportError("timeout")
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+
+
+def test_auth_transport_error_defaults_to_auth_or_registration_failure():
+    error = AuthTransportError("401")
+    assert error.failure.category is SyncOutcome.AUTH_OR_REGISTRATION_FAILURE
+
+
+def test_rate_limited_transport_error_is_a_transient_transport_error():
+    error = RateLimitedTransportError("429", retry_after_seconds=30)
+    assert isinstance(error, TransientTransportError)
+    assert error.failure.category is SyncOutcome.RATE_LIMITED
+    assert error.failure.retry_after_seconds == 30
+
+
+def test_request_too_large_error_defaults_to_transient_with_safe_code():
+    error = RequestTooLargeError("413")
+    assert isinstance(error, ProtocolTransportError)
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+    assert error.failure.error_code == "BATCH_TOO_LARGE"
+
+
+# --- Corrective B Task 6 §12: ProtocolTransportError explicit metadata,
+# no implicit "protocol error means permanent" fallback ---------------------
+
+
+def test_protocol_transport_error_requires_explicit_failure():
+    with pytest.raises(TypeError):
+        ProtocolTransportError("400")
+
+
+def test_protocol_transport_error_400_is_permanent_rejection():
+    error = ProtocolTransportError(
+        "request rejected (HTTP 400)",
+        failure=DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, http_status=400),
+    )
+    assert error.failure.category is SyncOutcome.PERMANENT_REJECTION
+    assert error.failure.http_status == 400
+
+
+def test_protocol_transport_error_malformed_ack_is_transient_not_permanent():
+    """The SAME class (ProtocolTransportError) represents a wholly
+    different semantic outcome for a malformed/missing/ambiguous ACK --
+    proving there is no implicit class-based "protocol error always
+    means permanent" fallback; `.failure.category` alone is authoritative."""
+    error = ProtocolTransportError(
+        "malformed ACK evidence", failure=DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    )
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+    # And this is a DIFFERENT ProtocolTransportError instance/category
+    # than the 400 case above -- the class alone never determines it.
+    permanent = ProtocolTransportError(
+        "400", failure=DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, http_status=400)
+    )
+    assert type(error) is type(permanent)
+    assert error.failure.category != permanent.failure.category
