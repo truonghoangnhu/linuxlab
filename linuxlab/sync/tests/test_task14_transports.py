@@ -6,6 +6,9 @@ dev/test/reference only and can never itself prove production delivery.
 
 import http.server
 import json
+import os
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -111,7 +114,7 @@ def test_http_transport_sends_bearer_secret_and_node_id_as_headers():
             200, {"results": [{"event_id": str(envelope.event_id), "status": ACCEPTED}]}
         )
 
-    with patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen):
+    with patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=_fake_urlopen):
         transport.send_batch((envelope,))
 
     headers = {k.lower(): v for k, v in captured_request["headers"].items()}
@@ -131,7 +134,7 @@ def test_http_transport_never_falls_back_from_https_to_http():
         raise urllib.error.URLError("connection refused")
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=_fake_urlopen),
         pytest.raises(TransientTransportError),
     ):
         transport.send_batch((envelope,))
@@ -160,7 +163,7 @@ def test_http_transport_parses_exact_per_event_results():
     }
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen",
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open",
         return_value=_fake_http_response(200, body),
     ):
         ack = transport.send_batch((e1, e2, e3))
@@ -176,7 +179,7 @@ def test_http_transport_treats_unknown_status_as_unconfirmed():
     body = {"results": [{"event_id": str(envelope.event_id), "status": "bogus-status"}]}
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen",
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open",
         return_value=_fake_http_response(200, body),
     ):
         ack = transport.send_batch((envelope,))
@@ -190,7 +193,7 @@ def test_http_transport_missing_event_result_is_unconfirmed():
     body = {"results": [{"event_id": str(present.event_id), "status": ACCEPTED}]}
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen",
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open",
         return_value=_fake_http_response(200, body),
     ):
         ack = transport.send_batch((present, missing))
@@ -217,7 +220,7 @@ def test_duplicate_accepted_entries_for_same_id_are_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -233,7 +236,7 @@ def test_accepted_then_rejected_for_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -249,7 +252,7 @@ def test_rejected_then_accepted_for_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -265,7 +268,7 @@ def test_duplicate_then_accepted_for_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -278,7 +281,7 @@ def test_rejected_missing_code_is_unconfirmed():
     body = [{"event_id": str(envelope.event_id), "status": REJECTED}]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -294,7 +297,7 @@ def test_unknown_result_id_never_affects_sent_events():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -310,7 +313,7 @@ def test_mixture_of_valid_and_malformed_results_only_the_malformed_stays_unconfi
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((good, malformed))
 
@@ -333,7 +336,7 @@ def test_accepted_then_malformed_rejection_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -349,7 +352,7 @@ def test_malformed_rejection_then_accepted_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -365,7 +368,7 @@ def test_accepted_then_unknown_status_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -381,7 +384,7 @@ def test_unknown_status_then_accepted_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -397,7 +400,7 @@ def test_duplicate_then_malformed_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -413,7 +416,7 @@ def test_malformed_then_duplicate_same_id_is_unconfirmed():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((envelope,))
 
@@ -430,7 +433,7 @@ def test_unrelated_valid_entry_is_unaffected_by_a_different_ids_ambiguity():
     ]
 
     with patch(
-        "linuxlab.sync.transports.urllib.request.urlopen", return_value=_batch_response(body)
+        "linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=_batch_response(body)
     ):
         ack = transport.send_batch((good, ambiguous))
 
@@ -448,7 +451,7 @@ def test_http_transport_malformed_json_response_is_transient():
     response.__exit__.return_value = False
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", return_value=response),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=response),
         pytest.raises(TransientTransportError),
     ):
         transport.send_batch((envelope,))
@@ -460,12 +463,65 @@ def test_http_transport_generic_2xx_without_results_never_marks_all_delivered():
 
     with (
         patch(
-            "linuxlab.sync.transports.urllib.request.urlopen",
+            "linuxlab.sync.transports._TRANSPORT_OPENER.open",
             return_value=_fake_http_response(200, {"ok": True}),
         ),
         pytest.raises(TransientTransportError),
     ):
         transport.send_batch((envelope,))
+
+
+# --- Fix round 1 M3: malformed whole-response JSON must not retain the
+# raw JSONDecodeError (which embeds the ENTIRE response document verbatim
+# in its own .doc attribute) as an explicit exception cause -- the class
+# and TRANSIENT_FAILURE category stay exactly as before (Task-8-boundary
+# compatibility ruling); only the raw-evidence retention is removed.
+
+
+def test_malformed_json_response_never_retains_the_raw_decoder_cause():
+    import traceback
+
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+    sentinel = "TOP-SECRET-MALFORMED-BODY-SENTINEL"
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = f'{{"detail": "{sentinel}", not valid json'.encode()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+
+    with (
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", return_value=response),
+        pytest.raises(TransientTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    error = excinfo.value
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.failure)
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert sentinel not in formatted
+    # Compatibility ruling: class/category unchanged.
+    assert error.failure.category is SyncOutcome.TRANSIENT_FAILURE
+
+
+def test_malformed_batch_shape_response_still_transient_and_safe():
+    transport = HttpSyncTransport("https://central.example.org", uuid.uuid4(), "secret")
+    envelope = _make_envelope()
+
+    with (
+        patch(
+            "linuxlab.sync.transports._TRANSPORT_OPENER.open",
+            return_value=_fake_http_response(200, {"ok": True}),
+        ),
+        pytest.raises(TransientTransportError) as excinfo,
+    ):
+        transport.send_batch((envelope,))
+
+    assert excinfo.value.failure.category is SyncOutcome.TRANSIENT_FAILURE
 
 
 # --- Corrective B Task 6: semantic transport outcome taxonomy --------------
@@ -505,7 +561,7 @@ def test_5xx_is_transient(status):
     error.read = lambda: b"{}"
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(TransientTransportError),
     ):
         transport.send_batch((envelope,))
@@ -519,7 +575,7 @@ def test_401_403_is_auth_fault(status):
     error.read = lambda: b"{}"
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(AuthTransportError),
     ):
         transport.send_batch((envelope,))
@@ -533,7 +589,7 @@ def test_400_413_is_protocol_failure(status):
     error.read = lambda: b"{}"
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(ProtocolTransportError),
     ):
         transport.send_batch((envelope,))
@@ -545,7 +601,7 @@ def test_timeout_is_transient():
 
     with (
         patch(
-            "linuxlab.sync.transports.urllib.request.urlopen",
+            "linuxlab.sync.transports._TRANSPORT_OPENER.open",
             side_effect=TimeoutError("timed out"),
         ),
         pytest.raises(TransientTransportError),
@@ -559,7 +615,7 @@ def test_dns_connect_failure_is_transient():
 
     with (
         patch(
-            "linuxlab.sync.transports.urllib.request.urlopen",
+            "linuxlab.sync.transports._TRANSPORT_OPENER.open",
             side_effect=urllib.error.URLError("name resolution failed"),
         ),
         pytest.raises(TransientTransportError),
@@ -580,7 +636,7 @@ def test_network_failure_never_leaks_host_or_credentials_in_error_text():
         )
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_boom),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=_boom),
         pytest.raises(TransientTransportError) as excinfo,
     ):
         transport.send_batch((envelope,))
@@ -675,7 +731,7 @@ def test_http_transport_429_extracts_retry_after_header_from_the_real_response()
     error.read = lambda: b"{}"
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(RateLimitedTransportError) as excinfo,
     ):
         transport.send_batch((envelope,))
@@ -691,7 +747,7 @@ def test_http_error_classification_never_leaks_raw_response_body():
     error.read = lambda: b'{"detail": "TOP-SECRET-SERVER-BODY", "authorization": "Bearer leaked"}'
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(ProtocolTransportError) as excinfo,
     ):
         transport.send_batch((envelope,))
@@ -713,7 +769,7 @@ def test_http_error_with_no_headers_object_still_classifies_safely():
     error.read = lambda: b"{}"
 
     with (
-        patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=error),
+        patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=error),
         pytest.raises(RateLimitedTransportError) as excinfo,
     ):
         transport.send_batch((envelope,))
@@ -754,6 +810,89 @@ def test_parse_retry_after_negative_integer_clamps_to_zero():
 def test_parse_retry_after_malformed_value_returns_none():
     now = datetime(2026, 9, 15, tzinfo=UTC)
     assert parse_retry_after("not-a-valid-retry-after", now=now) is None
+
+
+# --- Fix round 1 I3: harden Retry-After against non-ASCII "digit" text and
+# other unprocessable metadata that could otherwise escape the taxonomy as
+# a raw unhandled exception.
+
+
+def test_parse_retry_after_non_ascii_digit_text_returns_none():
+    """'²' (superscript two) is a Unicode "digit" per str.isdigit() but is
+    not ASCII-decimal; int() rejects it. Must return None, never raise."""
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("²" * 12, now=now) is None
+
+
+def test_parse_retry_after_non_ascii_decimal_digit_text_returns_none():
+    """Arabic-Indic digits ARE str.isdecimal()==True and int() actually
+    ACCEPTS them -- but they are not ASCII, so must still be rejected
+    (ASCII decimal delta-seconds only, per the taxonomy contract)."""
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("١٢٣", now=now) is None
+
+
+def test_parse_retry_after_huge_ascii_integer_preserved_exactly_never_overflows():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    huge_digits = "1" + "0" * 400
+    result = parse_retry_after(huge_digits, now=now)
+    assert result == int(huge_digits)
+    assert isinstance(result, int)
+
+
+def test_classify_http_failure_429_with_huge_retry_after_preserves_exact_int():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    huge = 10**400
+    error = classify_http_failure(429, retry_after=str(huge), now=now)
+
+    assert isinstance(error, RateLimitedTransportError)
+    assert error.failure.category is SyncOutcome.RATE_LIMITED
+    assert error.failure.retry_after_seconds == huge
+    assert isinstance(error.failure.retry_after_seconds, int)
+
+
+def test_parse_retry_after_extreme_date_offset_still_returns_none_safely():
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    assert parse_retry_after("Fri, 31 Dec 99999 23:59:59 GMT", now=now) is None
+    assert parse_retry_after("Fri, 31 Dec 9999 23:59:59 -9999", now=now) is None
+    huge_year_digits = "9" * 30
+    assert parse_retry_after(f"Fri, 31 Dec {huge_year_digits} 23:59:59 GMT", now=now) is None
+
+
+def test_parse_retry_after_expired_date_still_clamps_to_zero():
+    now = datetime(2026, 9, 15, 0, 5, 0, tzinfo=UTC)
+    assert parse_retry_after("Tue, 15 Sep 2026 00:00:00 GMT", now=now) == 0
+
+
+def test_parse_retry_after_normal_date_still_works():
+    now = datetime(2026, 9, 15, 0, 0, 0, tzinfo=UTC)
+    result = parse_retry_after("Tue, 15 Sep 2026 00:02:00 GMT", now=now)
+    assert result == pytest.approx(120, abs=1)
+
+
+def test_parse_retry_after_never_raises_for_a_battery_of_hostile_values():
+    """No malformed/unprocessable Retry-After value may ever escape as a
+    raw unhandled exception -- every one of these must return None."""
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    hostile_values = [
+        "²" * 12,
+        "١٢٣",
+        "not-a-number",
+        "NaN",
+        "Infinity",
+        "1e400",
+        "0x10",
+        "1_000",
+        "Fri, 31 Dec 99999 23:59:59 GMT",
+        "Fri, 31 Dec 9999 23:59:59 -9999",
+        "",
+        "   ",
+        "-",
+        "+",
+        "+-1",
+    ]
+    for value in hostile_values:
+        assert parse_retry_after(value, now=now) is None, f"{value!r} should be None"
 
 
 def test_parse_retry_after_whitespace_only_returns_none():
@@ -811,25 +950,45 @@ class _SilentHTTPServer(http.server.HTTPServer):
         pass
 
 
-def test_redirect_is_never_followed_and_authorization_never_reaches_second_origin():
-    """Real, unmocked end-to-end proof (not just a unit test of the
-    handler): an origin server that answers every POST with a 302 to a
-    second local server, which never receives any request at all -- the
-    strongest possible proof that Authorization is never forwarded to a
-    second origin, since the second origin is never contacted."""
+def _start_target_and_origin_servers():
+    """Start a target (redirect destination) and origin (redirects every
+    request it receives to the target) HTTP server pair on loopback.
+
+    Fix round 1 M1: the target handler tracks EVERY method urllib could
+    realistically issue on a followed redirect -- not just POST. A 302
+    response to a POST is commonly re-issued as a GET by a redirect-
+    following client, so a test that only tracked POST could miss a real
+    credential-forwarding leak entirely (exactly what independent review
+    caught). `target_requests` records `(method, headers_dict)` for
+    every request the target actually receives; `origin_requests`
+    records every method the origin itself saw, so a test can also prove
+    the origin actually issued the expected redirect in response to a
+    real request (not merely that nothing happened at all).
+
+    Returns `(target_requests, origin_requests, target_port, origin_port,
+    cleanup)`; `cleanup()` shuts both servers down and must be called
+    from a `finally` block.
+    """
     target_requests = []
 
     class _TargetHandler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            self.rfile.read(length)
-            target_requests.append(dict(self.headers.items()))
+        def _record(self, method):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
+            target_requests.append((method, dict(self.headers.items())))
             body = b'{"results": []}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self):
+            self._record("GET")
+
+        def do_POST(self):
+            self._record("POST")
 
         def log_message(self, format_, *args):
             del format_, args
@@ -839,16 +998,24 @@ def test_redirect_is_never_followed_and_authorization_never_reaches_second_origi
     target_thread.start()
     target_port = target_server.server_address[1]
 
+    origin_requests = []
+
     class _OriginHandler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            self.rfile.read(length)
+        def _redirect(self, method):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
+            origin_requests.append(method)
             self.send_response(302)
-            self.send_header(
-                "Location", f"http://127.0.0.1:{target_port}/api/v1/sync/events/"
-            )
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/api/v1/sync/events/")
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def do_GET(self):
+            self._redirect("GET")
+
+        def do_POST(self):
+            self._redirect("POST")
 
         def log_message(self, format_, *args):
             del format_, args
@@ -857,6 +1024,28 @@ def test_redirect_is_never_followed_and_authorization_never_reaches_second_origi
     origin_thread = threading.Thread(target=origin_server.serve_forever, daemon=True)
     origin_thread.start()
     origin_port = origin_server.server_address[1]
+
+    def cleanup():
+        origin_server.shutdown()
+        target_server.shutdown()
+        origin_thread.join(timeout=5)
+        target_thread.join(timeout=5)
+
+    return target_requests, origin_requests, target_port, origin_port, cleanup
+
+
+def test_redirect_is_never_followed_and_authorization_never_reaches_second_origin():
+    """Real, unmocked end-to-end proof (not just a unit test of the
+    handler): an origin server that answers our real POST with a 302 to
+    a second local server, which must receive ZERO requests of ANY
+    method -- the strongest possible proof that Authorization is never
+    forwarded to a second origin, since the second origin is never
+    contacted at all. Also proves the origin itself genuinely issued the
+    redirect in response to our real request, not merely that nothing
+    happened."""
+    target_requests, origin_requests, _target_port, origin_port, cleanup = (
+        _start_target_and_origin_servers()
+    )
 
     try:
         transport = HttpSyncTransport(
@@ -871,12 +1060,81 @@ def test_redirect_is_never_followed_and_authorization_never_reaches_second_origi
         with pytest.raises(TransientTransportError):
             transport.send_batch((envelope,))
 
+        assert origin_requests == ["POST"]
         assert target_requests == []
     finally:
-        origin_server.shutdown()
-        target_server.shutdown()
-        origin_thread.join(timeout=5)
-        target_thread.join(timeout=5)
+        cleanup()
+
+
+def test_transport_redirect_safety_is_independent_of_the_global_urllib_opener():
+    """I1 regression: even after another module (or test) has replaced
+    the PROCESS-GLOBAL urllib opener with an ordinary redirect-following
+    one, HttpSyncTransport must still refuse to follow a redirect and
+    must never forward Authorization to the redirect target -- proving
+    it owns its own opener rather than depending on (or ever mutating)
+    global urllib.request state."""
+    target_requests, origin_requests, _target_port, origin_port, cleanup = (
+        _start_target_and_origin_servers()
+    )
+
+    previous_opener = urllib.request._opener
+    try:
+        # Simulate another module (or test) installing an ORDINARY,
+        # redirect-following opener globally, AFTER linuxlab.sync.transports
+        # has already been imported.
+        urllib.request.install_opener(urllib.request.build_opener())
+
+        transport = HttpSyncTransport(
+            f"http://127.0.0.1:{origin_port}",
+            uuid.uuid4(),
+            "TOP-SECRET-BEARER-VALUE",
+            allow_insecure_http=True,
+            timeout=5,
+        )
+        envelope = _make_envelope()
+
+        with pytest.raises(TransientTransportError):
+            transport.send_batch((envelope,))
+
+        assert origin_requests == ["POST"]
+        assert target_requests == []
+    finally:
+        urllib.request._opener = previous_opener
+        cleanup()
+
+
+def test_importing_transports_never_mutates_global_urllib_opener_state():
+    """I1: importing linuxlab.sync.transports must not install a
+    process-wide urllib opener. Whether *this* process already has one
+    installed (by an earlier test/import) can't prove that -- so this
+    spawns a genuinely fresh interpreter, imports only the module, and
+    asserts urllib.request._opener is still None immediately after."""
+    script = (
+        "import urllib.request\n"
+        "import linuxlab.sync.transports\n"
+        "assert urllib.request._opener is None, "
+        "'importing linuxlab.sync.transports installed a global urllib opener'\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "DJANGO_SETTINGS_MODULE": "linuxlab.settings.test"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "OK"
+
+
+def test_transport_owned_opener_never_installed_as_the_global_opener():
+    """I1: within this process, HttpSyncTransport's private opener must
+    never have been installed as urllib.request's global opener -- it is
+    only ever used directly by this module's own send_batch() call."""
+    import linuxlab.sync.transports as transports_module
+
+    assert transports_module._TRANSPORT_OPENER is not urllib.request._opener
 
 
 # --- FileSyncTransport (dev/test/reference only) ---------------------------

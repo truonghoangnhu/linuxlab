@@ -30,6 +30,7 @@ from linuxlab.sync.contracts import (
     WireEventEnvelope,
     canonical_event_bytes,
     canonical_event_dict,
+    parse_ack_results,
 )
 
 
@@ -280,3 +281,118 @@ def test_protocol_transport_error_malformed_ack_is_transient_not_permanent():
     )
     assert type(error) is type(permanent)
     assert error.failure.category != permanent.failure.category
+
+
+# --- Fix round 1 I2: arbitrary-precision integer retry_after_seconds must
+# never be routed through math.isfinite()/float() -- Task 8 caps it later,
+# Task 6 must not crash or silently truncate it.
+
+
+def test_delivery_failure_preserves_a_huge_integer_retry_after_exactly():
+    huge = 10**400
+    failure = DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=huge)
+    assert failure.retry_after_seconds == huge
+    assert isinstance(failure.retry_after_seconds, int)
+
+
+def test_delivery_failure_still_rejects_a_negative_huge_integer():
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=-(10**400))
+
+
+def test_delivery_failure_float_retry_after_seconds_still_validated():
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=float("inf"))
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=-1.5)
+
+
+# --- Fix round 1 M2: category must be an actual SyncOutcome member, never
+# a raw string -- DeliveryFailure never silently coerces.
+
+
+@pytest.mark.parametrize("bogus", ["SUCCESS", "TRANSIENT_FAILURE", "anything", 1, None])
+def test_delivery_failure_rejects_a_non_syncoutcome_category(bogus):
+    with pytest.raises((TypeError, ValueError), match="category"):
+        DeliveryFailure(category=bogus)
+
+
+def test_delivery_failure_still_rejects_the_real_success_member():
+    with pytest.raises(ValueError, match="SUCCESS"):
+        DeliveryFailure(category=SyncOutcome.SUCCESS)
+
+
+# --- Fix round 1 I4: a structurally malformed per-event `status` (a list,
+# dict, or other unhashable value) must never crash the whole parser or
+# suppress an independently-valid neighboring event's evidence.
+
+
+def test_parse_ack_results_list_status_is_event_local_not_a_crash():
+    a = uuid.uuid4()
+    b = uuid.uuid4()
+    raw = [
+        {"event_id": str(a), "status": ACCEPTED},
+        {"event_id": str(b), "status": []},
+    ]
+
+    batch = parse_ack_results(raw)
+
+    assert batch.status_for(a) == ACCEPTED
+    assert batch.status_for(b) is None
+
+
+def test_parse_ack_results_dict_status_is_event_local_not_a_crash():
+    a = uuid.uuid4()
+    b = uuid.uuid4()
+    raw = [
+        {"event_id": str(a), "status": ACCEPTED},
+        {"event_id": str(b), "status": {}},
+    ]
+
+    batch = parse_ack_results(raw)
+
+    assert batch.status_for(a) == ACCEPTED
+    assert batch.status_for(b) is None
+
+
+def test_parse_ack_results_structured_status_neighboring_a_valid_duplicate():
+    duplicate_id = uuid.uuid4()
+    malformed_id = uuid.uuid4()
+    raw = [
+        {"event_id": str(duplicate_id), "status": DUPLICATE},
+        {"event_id": str(malformed_id), "status": {"nested": True}},
+    ]
+
+    batch = parse_ack_results(raw)
+
+    assert batch.status_for(duplicate_id) == DUPLICATE
+    assert batch.status_for(malformed_id) is None
+
+
+def test_parse_ack_results_structured_status_neighboring_a_valid_rejection():
+    rejected_id = uuid.uuid4()
+    malformed_id = uuid.uuid4()
+    raw = [
+        {"event_id": str(rejected_id), "status": REJECTED, "code": "IDEMPOTENCY_CONFLICT"},
+        {"event_id": str(malformed_id), "status": ["bogus"]},
+    ]
+
+    batch = parse_ack_results(raw)
+
+    assert batch.status_for(rejected_id) == REJECTED
+    assert batch.status_for(malformed_id) is None
+
+
+def test_parse_ack_results_structured_status_on_a_duplicated_event_id_still_ambiguous():
+    """A malformed structured status is not exempt from the existing
+    duplicate-event-id ambiguity rule -- it still counts toward that
+    event_id's occurrence count and stays unconfirmed if duplicated."""
+    event_id = uuid.uuid4()
+    raw = [
+        {"event_id": str(event_id), "status": ACCEPTED},
+        {"event_id": str(event_id), "status": []},
+    ]
+
+    batch = parse_ack_results(raw)
+
+    assert batch.status_for(event_id) is None

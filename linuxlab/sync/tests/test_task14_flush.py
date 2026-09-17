@@ -430,7 +430,7 @@ def test_flush_through_real_http_transport_never_delivers_a_masked_duplicate_id(
         response.__exit__.return_value = False
         return response
 
-    with patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen):
+    with patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=_fake_urlopen):
         summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
 
     assert summary.delivered == 1

@@ -435,7 +435,7 @@ def test_413_split_and_singleton_dead_letter_through_real_http_transport(setting
             200, {"results": [{"event_id": events[0]["event_id"], "status": "accepted"}]}
         )
 
-    with patch("linuxlab.sync.transports.urllib.request.urlopen", side_effect=_fake_urlopen):
+    with patch("linuxlab.sync.transports._TRANSPORT_OPENER.open", side_effect=_fake_urlopen):
         summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
 
     assert summary.claimed == 2

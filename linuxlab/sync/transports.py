@@ -60,15 +60,15 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _install_no_redirect_opener():
-    """Install a process-wide urllib opener that never follows a
-    redirect. `linuxlab.sync.transports` is the only urllib user in this
-    codebase (verified by repository search), so this has no effect
-    elsewhere. Idempotent: safe to call more than once."""
-    urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
-
-
-_install_no_redirect_opener()
+# Fix round 1 I1: a transport-OWNED opener, built once at import time but
+# never installed as urllib.request's process-wide default (no
+# urllib.request.install_opener() call). Importing this module must not
+# mutate global urllib state, and HttpSyncTransport's redirect safety must
+# not depend on -- or be overridable by -- whatever any other module
+# later installs as the global opener. `.open()` is called directly on
+# this object; the bare `urllib.request.urlopen()` function is
+# deliberately never used for the real network call.
+_TRANSPORT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def parse_retry_after(value: str | None, *, now: datetime) -> int | float | None:
@@ -90,18 +90,25 @@ def parse_retry_after(value: str | None, *, now: datetime) -> int | float | None
     if not stripped:
         return None
 
-    # 1. Integer delta-seconds first. Deliberately stricter than int()'s
-    # own leniency (underscores, surrounding whitespace already
-    # stripped) -- only an optional sign and ASCII digits. Preserved as
-    # a Python int (arbitrary precision) even for an excessively large
-    # value; never routed through float, which could lose precision or
-    # overflow. Task 8 caps this to policy.
+    # 1. Integer delta-seconds first. Fix round 1 I3: str.isdigit() alone
+    # accepts non-ASCII "digit" characters (e.g. superscript "²", which
+    # int() then rejects with an unhandled ValueError) AND non-ASCII
+    # decimal digits (e.g. Arabic-Indic "١٢٣", which int() actually DOES
+    # accept) -- ASCII decimal delta-seconds only. `digits.isascii() and
+    # digits.isdecimal()` excludes both; the int() conversion is still
+    # explicitly guarded for defense in depth even after that lexical
+    # validation. Preserved as a Python int (arbitrary precision) even
+    # for an excessively large value; never routed through float, which
+    # could lose precision or overflow. Task 8 caps this to policy.
     sign = ""
     digits = stripped
     if stripped[0] in "+-":
         sign, digits = stripped[0], stripped[1:]
-    if digits.isdigit():
-        seconds = int(sign + digits)
+    if digits and digits.isascii() and digits.isdecimal():
+        try:
+            seconds = int(sign + digits)
+        except ValueError:
+            return None
         return max(seconds, 0)
 
     # 2. Then an HTTP-date.
@@ -206,7 +213,7 @@ class HttpSyncTransport:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with _TRANSPORT_OPENER.open(request, timeout=self._timeout) as response:
                 raw_body = response.read()
         except urllib.error.HTTPError as exc:
             # Never str(exc)/the raw response body -- only the status code
@@ -229,8 +236,17 @@ class HttpSyncTransport:
     def _parse_batch_response(raw_body):
         try:
             parsed = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise TransientTransportError("malformed JSON response") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Fix round 1 M3: never chain the raw JSONDecodeError as an
+            # explicit cause -- json.JSONDecodeError.doc retains the
+            # ENTIRE raw response document verbatim, so keeping it
+            # reachable via __cause__ would let logging/error-tracking/
+            # traceback rendering leak whatever Central (or an attacker
+            # impersonating it) put in that body. Class and
+            # TRANSIENT_FAILURE category are unchanged (Task-8-boundary
+            # compatibility ruling); only the raw-evidence retention is
+            # removed.
+            raise TransientTransportError("malformed JSON response") from None
 
         if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
             raise TransientTransportError("malformed batch response shape")

@@ -116,6 +116,12 @@ class DeliveryFailure:
     retry_after_seconds: int | float | None = None
 
     def __post_init__(self):
+        # Fix round 1 M2: category must be a real SyncOutcome member --
+        # never a raw string/int coerced or compared loosely. Checked
+        # before the SUCCESS check so a non-member value always fails on
+        # its type, not on an incidental `is` mismatch.
+        if not isinstance(self.category, SyncOutcome):
+            raise TypeError("category must be a SyncOutcome member")
         if self.category is SyncOutcome.SUCCESS:
             raise ValueError("DeliveryFailure cannot represent SUCCESS")
         if self.http_status is not None:
@@ -126,14 +132,24 @@ class DeliveryFailure:
         if not isinstance(self.error_code, str):
             raise TypeError("error_code must be a string")
         if self.retry_after_seconds is not None:
-            if isinstance(self.retry_after_seconds, bool) or not isinstance(
-                self.retry_after_seconds, int | float
-            ):
+            # Fix round 1 I2: int and float are validated separately.
+            # Python int is arbitrary-precision and always exact/finite --
+            # never route it through math.isfinite()/float(), which can
+            # raise OverflowError for a very large (but perfectly valid)
+            # delta-seconds value. Only an actual float is checked for
+            # finiteness.
+            if isinstance(self.retry_after_seconds, bool):
                 raise TypeError("retry_after_seconds must be an int, float, or None")
-            if not math.isfinite(self.retry_after_seconds):
-                raise ValueError("retry_after_seconds must be finite")
-            if self.retry_after_seconds < 0:
-                raise ValueError("retry_after_seconds must be non-negative")
+            if isinstance(self.retry_after_seconds, int):
+                if self.retry_after_seconds < 0:
+                    raise ValueError("retry_after_seconds must be non-negative")
+            elif isinstance(self.retry_after_seconds, float):
+                if not math.isfinite(self.retry_after_seconds):
+                    raise ValueError("retry_after_seconds must be finite")
+                if self.retry_after_seconds < 0:
+                    raise ValueError("retry_after_seconds must be non-negative")
+            else:
+                raise TypeError("retry_after_seconds must be an int, float, or None")
 
 
 class TransportError(Exception):
@@ -450,7 +466,14 @@ def parse_ack_results(raw_results):
             continue
         item = items[0]
         status_value = item.get("status")
-        if status_value not in _ACK_STATUSES:
+        # Fix round 1 I4: an unhashable status (a list/dict/other
+        # structured value) must never reach `in _ACK_STATUSES` -- that
+        # would raise TypeError and crash the WHOLE parser, discarding
+        # every already-collected valid neighboring event's evidence.
+        # The isinstance check short-circuits before the membership test
+        # ever computes hash(status_value); this event alone stays
+        # unconfirmed, exactly like any other malformed status.
+        if not isinstance(status_value, str) or status_value not in _ACK_STATUSES:
             continue
         code = str(item.get("code") or "")
         if status_value == REJECTED and not code:
