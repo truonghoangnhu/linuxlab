@@ -648,3 +648,82 @@ def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
     )
     policy = _current_retry_policy()
     return _send_claimed_rows(transport, list(claimed), now=now, policy=policy)
+
+
+class OutboxRequeueError(ValueError):
+    """Safe, fixed-message failure for an invalid explicit requeue
+    request (Corrective B Task 9, approved spec §15). Messages are
+    always one of a small set of bounded, fixed literals -- never a raw
+    DB exception, payload, credential, setting value, or remote failure
+    detail."""
+
+
+_REQUEUE_INVALID_EVENT_ID = "invalid event identifier"
+_REQUEUE_NOT_FOUND = "outbox event not found"
+_REQUEUE_NOT_REQUEUEABLE = "outbox event is not requeueable"
+_REQUEUE_CONFIG_UNAVAILABLE = "requeue configuration unavailable"
+
+
+def requeue_outbox_message(event_id):
+    """The sole Task-9 requeue authority (approved spec §15): an
+    explicit, atomic, Outbox-only state reset for exactly one
+    dead_letter row, identified by its immutable event_id (never the
+    local DB primary key). Requires the same typed local Node worker
+    configuration/capability `sync_events` itself requires (Task 3's
+    `load_sync_configuration(purpose="worker")`) -- validated BEFORE any
+    row is read or locked, so a malformed/disabled local deployment
+    makes zero writes. No network call anywhere in this path.
+
+    Locks the exact row via `select_for_update()` inside one short
+    transaction and requires its CURRENT state to be dead_letter;
+    pending, in_flight, delivered, or an unknown event_id are all
+    rejected with `OutboxRequeueError` and zero mutation -- a failure
+    partway through the controlled write rolls the whole transaction
+    back, leaving the row completely unchanged (never a partial reset).
+
+    On success, through the model-owned controlled writer, resets only
+    the current retry cycle: state -> pending, attempts -> 0,
+    first_failure_at -> None, next_attempt_at -> now() (no backoff/
+    jitter -- immediately due), and clears claimed_at/lease_until/
+    claim_token/last_failure_category/last_http_status/rejection_code/
+    rejection_reason. The immutable wire envelope (event_id through
+    payload), domain_event trace link, created_at, and delivered_at
+    history are never touched. No DomainEvent is created or modified
+    (repository audit-pattern decision NO_EXISTING_PATTERN_EVENT_REMOVED,
+    spec §15) and no other OutboxMessage row is created. This function
+    never sends the event itself -- a later ordinary `sync_events`
+    worker cycle picks the now-pending row up like any other due row.
+    """
+    if not isinstance(event_id, uuid.UUID):
+        raise OutboxRequeueError(_REQUEUE_INVALID_EVENT_ID)
+
+    try:
+        load_sync_configuration(purpose="worker")
+    except SyncConfigurationError:
+        raise OutboxRequeueError(_REQUEUE_CONFIG_UNAVAILABLE) from None
+
+    now = timezone.now()
+    with transaction.atomic():
+        try:
+            current = OutboxMessage.objects.select_for_update().get(event_id=event_id)
+        except OutboxMessage.DoesNotExist:
+            raise OutboxRequeueError(_REQUEUE_NOT_FOUND) from None
+
+        if current.state != OUTBOX_DEAD_LETTER:
+            raise OutboxRequeueError(_REQUEUE_NOT_REQUEUEABLE)
+
+        _write_immutable_row_fields(
+            current,
+            state=OUTBOX_PENDING,
+            attempts=0,
+            first_failure_at=None,
+            next_attempt_at=now,
+            claimed_at=None,
+            lease_until=None,
+            claim_token=None,
+            last_failure_category="",
+            last_http_status=None,
+            rejection_code="",
+            rejection_reason="",
+        )
+        return OutboxMessage.objects.get(pk=current.pk)

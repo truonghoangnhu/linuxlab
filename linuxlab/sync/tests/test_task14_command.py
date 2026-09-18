@@ -6,13 +6,21 @@ background thread inside the Django web process.
 import io
 import signal
 import uuid
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.utils import timezone
 
 from linuxlab.sync.management.commands.sync_events import Command
+from linuxlab.sync.models import (
+    OUTBOX_DEAD_LETTER,
+    OUTBOX_PENDING,
+    OutboxMessage,
+    _insert_immutable_row,
+)
 from linuxlab.sync.outbox import FlushSummary
 
 pytestmark = pytest.mark.django_db
@@ -199,3 +207,161 @@ def test_invalid_worker_configuration_rejected_before_transport(settings, name, 
     assert (
         "SECRET_SENTINEL" not in str(caught.value) + out.getvalue() + err.getvalue() + caplog.text
     )
+
+
+# --- Corrective B Task 9: `sync_events requeue --event-id <UUID>` -----------
+
+
+def _make_dead_letter_outbox(**overrides):
+    now = timezone.now()
+    fields = {
+        "event_id": uuid.uuid4(),
+        "domain_event": None,
+        "event_type": "activity.completed",
+        "schema_version": 1,
+        "source_node_id": uuid.uuid4(),
+        "occurred_at": now,
+        "aggregate_type": "attempt",
+        "aggregate_public_id": uuid.uuid4(),
+        "payload": {"score": 1, "max_score": 1},
+        "state": OUTBOX_DEAD_LETTER,
+        "attempts": 2,
+        "first_failure_at": now - timedelta(hours=1),
+        "last_failure_category": "PERMANENT_REJECTION",
+        "rejection_code": "IDEMPOTENCY_CONFLICT",
+        "rejection_reason": "rejected by Central as a permanent failure",
+        "next_attempt_at": now - timedelta(minutes=30),
+        "claimed_at": None,
+        "lease_until": None,
+        "delivered_at": None,
+    }
+    fields.update(overrides)
+    return _insert_immutable_row(OutboxMessage, **fields)
+
+
+def test_requeue_cli_success_prints_exact_confirmation(settings):
+    _configure_sync_settings(settings)
+    row = _make_dead_letter_outbox()
+    out = io.StringIO()
+
+    call_command("sync_events", "requeue", "--event-id", str(row.event_id), stdout=out)
+
+    assert out.getvalue() == f"requeued {row.event_id}\n"
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_PENDING
+    assert refreshed.attempts == 0
+
+
+def test_requeue_cli_dispatches_before_worker_setup_no_transport_no_network(settings):
+    _configure_sync_settings(settings)
+    row = _make_dead_letter_outbox()
+
+    with (
+        patch("linuxlab.sync.management.commands.sync_events.HttpSyncTransport") as transport,
+        patch("linuxlab.sync.management.commands.sync_events.flush_outbox") as flush,
+        patch("linuxlab.sync.management.commands.sync_events.signal.signal") as signal_setup,
+    ):
+        call_command("sync_events", "requeue", "--event-id", str(row.event_id))
+
+    transport.assert_not_called()
+    flush.assert_not_called()
+    signal_setup.assert_not_called()
+
+
+def test_requeue_cli_missing_event_id_is_rejected(settings):
+    _configure_sync_settings(settings)
+
+    with pytest.raises(CommandError):
+        call_command("sync_events", "requeue")
+
+
+def test_requeue_cli_rejects_once_combined_with_requeue(settings):
+    _configure_sync_settings(settings)
+    row = _make_dead_letter_outbox()
+
+    with pytest.raises(CommandError):
+        call_command("sync_events", "requeue", "--once", "--event-id", str(row.event_id))
+
+    # Rejected before any mutation.
+    assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DEAD_LETTER
+
+
+def test_requeue_cli_event_id_without_action_is_rejected(settings):
+    _configure_sync_settings(settings)
+    row = _make_dead_letter_outbox()
+
+    with pytest.raises(CommandError):
+        call_command("sync_events", "--event-id", str(row.event_id))
+
+    assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DEAD_LETTER
+
+
+def test_requeue_cli_rejects_unknown_positional_action(settings):
+    _configure_sync_settings(settings)
+
+    with pytest.raises(CommandError):
+        call_command("sync_events", "diagnose")
+
+
+def test_requeue_cli_rejects_invalid_uuid_text(settings, caplog):
+    _configure_sync_settings(settings)
+    out, err = io.StringIO(), io.StringIO()
+
+    with pytest.raises(CommandError) as caught:
+        call_command(
+            "sync_events", "requeue", "--event-id", "not-a-uuid<script>", stdout=out, stderr=err
+        )
+
+    text = str(caught.value) + out.getvalue() + err.getvalue() + caplog.text
+    assert "not-a-uuid" not in text
+    assert "<script>" not in text
+
+
+def test_requeue_cli_rejects_unknown_event_id_safely(settings, caplog):
+    _configure_sync_settings(settings)
+    out, err = io.StringIO(), io.StringIO()
+    unknown_id = uuid.uuid4()
+
+    with pytest.raises(CommandError):
+        call_command(
+            "sync_events", "requeue", "--event-id", str(unknown_id), stdout=out, stderr=err
+        )
+
+    assert OutboxMessage.objects.count() == 0
+
+
+def test_requeue_cli_output_never_leaks_payload_or_rejection_reason(settings):
+    _configure_sync_settings(settings)
+    row = _make_dead_letter_outbox(
+        payload={"answer": "PAYLOAD_SENTINEL_VALUE"},
+        rejection_reason="REASON_SENTINEL_VALUE",
+    )
+    out, err = io.StringIO(), io.StringIO()
+
+    call_command("sync_events", "requeue", "--event-id", str(row.event_id), stdout=out, stderr=err)
+
+    combined = out.getvalue() + err.getvalue()
+    assert "PAYLOAD_SENTINEL_VALUE" not in combined
+    assert "REASON_SENTINEL_VALUE" not in combined
+    assert combined == f"requeued {row.event_id}\n"
+
+
+def test_existing_worker_forms_are_unaffected_by_the_requeue_action(settings):
+    """`sync_events` and `sync_events --once` must behave exactly as
+    before -- the new optional positional `action` defaults to None and
+    changes nothing about ordinary worker dispatch."""
+    _configure_sync_settings(settings)
+
+    with (
+        patch(
+            "linuxlab.sync.management.commands.sync_events.flush_outbox",
+            return_value=FlushSummary(),
+        ) as flush,
+        patch(
+            "linuxlab.sync.management.commands.sync_events.Command._build_transport",
+            return_value=object(),
+        ),
+    ):
+        call_command("sync_events", "--once")
+
+    assert flush.call_count == 1
