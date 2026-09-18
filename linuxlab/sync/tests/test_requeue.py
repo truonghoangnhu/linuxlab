@@ -366,17 +366,38 @@ def test_requeue_creates_no_additional_outbox_row(settings):
 # --- transaction rollback on a mid-write failure -----------------------------
 
 
-def test_requeue_rolls_back_completely_on_a_controlled_writer_failure(settings, monkeypatch):
+def test_requeue_rollback_restores_complete_state_after_a_real_write(settings, monkeypatch):
+    """Fix Round 1 M1: proves an ACTUAL database rollback undoes a REAL
+    write, not merely that nothing happened because the write never
+    started. The wrapper below calls the genuine
+    `_write_immutable_row_fields` first (so the reset really lands
+    inside the open transaction -- confirmed by re-reading the row from
+    the SAME connection, which sees its own uncommitted write under
+    PostgreSQL's read-committed isolation), THEN raises -- forcing
+    `transaction.atomic()` to roll the whole thing back. Only after that
+    do we assert the complete pre-state (including the linked
+    DomainEvent) is exactly restored."""
     from linuxlab.sync import outbox as outbox_module
 
     _configure_worker_settings(settings)
     row = _make_dead_letter_row(claim_token=uuid.uuid4())
     before = OutboxMessage.objects.values().get(pk=row.pk)
+    before_events = list(DomainEvent.objects.values())
 
-    def _boom(*args, **kwargs):
-        raise RuntimeError("simulated controlled-writer failure")
+    original_writer = outbox_module._write_immutable_row_fields
 
-    monkeypatch.setattr(outbox_module, "_write_immutable_row_fields", _boom)
+    def _write_then_raise(instance, **changes):
+        original_writer(instance, **changes)
+        # The real mutation genuinely happened inside the still-open
+        # transaction -- this is what makes the failure below a REAL
+        # rollback proof rather than a no-op.
+        mutated = OutboxMessage.objects.get(pk=instance.pk)
+        assert mutated.state == OUTBOX_PENDING
+        assert mutated.attempts == 0
+        assert mutated.first_failure_at is None
+        raise RuntimeError("simulated controlled-writer failure after a real write")
+
+    monkeypatch.setattr(outbox_module, "_write_immutable_row_fields", _write_then_raise)
 
     with pytest.raises(RuntimeError):
         outbox_module.requeue_outbox_message(row.event_id)
@@ -384,6 +405,15 @@ def test_requeue_rolls_back_completely_on_a_controlled_writer_failure(settings, 
     after = OutboxMessage.objects.values().get(pk=row.pk)
     assert after == before
     assert after["state"] == OUTBOX_DEAD_LETTER
+    assert after["attempts"] == before["attempts"]
+    assert after["first_failure_at"] == before["first_failure_at"]
+    assert after["next_attempt_at"] == before["next_attempt_at"]
+    assert after["claim_token"] == before["claim_token"]
+    assert after["last_failure_category"] == before["last_failure_category"]
+    assert after["last_http_status"] == before["last_http_status"]
+    assert after["rejection_code"] == before["rejection_code"]
+    assert after["rejection_reason"] == before["rejection_reason"]
+    assert list(DomainEvent.objects.values()) == before_events
 
 
 # --- concurrency: exactly one of two concurrent requeues succeeds -----------

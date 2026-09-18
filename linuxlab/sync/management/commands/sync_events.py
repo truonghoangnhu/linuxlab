@@ -104,7 +104,13 @@ class Command(BaseCommand):
         if options.get("once"):
             raise CommandError("requeue is mutually exclusive with --once")
         raw_event_id = options.get("event_id")
-        if not raw_event_id:
+        # Semantic presence check: an omitted --event-id is None; a
+        # SUPPLIED but empty "--event-id \"\"" is "" -- distinct cases
+        # (Fix Round 1 I1). Only the former is "requeue requires
+        # --event-id"; the latter is a supplied-but-invalid selector and
+        # falls through to the same "invalid event identifier" outcome
+        # as any other malformed UUID text.
+        if raw_event_id is None:
             raise CommandError("requeue requires --event-id")
         try:
             event_id = uuid.UUID(raw_event_id)
@@ -121,7 +127,12 @@ class Command(BaseCommand):
         if options.get("action") == _REQUEUE_ACTION:
             self._handle_requeue(options)
             return
-        if options.get("event_id"):
+        # Semantic presence check (Fix Round 1 I1): options.get("event_id")
+        # is None only when --event-id was never given at all -- a
+        # SUPPLIED but empty "--event-id \"\"" is "", which is falsy but
+        # NOT absent, and must still be rejected here rather than
+        # silently falling through into ordinary worker execution.
+        if options.get("event_id") is not None:
             raise CommandError("--event-id requires the requeue action")
 
         configuration = self._load_configuration()

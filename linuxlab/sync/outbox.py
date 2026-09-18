@@ -664,7 +664,7 @@ _REQUEUE_NOT_REQUEUEABLE = "outbox event is not requeueable"
 _REQUEUE_CONFIG_UNAVAILABLE = "requeue configuration unavailable"
 
 
-def requeue_outbox_message(event_id):
+def requeue_outbox_message(event_id: uuid.UUID) -> OutboxMessage:
     """The sole Task-9 requeue authority (approved spec §15): an
     explicit, atomic, Outbox-only state reset for exactly one
     dead_letter row, identified by its immutable event_id (never the

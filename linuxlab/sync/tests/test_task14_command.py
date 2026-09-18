@@ -346,6 +346,108 @@ def test_requeue_cli_output_never_leaks_payload_or_rejection_reason(settings):
     assert combined == f"requeued {row.event_id}\n"
 
 
+def test_requeue_cli_empty_event_id_without_action_is_rejected_not_worker(settings):
+    """Fix Round 1 I1: an empty `--event-id ""` is a SUPPLIED-but-invalid
+    selector, not an omitted one -- it must reject before worker setup,
+    never fall through into ordinary worker execution just because an
+    empty string is falsy.
+
+    Uses a Command() instance (not call_command with no --once) so a
+    self-stopping fake flush_outbox bounds the continuous loop to at
+    most one iteration even under the UNFIXED bug -- proving the defect
+    (or its absence) without ever risking an unbounded hang from a
+    genuinely infinite worker loop."""
+    _configure_sync_settings(settings)
+    command = Command()
+
+    def _fake_flush(*args, **kwargs):
+        command._running = False
+        return FlushSummary()
+
+    with (
+        patch("linuxlab.sync.management.commands.sync_events.HttpSyncTransport") as transport,
+        patch(
+            "linuxlab.sync.management.commands.sync_events.flush_outbox",
+            side_effect=_fake_flush,
+        ) as flush,
+        patch("linuxlab.sync.management.commands.sync_events.signal.signal") as signal_setup,
+        patch("linuxlab.sync.management.commands.sync_events.time.sleep"),
+        pytest.raises(CommandError),
+    ):
+        command.handle(action=None, once=False, event_id="")
+
+    transport.assert_not_called()
+    flush.assert_not_called()
+    signal_setup.assert_not_called()
+
+
+def test_requeue_cli_empty_event_id_with_once_is_rejected_not_worker(settings):
+    """Fix Round 1 I1: the same empty-selector rejection must hold when
+    --once is also given -- `--event-id "" --once` must not reach the
+    worker's transport/signal/flush setup either."""
+    _configure_sync_settings(settings)
+
+    with (
+        patch("linuxlab.sync.management.commands.sync_events.HttpSyncTransport") as transport,
+        patch("linuxlab.sync.management.commands.sync_events.flush_outbox") as flush,
+        patch("linuxlab.sync.management.commands.sync_events.signal.signal") as signal_setup,
+        pytest.raises(CommandError),
+    ):
+        call_command("sync_events", "--event-id", "", "--once")
+
+    transport.assert_not_called()
+    flush.assert_not_called()
+    signal_setup.assert_not_called()
+
+
+def test_requeue_cli_empty_event_id_with_requeue_action_is_invalid_identifier(settings):
+    """Fix Round 1 I1: `requeue --event-id ""` is a supplied-but-empty
+    selector -- it must be rejected as an invalid event identifier, the
+    same outcome as any other malformed UUID text, not conflated with
+    the separate "requeue requires --event-id" (omitted) case."""
+    _configure_sync_settings(settings)
+
+    with pytest.raises(CommandError) as caught:
+        call_command("sync_events", "requeue", "--event-id", "")
+
+    assert "invalid event identifier" in str(caught.value)
+    assert "requires --event-id" not in str(caught.value)
+
+
+def test_requeue_cli_missing_event_id_message_distinguishes_omitted_case(settings):
+    """The OMITTED case (no --event-id at all) keeps its own distinct
+    message -- proving the fix distinguishes None (omitted) from ""
+    (supplied-empty) in both directions, not merely by accident."""
+    _configure_sync_settings(settings)
+
+    with pytest.raises(CommandError) as caught:
+        call_command("sync_events", "requeue")
+
+    assert "requires --event-id" in str(caught.value)
+
+
+def test_requeue_cli_omitted_event_id_still_preserves_ordinary_worker_form(settings):
+    """Omitting --event-id entirely (the ordinary, pre-Task-9 form) must
+    still work exactly as before -- the I1 fix must distinguish omitted
+    (None) from supplied-empty ("") rather than merely tightening
+    truthiness checks in a way that breaks the plain worker form."""
+    _configure_sync_settings(settings)
+
+    with (
+        patch(
+            "linuxlab.sync.management.commands.sync_events.flush_outbox",
+            return_value=FlushSummary(),
+        ) as flush,
+        patch(
+            "linuxlab.sync.management.commands.sync_events.Command._build_transport",
+            return_value=object(),
+        ),
+    ):
+        call_command("sync_events", "--once")
+
+    assert flush.call_count == 1
+
+
 def test_existing_worker_forms_are_unaffected_by_the_requeue_action(settings):
     """`sync_events` and `sync_events --once` must behave exactly as
     before -- the new optional positional `action` defaults to None and
