@@ -29,8 +29,10 @@ def test_n1_tampered_replacement_leaves_existing_active_package_fully_unchanged(
 
 
 def test_n2_revoked_credential_never_falsely_delivers_and_leaks_no_secret(tmp_path):
-    """Desired final state: Central rejects; Outbox stays pending/
-    retryable. Forbidden invariant: the Outbox row becomes DELIVERED, or
+    """Desired final state: Central rejects; the attempted Outbox row
+    ends in dead_letter (Corrective B Task 8 §25: an auth/credential
+    fault is immediately terminal, not returned to pending for automatic
+    retry). Forbidden invariant: the Outbox row becomes DELIVERED, or
     the Node's bearer secret appears in the worker's own stdout/stderr."""
     with dual_deployment(tmp_path) as deployment:
         detail = scenarios.run_n2_revoked_credential(deployment)

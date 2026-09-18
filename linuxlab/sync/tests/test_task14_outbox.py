@@ -427,7 +427,10 @@ def test_mark_dead_letter_transitions_only_the_named_event():
     refreshed_poison = OutboxMessage.objects.get(pk=poison.pk)
     assert refreshed_poison.state == OUTBOX_DEAD_LETTER
     assert refreshed_poison.rejection_code == "IDEMPOTENCY_CONFLICT"
-    assert refreshed_poison.rejection_reason == "conflicting content"
+    # Corrective B Task 8 §9/§27: the free-form `reason` argument is never
+    # persisted verbatim -- only a fixed, safe, controlled reason is written.
+    assert refreshed_poison.rejection_reason == "rejected by Central as a permanent failure"
+    assert "conflicting content" not in refreshed_poison.rejection_reason
 
     refreshed_healthy = OutboxMessage.objects.get(pk=healthy.pk)
     assert refreshed_healthy.state == OUTBOX_IN_FLIGHT
@@ -450,38 +453,48 @@ def test_release_transient_returns_row_to_pending_with_incremented_attempts():
     assert refreshed.next_attempt_at > now
 
 
-def test_release_transient_never_dead_letters_at_any_attempt_count():
-    row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=10_000)
+def test_release_transient_dead_letters_once_the_attempt_budget_is_exhausted():
+    # Corrective B Task 8: transient failures are retried only WITHIN the
+    # bounded budget (default max_attempts=10) -- never unconditionally
+    # at any attempt count.
+    row = _make_outbox(
+        state=OUTBOX_IN_FLIGHT, attempts=9, first_failure_at=timezone.now(), claim_token=uuid.uuid4()
+    )
 
     release_transient([row], "timeout")
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
-    assert refreshed.state == OUTBOX_PENDING
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 10
 
 
 # --- release_auth_failure() --------------------------------------------------
 
 
-def test_release_auth_failure_returns_row_to_pending_without_incrementing_attempts():
+def test_release_auth_failure_terminalizes_and_counts_one_attempt():
+    # Corrective B Task 8: a channel/credential fault is immediately
+    # terminal -- it is no longer released back to PENDING for
+    # unconditional automatic retry.
     now = timezone.now()
     row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=1, claimed_at=now, lease_until=now + timedelta(minutes=5))
 
     release_auth_failure([row], now=now)
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
-    assert refreshed.state == OUTBOX_PENDING
-    assert refreshed.attempts == 1
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 2
     assert refreshed.claimed_at is None
     assert refreshed.lease_until is None
+    assert refreshed.last_failure_category == "AUTH_OR_REGISTRATION_FAILURE"
 
 
-def test_release_auth_failure_never_dead_letters():
+def test_release_auth_failure_always_dead_letters():
     row = _make_outbox(state=OUTBOX_IN_FLIGHT)
 
     release_auth_failure([row])
 
     refreshed = OutboxMessage.objects.get(pk=row.pk)
-    assert refreshed.state == OUTBOX_PENDING
+    assert refreshed.state == OUTBOX_DEAD_LETTER
 
 
 # --- corrective (independent review finding #3): stale-claim fencing --------
@@ -543,13 +556,15 @@ def test_mark_dead_letter_after_reclaim_affects_zero_rows():
 
 
 def test_compute_retry_delay_grows_exponentially_before_cap():
+    # n = max(attempts - 1, 0): the FIRST failure's ceiling is base
+    # itself, not 2*base.
     delay_1 = compute_retry_delay(1, base=1.0, cap=1000.0, random_source=lambda: 1.0)
     delay_2 = compute_retry_delay(2, base=1.0, cap=1000.0, random_source=lambda: 1.0)
     delay_3 = compute_retry_delay(3, base=1.0, cap=1000.0, random_source=lambda: 1.0)
 
-    assert delay_1 == 2.0
-    assert delay_2 == 4.0
-    assert delay_3 == 8.0
+    assert delay_1 == 1.0
+    assert delay_2 == 2.0
+    assert delay_3 == 4.0
 
 
 def test_compute_retry_delay_respects_cap():

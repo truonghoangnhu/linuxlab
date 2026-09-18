@@ -60,21 +60,18 @@ class Command(BaseCommand):
             f"auth_fault={summary.auth_fault} protocol_fault={summary.protocol_fault}"
         )
         if summary.protocol_fault:
-            # T14-D41: a deterministic 400 means Central rejected a
-            # request-level batch as malformed; flush_outbox() already
-            # bisects a multi-event 400 to isolate exactly which
-            # event(s) are the cause and lets good neighbors still
-            # deliver. Whatever remains isolated as a persistent
-            # singleton 400 is now retryable on a long backoff, not
-            # dead-lettered -- but it will not resolve on its own,
-            # so surface it distinctly rather than letting it blend
-            # into ordinary transient-failure log noise.
+            # Corrective B Task 8: a deterministic 400 (PERMANENT_REJECTION)
+            # means Central rejected the request itself as malformed --
+            # every claimed event in that batch dead-letters immediately
+            # and will not resolve on its own, so surface it distinctly
+            # rather than letting it blend into ordinary transient-failure
+            # log noise.
             self.stderr.write(
                 self.style.WARNING(
-                    "sync_events: Central rejected one or more isolated events as "
-                    "malformed (HTTP 400); this will not resolve on its own -- "
-                    "investigate the Node/Central protocol version mismatch or a "
-                    "local batching defect for the isolated event(s)"
+                    "sync_events: Central rejected a request as malformed (HTTP 400); "
+                    "the claimed event(s) in that batch were dead-lettered and this "
+                    "will not resolve on its own -- investigate the Node/Central "
+                    "protocol version mismatch or a local batching defect"
                 )
             )
 

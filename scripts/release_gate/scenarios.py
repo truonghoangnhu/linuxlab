@@ -522,7 +522,11 @@ def run_n2_revoked_credential(deployment) -> dict:
     outbox_after = run_action(
         deployment.node_profile_env, "find-outbox-message", "--event-id", outbox_before["event_id"]
     )
-    assert outbox_after["state"] == "pending"
+    # Corrective B Task 8 §25: a revoked credential is a channel/
+    # credential fault, now immediately terminal -- the attempted row
+    # ends in dead_letter rather than returning to pending for automatic
+    # auth retry.
+    assert outbox_after["state"] == "dead_letter"
 
     central_inbox_count = run_action(
         deployment.central_profile_env, "count-inbox-messages", "--event-id", outbox_before["event_id"]
@@ -537,7 +541,7 @@ def run_n2_revoked_credential(deployment) -> dict:
     central_inbox_mutated = central_inbox_count != 0
     assert not central_inbox_mutated
 
-    revoked_credential_not_accepted = outbox_after["state"] == "pending"
+    revoked_credential_not_accepted = outbox_after["state"] == "dead_letter"
     assert revoked_credential_not_accepted
 
     return {

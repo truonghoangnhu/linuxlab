@@ -4,6 +4,10 @@ conservative UPPER-BOUND AGE ANCHOR seeded from legacy `created_at` for
 already-retrying rows -- never the actual historical first-failure
 instant, never a fresh budget, never migration-execution time."""
 
+import json
+import os
+import subprocess
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -400,3 +404,114 @@ def test_outbox_message_model_metadata_matches_migration_state(scratch):
         "delivered",
         "dead_letter",
     }
+
+
+# --- Corrective B Task 8 §22: claim_outbox_batch() eligibility against a
+# genuinely migrated legacy row -----------------------------------------------
+# claim_outbox_batch() always queries Django's `default` DB alias, so its
+# preflight budget-eligibility behavior against a migrated legacy row can
+# only be proven from a real, separate Django process pointed at the
+# scratch database via POSTGRES_DB -- never a second in-process alias
+# (claim_outbox_batch() has no alias parameter to accept one). Everything
+# up to and including the 0008/0009 migration itself still runs in-process
+# against the scratch alias, exactly like every other test in this file;
+# only the final claim_outbox_batch() call needs the subprocess.
+
+_ELIGIBILITY_PROBE_SCRIPT = """
+import json
+import sys
+import django
+
+django.setup()
+
+from linuxlab.sync.models import OutboxMessage
+from linuxlab.sync.outbox import claim_outbox_batch
+
+exhausted_id, eligible_id = sys.argv[1], sys.argv[2]
+
+claimed = claim_outbox_batch(max_events=10, max_bytes=1_000_000, lease_seconds=60)
+claimed_ids = sorted(str(row.event_id) for row in claimed)
+
+exhausted_after = OutboxMessage.objects.get(event_id=exhausted_id)
+eligible_after = OutboxMessage.objects.get(event_id=eligible_id)
+
+print(json.dumps({
+    "claimed_ids": claimed_ids,
+    "exhausted_state": exhausted_after.state,
+    "exhausted_attempts": exhausted_after.attempts,
+    "exhausted_last_failure_category": exhausted_after.last_failure_category,
+    "eligible_state": eligible_after.state,
+}))
+"""
+
+
+def test_claim_outbox_batch_eligibility_against_a_genuinely_migrated_legacy_row(scratch):
+    apps = migrate(scratch, BEFORE)
+    now = datetime.now(UTC)
+    very_old = datetime(2015, 1, 1, tzinfo=UTC)
+    # Genuinely recent relative to REAL wall-clock time (the retry-age
+    # budget is measured against actual now(), not a fixed calendar
+    # date) -- comfortably inside the default 24h max_retry_age.
+    recent = now - timedelta(minutes=5)
+
+    # A legacy row whose attempts already meet/exceed the default
+    # max_attempts(10) budget -- created and migrated exactly like the
+    # "exhausted_looking" fixture in
+    # test_exhausted_and_nonexhausted_legacy_fixtures_are_left_for_task_8,
+    # except this test actually exercises Task 8's claim-time preflight
+    # eligibility decision against it (Task 7 deliberately did not).
+    exhausted = _make_legacy_outbox(
+        apps,
+        scratch,
+        state="pending",
+        attempts=10,
+        created_at=very_old,
+        next_attempt_at=now,
+    )
+    eligible = _make_legacy_outbox(
+        apps,
+        scratch,
+        state="pending",
+        attempts=1,
+        created_at=recent,
+        next_attempt_at=now,
+    )
+
+    migrate(scratch, SCHEMA)
+    migrate(scratch, AFTER)
+
+    db_settings = connections[scratch].settings_dict
+    env = {
+        **os.environ,
+        "DJANGO_SETTINGS_MODULE": "linuxlab.settings.node",
+        "POSTGRES_DB": db_settings["NAME"],
+        "POSTGRES_USER": str(db_settings["USER"]),
+        "POSTGRES_PASSWORD": str(db_settings["PASSWORD"]),
+        "POSTGRES_HOST": str(db_settings["HOST"]),
+        "POSTGRES_PORT": str(db_settings["PORT"]),
+    }
+
+    result = subprocess.run(
+        [sys.executable, "-c", _ELIGIBILITY_PROBE_SCRIPT, str(exhausted.event_id), str(eligible.event_id)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    probe = json.loads(result.stdout.strip().splitlines()[-1])
+
+    # The exhausted migrated row is never claimed and never sent -- it is
+    # terminalized as a preflight eligibility decision, so its attempts
+    # count and failure evidence are left exactly as the migration left
+    # them (this is NOT a failed send).
+    assert probe["exhausted_state"] == "dead_letter"
+    assert probe["exhausted_attempts"] == 10
+    assert probe["exhausted_last_failure_category"] == ""
+    assert str(exhausted.event_id) not in probe["claimed_ids"]
+
+    # The budget-eligible migrated row claims normally.
+    assert probe["claimed_ids"] == [str(eligible.event_id)]
+    assert probe["eligible_state"] == "in_flight"
