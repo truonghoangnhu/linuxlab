@@ -408,6 +408,25 @@ OUTBOX_STATE_CHOICES = [
     (OUTBOX_DEAD_LETTER, "Dead letter"),
 ]
 
+# Corrective B Task 7 (approved spec §13): persisted retry-state failure
+# categories. Names match linuxlab.sync.contracts.SyncOutcome's four
+# FAILURE members exactly (terminology authority only -- this module does
+# not import contracts.py, keeping Task 7 a pure schema/migration change).
+# SUCCESS is deliberately not a member here: last_failure_category never
+# stores it, only "" (no failure yet) or one of these four.
+OUTBOX_FAILURE_PERMANENT_REJECTION = "PERMANENT_REJECTION"
+OUTBOX_FAILURE_AUTH_OR_REGISTRATION_FAILURE = "AUTH_OR_REGISTRATION_FAILURE"
+OUTBOX_FAILURE_TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
+OUTBOX_FAILURE_RATE_LIMITED = "RATE_LIMITED"
+
+OUTBOX_FAILURE_CATEGORY_CHOICES = [
+    ("", "None"),
+    (OUTBOX_FAILURE_PERMANENT_REJECTION, "Permanent rejection"),
+    (OUTBOX_FAILURE_AUTH_OR_REGISTRATION_FAILURE, "Auth or registration failure"),
+    (OUTBOX_FAILURE_TRANSIENT_FAILURE, "Transient failure"),
+    (OUTBOX_FAILURE_RATE_LIMITED, "Rate limited"),
+]
+
 INBOX_RECEIVED = "received"
 INBOX_PROCESSED = "processed"
 INBOX_FAILED = "failed"
@@ -478,13 +497,22 @@ class OutboxMessage(ImmutableArtifact):
     wire envelope fields (event_id through payload) are the immutable
     snapshot captured at enqueue time -- retries resend exactly this, never
     a reserialization of current domain state. Delivery metadata (state
-    through created_at) is mutable only through linuxlab.sync.outbox's
-    private controlled writer.
+    through created_at, plus the Corrective B Task 7 retry-state fields
+    below) is mutable only through linuxlab.sync.outbox's private
+    controlled writer.
 
     `domain_event` is a trace/audit link only (T14-D11); wire semantics
     never depend on re-reading it. PROTECT mirrors the rest of this app's
     convention of never allowing an ordinary cascade to silently remove
     retained history.
+
+    Corrective B Task 7 (approved spec §13): `first_failure_at`,
+    `last_failure_category`, and `last_http_status` are the ONLY new
+    persisted retry-state fields -- OutboxMessage remains the sole retry
+    authority, no parallel scheduler/retry table. Task 7 only adds this
+    schema and conservatively backfills `first_failure_at` for already-
+    retrying legacy rows (see migration 0009); it implements no retry
+    policy, eligibility, or scheduling -- that is Task 8.
     """
 
     event_id = models.UUIDField(unique=True, editable=False)
@@ -520,6 +548,22 @@ class OutboxMessage(ImmutableArtifact):
     rejection_reason = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Corrective B Task 7: persisted retry-cycle metadata (approved spec
+    # §13). `first_failure_at` is set once by the first failed send in the
+    # current retry cycle and preserved thereafter (never null-able reset
+    # in place; only Task 8's explicit requeue restarts a cycle).
+    # `last_failure_category` is "" before any failure, otherwise one of
+    # the four DeliveryFailure categories -- never SUCCESS. `last_http_status`
+    # is optional context, null when not applicable/unknown.
+    first_failure_at = models.DateTimeField(null=True, blank=True)
+    last_failure_category = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        choices=OUTBOX_FAILURE_CATEGORY_CHOICES,
+    )
+    last_http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+
     class Meta(ImmutableArtifact.Meta):
         constraints: ClassVar[list[models.BaseConstraint]] = [
             models.CheckConstraint(
@@ -532,6 +576,25 @@ class OutboxMessage(ImmutableArtifact):
                     ]
                 ),
                 name="outbox_message_state_allowed_values",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    last_failure_category__in=[
+                        "",
+                        OUTBOX_FAILURE_PERMANENT_REJECTION,
+                        OUTBOX_FAILURE_AUTH_OR_REGISTRATION_FAILURE,
+                        OUTBOX_FAILURE_TRANSIENT_FAILURE,
+                        OUTBOX_FAILURE_RATE_LIMITED,
+                    ]
+                ),
+                name="outbox_message_last_failure_category_allowed_values",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(last_http_status__isnull=True)
+                    | (Q(last_http_status__gte=100) & Q(last_http_status__lte=599))
+                ),
+                name="outbox_message_last_http_status_range",
             ),
         ]
 
@@ -608,6 +671,11 @@ _MUTABLE_FIELDS_BY_MODEL = MappingProxyType(
                 "delivered_at",
                 "rejection_code",
                 "rejection_reason",
+                # Corrective B Task 7: runtime-owned retry metadata --
+                # Task 8 will update these; never the immutable envelope.
+                "first_failure_at",
+                "last_failure_category",
+                "last_http_status",
             }
         ),
         InboxMessage: frozenset(

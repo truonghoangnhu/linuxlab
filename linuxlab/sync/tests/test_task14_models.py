@@ -337,6 +337,107 @@ def test_bulk_write_immutable_rows_rejects_non_mutable_outbox_field():
     assert OutboxMessage.objects.get(pk=outbox.pk).payload == {"score": 1, "max_score": 1}
 
 
+# --- Corrective B Task 7: persisted retry-state fields ----------------------
+
+
+def test_outbox_retry_state_fields_default_to_no_failure_yet():
+    outbox = _make_outbox_message()
+
+    assert outbox.first_failure_at is None
+    assert outbox.last_failure_category == ""
+    assert outbox.last_http_status is None
+
+
+def test_outbox_retry_state_field_metadata_matches_spec():
+    first_failure_at = OutboxMessage._meta.get_field("first_failure_at")
+    assert first_failure_at.null and first_failure_at.blank
+
+    last_failure_category = OutboxMessage._meta.get_field("last_failure_category")
+    assert last_failure_category.max_length == 32
+    assert last_failure_category.blank
+    assert last_failure_category.default == ""
+    assert {value for value, _label in last_failure_category.choices} == {
+        "",
+        "PERMANENT_REJECTION",
+        "AUTH_OR_REGISTRATION_FAILURE",
+        "TRANSIENT_FAILURE",
+        "RATE_LIMITED",
+    }
+
+    last_http_status = OutboxMessage._meta.get_field("last_http_status")
+    assert last_http_status.null and last_http_status.blank
+
+
+def test_write_immutable_row_fields_updates_retry_state_fields():
+    outbox = _make_outbox_message()
+    now = datetime.now(UTC)
+
+    _write_immutable_row_fields(
+        outbox,
+        first_failure_at=now,
+        last_failure_category="TRANSIENT_FAILURE",
+        last_http_status=503,
+    )
+
+    reloaded = OutboxMessage.objects.get(pk=outbox.pk)
+    assert reloaded.first_failure_at == now
+    assert reloaded.last_failure_category == "TRANSIENT_FAILURE"
+    assert reloaded.last_http_status == 503
+    # Envelope/other delivery fields untouched by this write.
+    assert reloaded.payload == {"score": 1, "max_score": 1}
+    assert reloaded.attempts == outbox.attempts
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["", "PERMANENT_REJECTION", "AUTH_OR_REGISTRATION_FAILURE", "TRANSIENT_FAILURE", "RATE_LIMITED"],
+)
+def test_outbox_last_failure_category_allows_each_approved_value(category):
+    outbox = _make_outbox_message(event_id=uuid.uuid4(), last_failure_category=category)
+    assert OutboxMessage.objects.get(pk=outbox.pk).last_failure_category == category
+
+
+@pytest.mark.parametrize("category", ["SUCCESS", "success", "permanent_rejection", "bogus"])
+def test_outbox_last_failure_category_check_constraint_rejects_invalid_value(category):
+    with pytest.raises(IntegrityError), transaction.atomic():
+        _make_outbox_message(last_failure_category=category)
+
+
+@pytest.mark.parametrize("status", [100, 200, 429, 503, 599])
+def test_outbox_last_http_status_allows_boundary_and_typical_values(status):
+    outbox = _make_outbox_message(event_id=uuid.uuid4(), last_http_status=status)
+    assert OutboxMessage.objects.get(pk=outbox.pk).last_http_status == status
+
+
+def test_outbox_last_http_status_allows_null():
+    outbox = _make_outbox_message(last_http_status=None)
+    assert OutboxMessage.objects.get(pk=outbox.pk).last_http_status is None
+
+
+@pytest.mark.parametrize("status", [0, 1, 99, 600, 1000, -1])
+def test_outbox_last_http_status_check_constraint_rejects_out_of_range(status):
+    with pytest.raises(IntegrityError), transaction.atomic():
+        _make_outbox_message(last_http_status=status)
+
+
+def test_outbox_retry_state_fields_are_in_the_mutable_allow_list():
+    from linuxlab.sync.models import _MUTABLE_FIELDS_BY_MODEL
+
+    allowed = _MUTABLE_FIELDS_BY_MODEL[OutboxMessage]
+    assert {"first_failure_at", "last_failure_category", "last_http_status"} <= allowed
+
+
+def test_outbox_retry_state_fields_are_not_treated_as_immutable_envelope():
+    outbox = _make_outbox_message()
+
+    # None of these three raise "non-mutable" -- proving they are the
+    # runtime-owned exception to the envelope-immutability guard, not an
+    # oversight in the rejection list above.
+    _write_immutable_row_fields(outbox, first_failure_at=datetime.now(UTC))
+    _write_immutable_row_fields(outbox, last_failure_category="RATE_LIMITED")
+    _write_immutable_row_fields(outbox, last_http_status=429)
+
+
 # --- InboxMessage ------------------------------------------------------------
 
 
