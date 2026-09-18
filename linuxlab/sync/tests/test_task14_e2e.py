@@ -50,6 +50,18 @@ from linuxlab.sync.transports import HttpSyncTransport
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _node_worker_configuration(settings):
+    """Corrective B Task 8 Fix Round 1 (I3): the public flush_outbox()
+    performs the full typed WORKER-purpose configuration preflight
+    itself. Each test below still sets LINUXLAB_SYNC_ENABLED and its own
+    real LINUXLAB_NODE_ID; this supplies the remaining worker
+    prerequisites (capability, secret, Central URL)."""
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_SECRET = "the-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+
 class _FakeProvider:
     type_key = "fake"
 

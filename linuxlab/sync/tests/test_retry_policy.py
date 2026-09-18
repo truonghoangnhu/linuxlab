@@ -12,7 +12,7 @@ record_delivery_failure() as the sole fenced writer.
 """
 
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from django.utils import timezone
@@ -28,6 +28,7 @@ from linuxlab.sync.models import (
     _insert_immutable_row,
 )
 from linuxlab.sync.outbox import (
+    _revalidate_claimed_for_send,
     claim_outbox_batch,
     compute_retry_delay,
     record_delivery_failure,
@@ -387,3 +388,340 @@ def test_claim_still_selects_a_budget_eligible_candidate(settings):
 
     assert [row.event_id for row in claimed] == [eligible.event_id]
     assert OutboxMessage.objects.get(pk=eligible.pk).state == OUTBOX_IN_FLIGHT
+
+
+# --- Corrective B Task 8 Fix Round 1 ----------------------------------------
+# I1: pre-send authority/budget recheck; I2: safe bounded persisted machine
+# code; I4: missing first-failure anchor fails closed; I5: datetime
+# representability can never erase a real failed send.
+
+def _in_flight_pending_budget(**overrides):
+    return _make_outbox(**overrides)
+
+
+# I1 -- _revalidate_claimed_for_send(): the short-transaction recheck run
+# immediately before EVERY network send (initial batch and every 413 child).
+
+
+def test_presend_recheck_keeps_a_row_whose_claim_and_budget_are_intact():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=1, first_failure_at=now - timedelta(seconds=50))
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert dead_lettered == 0
+    assert [r.event_id for r in survivors] == [row.event_id]
+    assert survivors[0].claim_token == row.claim_token
+    assert survivors[0].attempts == 1
+    assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_IN_FLIGHT
+
+
+def test_presend_recheck_terminalizes_at_exact_age_equality_without_counting_or_sending():
+    now = timezone.now()
+    row = _in_flight_pending_budget(
+        attempts=1, first_failure_at=now - timedelta(seconds=_POLICY.max_retry_age)
+    )
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 1  # a prevented send is never a failed send
+    assert refreshed.last_failure_category == ""
+    assert refreshed.claim_token is None
+    assert refreshed.claimed_at is None
+    assert refreshed.lease_until is None
+
+
+def test_presend_recheck_keeps_a_row_one_second_under_the_age_ceiling():
+    now = timezone.now()
+    row = _in_flight_pending_budget(
+        attempts=1, first_failure_at=now - timedelta(seconds=_POLICY.max_retry_age - 1)
+    )
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert dead_lettered == 0
+    assert len(survivors) == 1
+
+
+def test_presend_recheck_terminalizes_at_exact_attempts_equality():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=_POLICY.max_attempts, first_failure_at=now)
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == _POLICY.max_attempts
+
+
+def test_presend_recheck_excludes_a_row_whose_claim_token_changed_with_zero_mutation():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=0)
+    new_token = uuid.uuid4()
+    _bulk_write_immutable_rows(OutboxMessage.objects.filter(pk=row.pk), claim_token=new_token)
+    before = OutboxMessage.objects.values().get(pk=row.pk)
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 0
+    assert OutboxMessage.objects.values().get(pk=row.pk) == before
+
+
+def test_presend_recheck_excludes_a_row_whose_attempts_snapshot_is_stale():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=0)
+    _bulk_write_immutable_rows(OutboxMessage.objects.filter(pk=row.pk), attempts=1)
+    before = OutboxMessage.objects.values().get(pk=row.pk)
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 0
+    assert OutboxMessage.objects.values().get(pk=row.pk) == before
+
+
+def test_presend_recheck_excludes_a_row_no_longer_in_flight():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=0)
+    _bulk_write_immutable_rows(OutboxMessage.objects.filter(pk=row.pk), state=OUTBOX_PENDING)
+    before = OutboxMessage.objects.values().get(pk=row.pk)
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 0
+    assert OutboxMessage.objects.values().get(pk=row.pk) == before
+
+
+def test_presend_recheck_fails_closed_for_missing_anchor_without_counting():
+    now = timezone.now()
+    row = _in_flight_pending_budget(attempts=1, first_failure_at=None)
+
+    survivors, dead_lettered = _revalidate_claimed_for_send([row], policy=_POLICY, now=now)
+
+    assert survivors == ()
+    assert dead_lettered == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 1
+    assert refreshed.first_failure_at is None
+
+
+def test_presend_recheck_returns_only_surviving_siblings_in_original_order():
+    now = timezone.now()
+    keep_a = _in_flight_pending_budget(attempts=1, first_failure_at=now - timedelta(seconds=10))
+    expired = _in_flight_pending_budget(
+        attempts=1, first_failure_at=now - timedelta(seconds=_POLICY.max_retry_age)
+    )
+    keep_b = _in_flight_pending_budget(attempts=1, first_failure_at=now - timedelta(seconds=10))
+
+    survivors, dead_lettered = _revalidate_claimed_for_send(
+        [keep_a, expired, keep_b], policy=_POLICY, now=now
+    )
+
+    assert dead_lettered == 1
+    assert [r.event_id for r in survivors] == [keep_a.event_id, keep_b.event_id]
+    assert OutboxMessage.objects.get(pk=expired.pk).state == OUTBOX_DEAD_LETTER
+    assert OutboxMessage.objects.get(pk=keep_a.pk).state == OUTBOX_IN_FLIGHT
+
+
+# I2 -- persisted rejection/failure machine code is normalized through ONE
+# private boundary: bounded, conservative token grammar, fixed safe fallback.
+
+
+def test_authorization_shaped_remote_code_is_never_persisted_raw_but_still_terminal():
+    row = _make_outbox(attempts=0)
+    failure = DeliveryFailure(
+        category=SyncOutcome.PERMANENT_REJECTION,
+        error_code="Bearer AUTH_SENTINEL_TOKEN_VALUE",
+    )
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY)
+
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.attempts == 1
+    persisted = OutboxMessage.objects.values().get(pk=row.pk)
+    assert "AUTH_SENTINEL_TOKEN_VALUE" not in str(persisted)
+    assert "Bearer" not in str(persisted)
+    assert persisted["rejection_code"] != ""
+    assert len(persisted["rejection_code"]) <= 100
+
+
+def test_oversized_remote_code_never_raises_data_error_and_never_erases_accounting():
+    row = _make_outbox(attempts=0)
+    oversized = "A" * 101
+    failure = DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, error_code=oversized)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY)
+
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.attempts == 1
+    assert updated.last_failure_category == "PERMANENT_REJECTION"
+    assert updated.rejection_code != oversized
+    assert updated.rejection_code != ""
+    assert len(updated.rejection_code) <= 100
+    # Never a silent truncation of the remote text either.
+    assert updated.rejection_code != oversized[:100]
+
+
+def test_ordinary_safe_machine_code_is_preserved_exactly():
+    row = _make_outbox(attempts=0)
+    failure = DeliveryFailure(
+        category=SyncOutcome.PERMANENT_REJECTION, error_code="IDEMPOTENCY_CONFLICT"
+    )
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY)
+
+    assert updated.rejection_code == "IDEMPOTENCY_CONFLICT"
+    assert updated.state == OUTBOX_DEAD_LETTER
+
+
+@pytest.mark.parametrize(
+    "unsafe_code",
+    [
+        "Authorization: Bearer x",
+        "{\"body\": \"text\"}",
+        "free form reason text",
+        "code\nwith\nnewlines",
+        "lower_case_code",
+        "_LEADING_UNDERSCORE",
+        "1STARTS_WITH_DIGIT",
+        "B" * 100 + "C",
+    ],
+)
+def test_every_unsafe_code_shape_maps_to_the_same_fixed_fallback(unsafe_code):
+    row = _make_outbox(attempts=0)
+    failure = DeliveryFailure(category=SyncOutcome.PERMANENT_REJECTION, error_code=unsafe_code)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY)
+
+    assert updated.rejection_code == "UNSAFE_REMOTE_CODE"
+    assert updated.attempts == 1
+    assert updated.state == OUTBOX_DEAD_LETTER
+
+
+def test_empty_code_stays_empty_for_transient_failures():
+    row = _make_outbox(attempts=0)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY)
+
+    assert updated.rejection_code == ""
+
+
+# I4 -- attempts > 0 with first_failure_at None is an invalid persisted retry
+# cycle: a real failed send is still counted exactly once, but the missing
+# anchor is NEVER renewed by assigning now; the row terminalizes instead.
+
+
+def test_record_delivery_failure_never_renews_a_missing_anchor_and_terminalizes():
+    row = _make_outbox(attempts=1, first_failure_at=None)
+    now = timezone.now()
+    original_next_attempt_at = row.next_attempt_at
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 2
+    assert updated.first_failure_at is None
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.last_failure_category == "TRANSIENT_FAILURE"
+    assert updated.claim_token is None
+    assert updated.claimed_at is None
+    assert updated.lease_until is None
+    assert updated.next_attempt_at == original_next_attempt_at
+
+
+def test_record_delivery_failure_missing_anchor_keep_claim_still_terminalizes():
+    row = _make_outbox(attempts=1, first_failure_at=None)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, keep_claim=True)
+
+    assert updated.attempts == 2
+    assert updated.first_failure_at is None
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.claim_token is None
+
+
+def test_record_delivery_failure_untouched_cycle_still_anchors_on_first_real_failure():
+    row = _make_outbox(attempts=0, first_failure_at=None)
+    now = timezone.now()
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 1
+    assert updated.first_failure_at == now
+    assert updated.state == OUTBOX_PENDING
+
+
+# I5 -- datetime representability: an unrepresentable due time/deadline
+# fails closed AFTER accounting, never as an escaping OverflowError that
+# rolls the failed send back.
+
+
+_NEAR_DATETIME_MAX = datetime.max.replace(tzinfo=UTC) - timedelta(seconds=2)
+
+
+def test_unrepresentable_due_time_fails_closed_after_counting_the_failed_send(monkeypatch):
+    now = _NEAR_DATETIME_MAX
+    row = _make_outbox(attempts=0, first_failure_at=None)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 1
+    assert updated.first_failure_at == now
+    assert updated.last_failure_category == "TRANSIENT_FAILURE"
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.claim_token is None
+    assert updated.claimed_at is None
+    assert updated.lease_until is None
+
+
+def test_unrepresentable_retry_after_schedule_fails_closed_after_counting():
+    now = _NEAR_DATETIME_MAX
+    row = _make_outbox(attempts=0, first_failure_at=None)
+    failure = DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=30)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 1
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.last_failure_category == "RATE_LIMITED"
+
+
+def test_unrepresentable_age_deadline_fails_closed_after_counting(monkeypatch):
+    # Due time itself is representable (zero jitter) but the age deadline
+    # first_failure_at + max_retry_age is not.
+    now = _NEAR_DATETIME_MAX
+    row = _make_outbox(attempts=0, first_failure_at=None)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 0.0)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 1
+    assert updated.state == OUTBOX_DEAD_LETTER
+
+
+def test_representable_near_boundary_schedule_still_returns_to_pending(monkeypatch):
+    now = datetime.max.replace(tzinfo=UTC) - timedelta(minutes=10)
+    row = _make_outbox(attempts=0, first_failure_at=None)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 1
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=_POLICY.base_delay)

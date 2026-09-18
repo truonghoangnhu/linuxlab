@@ -441,7 +441,16 @@ def test_mark_dead_letter_transitions_only_the_named_event():
 
 def test_release_transient_returns_row_to_pending_with_incremented_attempts():
     now = timezone.now()
-    row = _make_outbox(state=OUTBOX_IN_FLIGHT, attempts=2, claimed_at=now, lease_until=now + timedelta(minutes=5))
+    # A row mid-cycle (attempts > 0) carries its real first-failure anchor;
+    # attempts > 0 with NO anchor is an invalid cycle that fails closed
+    # (Corrective B Task 8 Fix Round 1, I4) and is covered separately.
+    row = _make_outbox(
+        state=OUTBOX_IN_FLIGHT,
+        attempts=2,
+        first_failure_at=now - timedelta(seconds=30),
+        claimed_at=now,
+        lease_until=now + timedelta(minutes=5),
+    )
 
     release_transient([row], "timeout", now=now)
 

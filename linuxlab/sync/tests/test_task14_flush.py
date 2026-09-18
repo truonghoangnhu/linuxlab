@@ -35,6 +35,20 @@ from linuxlab.sync.transports import FileSyncTransport
 
 pytestmark = pytest.mark.django_db
 
+
+@pytest.fixture(autouse=True)
+def _node_worker_configuration(settings):
+    """Corrective B Task 8 Fix Round 1 (I3): the public flush_outbox()
+    now performs the full typed WORKER-purpose configuration preflight
+    itself, so every direct call here runs under a valid Node worker
+    configuration -- exactly what `sync_events` would have validated."""
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+    settings.LINUXLAB_SYNC_ENABLED = True
+    settings.LINUXLAB_NODE_ID = str(uuid.uuid4())
+    settings.LINUXLAB_SYNC_SECRET = "the-secret"
+    settings.LINUXLAB_CENTRAL_URL = "https://central.example.org"
+
+
 # Corrective B Task 6: ProtocolTransportError now requires an explicit
 # DeliveryFailure -- these existing fixtures all represent an HTTP-400-style
 # protocol fault, so they carry PERMANENT_REJECTION metadata (the same
@@ -571,3 +585,261 @@ def test_file_transport_flush_leaves_events_unconfirmed_never_delivered(tmp_path
     assert refreshed.state == OUTBOX_PENDING
     assert refreshed.state != OUTBOX_DELIVERED
     assert list(tmp_path.glob("*.json"))
+
+
+# --- Corrective B Task 8 Fix Round 1 ----------------------------------------
+
+
+def _advancing_clock(monkeypatch, start):
+    """Controlled clock seam: flush_outbox(now=None) resolves the clock
+    per operation through linuxlab.sync.outbox's `timezone.now`, so a
+    test can advance it BETWEEN operations of one flush cycle."""
+    from linuxlab.sync import outbox as outbox_module
+
+    clock = {"now": start}
+    monkeypatch.setattr(outbox_module.timezone, "now", lambda: clock["now"])
+    return clock
+
+
+# I1 -- retry budget / claim authority are rechecked immediately before
+# EVERY network send, including every 413 child resend.
+
+
+def test_413_child_whose_age_budget_expires_before_its_send_is_not_sent(settings, monkeypatch):
+    settings.LINUXLAB_SYNC_RETRY_MAX_AGE = 100
+    settings.LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS = 10
+    t0 = timezone.now()
+    clock = _advancing_clock(monkeypatch, t0)
+    first_failure_at = t0 - timedelta(seconds=50)  # age 50 at the parent send
+    a = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+    b = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+    c = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+
+    def _decide(envelopes):
+        if len(envelopes) > 1:
+            raise RequestTooLargeError("413")
+        # The first child (singleton `a`) succeeds; the clock then advances
+        # so the remaining siblings reach EXACT age equality (100s) before
+        # their own child send.
+        clock["now"] = first_failure_at + timedelta(seconds=100)
+        (envelope,) = envelopes
+        return BatchAck(results=(EventAck(event_id=envelope.event_id, status=ACCEPTED),))
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    # Parent 3-batch (413) + exactly one child send (`a` alone); `b`/`c`
+    # never hit the network again.
+    assert [len(call) for call in transport.calls] == [3, 1]
+    assert transport.calls[1][0].event_id == a.event_id
+    assert summary.claimed == 3
+    assert summary.delivered == 1
+    assert summary.dead_lettered == 2
+    assert OutboxMessage.objects.get(pk=a.pk).state == OUTBOX_DELIVERED
+    for row in (b, c):
+        refreshed = OutboxMessage.objects.get(pk=row.pk)
+        assert refreshed.state == OUTBOX_DEAD_LETTER
+        # Exactly ONE failed send counted (the parent 413); the prevented
+        # child send adds nothing.
+        assert refreshed.attempts == 2
+        assert refreshed.first_failure_at == first_failure_at
+        assert refreshed.claim_token is None
+        assert refreshed.claimed_at is None
+        assert refreshed.lease_until is None
+
+
+def test_413_child_one_second_under_the_age_ceiling_is_still_sent(settings, monkeypatch):
+    settings.LINUXLAB_SYNC_RETRY_MAX_AGE = 100
+    settings.LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS = 10
+    t0 = timezone.now()
+    clock = _advancing_clock(monkeypatch, t0)
+    first_failure_at = t0 - timedelta(seconds=50)
+    a = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+    b = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+
+    def _decide(envelopes):
+        if len(envelopes) > 1:
+            raise RequestTooLargeError("413")
+        clock["now"] = first_failure_at + timedelta(seconds=99)
+        (envelope,) = envelopes
+        return BatchAck(results=(EventAck(event_id=envelope.event_id, status=ACCEPTED),))
+
+    transport = _CallableTransport(_decide)
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert [len(call) for call in transport.calls] == [2, 1, 1]
+    assert summary.delivered == 2
+    assert summary.dead_lettered == 0
+    for row in (a, b):
+        assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DELIVERED
+
+
+def test_initial_send_is_prevented_when_budget_expires_between_claim_and_send(
+    settings, monkeypatch
+):
+    settings.LINUXLAB_SYNC_RETRY_MAX_AGE = 100
+    settings.LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS = 10
+    from linuxlab.sync import outbox as outbox_module
+
+    t0 = timezone.now()
+    clock = _advancing_clock(monkeypatch, t0)
+    first_failure_at = t0 - timedelta(seconds=99)  # eligible at claim time
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at, next_attempt_at=t0)
+
+    real_claim = outbox_module.claim_outbox_batch
+
+    def _claim_then_advance(**kwargs):
+        claimed = real_claim(**kwargs)
+        clock["now"] = first_failure_at + timedelta(seconds=100)
+        return claimed
+
+    monkeypatch.setattr(outbox_module, "claim_outbox_batch", _claim_then_advance)
+    transport = _ScriptedTransport(
+        result=BatchAck(results=(EventAck(event_id=row.event_id, status=ACCEPTED),))
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert transport.calls == []
+    assert summary.claimed == 1
+    assert summary.dead_lettered == 1
+    assert summary.delivered == 0
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 1
+    assert refreshed.last_failure_category == ""
+    assert refreshed.claim_token is None
+
+
+def test_initial_send_excludes_a_row_reclaimed_by_another_worker_with_zero_mutation(
+    settings, monkeypatch
+):
+    from linuxlab.sync import outbox as outbox_module
+    from linuxlab.sync.models import _bulk_write_immutable_rows
+
+    row = _make_outbox()
+    real_claim = outbox_module.claim_outbox_batch
+    stolen_token = uuid.uuid4()
+    after_reclaim = {}
+
+    def _claim_then_lose_authority(**kwargs):
+        claimed = real_claim(**kwargs)
+        # Another worker reclaims the row under a fresh token before our send.
+        _bulk_write_immutable_rows(
+            OutboxMessage.objects.filter(pk=row.pk), claim_token=stolen_token
+        )
+        after_reclaim["snapshot"] = OutboxMessage.objects.values().get(pk=row.pk)
+        return claimed
+
+    monkeypatch.setattr(outbox_module, "claim_outbox_batch", _claim_then_lose_authority)
+    transport = _ScriptedTransport(
+        result=BatchAck(results=(EventAck(event_id=row.event_id, status=ACCEPTED),))
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert transport.calls == []
+    assert summary.claimed == 1
+    assert summary.delivered == 0
+    assert summary.dead_lettered == 0
+    # The stale worker made ZERO mutation: the row is exactly as the
+    # reclaiming worker left it, still owned by the stolen token.
+    persisted = OutboxMessage.objects.values().get(pk=row.pk)
+    assert persisted == after_reclaim["snapshot"]
+    assert persisted["claim_token"] == stolen_token
+
+
+# I2 -- an unsafe per-event ACK rejection code from Central is still a
+# PERMANENT_REJECTION (one failed send, dead_letter) but is never persisted
+# raw; the fixed safe fallback is stored instead.
+
+
+def test_authorization_shaped_ack_rejection_code_is_terminal_but_never_persisted_raw():
+    row = _make_outbox()
+    transport = _ScriptedTransport(
+        result=BatchAck(
+            results=(
+                EventAck(
+                    event_id=row.event_id,
+                    status=REJECTED,
+                    code="Bearer ACK_AUTH_SENTINEL",
+                    reason="Authorization: Bearer ACK_AUTH_SENTINEL",
+                ),
+            )
+        )
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.dead_lettered == 1
+    assert summary.delivered == 0
+    persisted = OutboxMessage.objects.values().get(pk=row.pk)
+    assert persisted["state"] == OUTBOX_DEAD_LETTER
+    assert persisted["attempts"] == 1
+    assert "ACK_AUTH_SENTINEL" not in str(persisted)
+    assert "Bearer" not in str(persisted)
+    assert persisted["rejection_code"] == "UNSAFE_REMOTE_CODE"
+
+
+def test_oversized_ack_rejection_code_never_raises_and_still_dead_letters():
+    row = _make_outbox()
+    transport = _ScriptedTransport(
+        result=BatchAck(
+            results=(EventAck(event_id=row.event_id, status=REJECTED, code="Z" * 150),)
+        )
+    )
+
+    summary = flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert summary.dead_lettered == 1
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 1
+    assert refreshed.rejection_code == "UNSAFE_REMOTE_CODE"
+
+
+# I3 -- the PUBLIC flush_outbox() performs the complete typed WORKER-purpose
+# configuration preflight itself, before any claim/write/network.
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("LINUXLAB_SYNC_BATCH_MAX_BYTES", "CONFIG_SENTINEL_VALUE"),
+        ("LINUXLAB_SYNC_BATCH_MAX_EVENTS", "CONFIG_SENTINEL_VALUE"),
+        ("LINUXLAB_SYNC_LEASE_SECONDS", 0),
+        ("LINUXLAB_SYNC_RETRY_MAX_ATTEMPTS", "CONFIG_SENTINEL_VALUE"),
+        ("LINUXLAB_SYNC_RETRY_MAX_AGE", "CONFIG_SENTINEL_VALUE"),
+        ("LINUXLAB_SYNC_BACKOFF_BASE_SECONDS", "CONFIG_SENTINEL_VALUE"),
+        ("LINUXLAB_SYNC_ENABLED", False),
+        ("LINUXLAB_CAN_RUN_SYNC_WORKER", False),
+        ("LINUXLAB_NODE_ID", None),
+        ("LINUXLAB_SYNC_SECRET", ""),
+        ("LINUXLAB_CENTRAL_URL", "CONFIG_SENTINEL_VALUE"),
+    ],
+)
+def test_public_flush_outbox_preflights_worker_configuration_before_any_write(
+    settings, name, value
+):
+    from linuxlab.sync.configuration import SyncConfigurationError
+
+    setattr(settings, name, value)
+    row = _make_outbox()
+    before = OutboxMessage.objects.values().get(pk=row.pk)
+    transport = _ScriptedTransport(
+        result=BatchAck(results=(EventAck(event_id=row.event_id, status=ACCEPTED),))
+    )
+
+    with pytest.raises(SyncConfigurationError) as caught:
+        flush_outbox(transport, max_events=10, max_bytes=1_000_000, lease_seconds=60)
+
+    assert transport.calls == []
+    after = OutboxMessage.objects.values().get(pk=row.pk)
+    assert after == before
+    assert after["state"] == OUTBOX_PENDING
+    assert after["attempts"] == 0
+    assert after["claim_token"] is None
+    assert "CONFIG_SENTINEL_VALUE" not in str(caught.value)
+    assert "the-secret" not in str(caught.value)

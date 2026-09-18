@@ -78,8 +78,9 @@ def test_release_transient_uses_configured_base_and_cap(settings):
 def test_release_transient_scales_with_larger_configured_values(settings):
     settings.LINUXLAB_SYNC_BACKOFF_BASE_SECONDS = 20.0
     settings.LINUXLAB_SYNC_BACKOFF_CAP_SECONDS = 80.0
-    row = _make_outbox(attempts=1)
     now = timezone.now()
+    # attempts > 0 requires its real first-failure anchor (Fix Round 1, I4).
+    row = _make_outbox(attempts=1, first_failure_at=now)
 
     with patch("linuxlab.sync.outbox.random.random", return_value=1.0):
         release_transient([row], "timeout", now=now)

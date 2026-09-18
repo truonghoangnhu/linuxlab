@@ -31,6 +31,7 @@ linuxlab.sync.models' own model-fixed allow-list
 """
 
 import random
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -76,6 +77,31 @@ _SAFE_FAILURE_REASONS = {
 _TERMINAL_CATEGORIES = frozenset(
     {SyncOutcome.PERMANENT_REJECTION, SyncOutcome.AUTH_OR_REGISTRATION_FAILURE}
 )
+
+# Corrective B Task 8 Fix Round 1 (I2): the ONE boundary through which any
+# rejection/failure machine code reaches persistence. A remote-supplied
+# code (a Central per-event ACK `code`, a transport error_code) is
+# untrusted text: it is persisted verbatim ONLY when it already fits a
+# conservative machine-token grammar AND the rejection_code column's own
+# DB bound; anything else (Authorization/bearer-shaped text, free-form
+# reasons, bodies, headers, oversized values) maps to this fixed,
+# project-owned fallback -- never truncated, never stored raw, never able
+# to raise DataError and roll the failed-send accounting back.
+_UNSAFE_REMOTE_CODE_FALLBACK = "UNSAFE_REMOTE_CODE"
+_MACHINE_CODE_GRAMMAR = re.compile(r"[A-Z][A-Z0-9_]*")
+_REJECTION_CODE_MAX_LENGTH = OutboxMessage._meta.get_field("rejection_code").max_length
+
+
+def _safe_machine_code(code):
+    """Normalize an untrusted machine code for persistence: "" stays ""
+    (no code); a value that fully matches the UPPER_SNAKE token grammar
+    and fits the column is preserved exactly; everything else becomes
+    the fixed safe fallback."""
+    if not isinstance(code, str) or code == "":
+        return ""
+    if len(code) <= _REJECTION_CODE_MAX_LENGTH and _MACHINE_CODE_GRAMMAR.fullmatch(code):
+        return code
+    return _UNSAFE_REMOTE_CODE_FALLBACK
 
 
 def _current_retry_policy():
@@ -177,7 +203,7 @@ def _safe_failure_evidence(failure):
     """Bounded safe machine code + fixed controlled safe human reason --
     never the remote transport's own exception/response/ACK text
     (Corrective B Task 8 §9/§27)."""
-    code = failure.error_code if failure.error_code else ""
+    code = _safe_machine_code(failure.error_code)
     reason = _SAFE_FAILURE_REASONS.get(failure.category, "delivery failure")
     return code, reason
 
@@ -193,6 +219,24 @@ def _candidate_delay(failure, new_attempts, policy, random_source):
     if failure.category is SyncOutcome.RATE_LIMITED and failure.retry_after_seconds is not None:
         return float(min(failure.retry_after_seconds, policy.max_delay))
     return compute_retry_delay(new_attempts, base=policy.base_delay, cap=policy.max_delay, random_source=random_source)
+
+
+def _representable_next_attempt_at(
+    failure, new_attempts, first_failure_at, policy, now, random_source
+):
+    """Compute `min(now + delay, first_failure_at + max_retry_age)` for a
+    retryable failure, or None when compliant scheduling cannot produce a
+    representable datetime (Corrective B Task 8 Fix Round 1, I5). Only
+    the datetime/timedelta arithmetic itself is guarded, and only for
+    the two exceptions it raises on overflow (OverflowError from
+    datetime + timedelta and timedelta(seconds=...) range, ValueError
+    from a non-finite seconds value) -- nothing else is swallowed."""
+    delay = _candidate_delay(failure, new_attempts, policy, random_source)
+    try:
+        deadline = first_failure_at + timedelta(seconds=policy.max_retry_age)
+        return min(now + timedelta(seconds=delay), deadline)
+    except (OverflowError, ValueError):
+        return None
 
 
 def record_delivery_failure(
@@ -243,7 +287,18 @@ def record_delivery_failure(
             return None
 
         new_attempts = current.attempts + 1
-        first_failure_at = current.first_failure_at or now
+        # Fix Round 1 (I4): the anchor is set ONLY by the first real failed
+        # send of an untouched cycle (attempts == 0, no anchor). A row with
+        # attempts > 0 and NO anchor is an invalid persisted retry cycle --
+        # its missing age evidence is never renewed by assigning `now`;
+        # the failed send is still counted once below and the row fails
+        # closed to dead_letter.
+        if current.first_failure_at is not None:
+            first_failure_at = current.first_failure_at
+        elif current.attempts == 0:
+            first_failure_at = now
+        else:
+            first_failure_at = None
         safe_code, safe_reason = _safe_failure_evidence(failure)
 
         changes = {
@@ -261,14 +316,21 @@ def record_delivery_failure(
                 new_attempts, first_failure_at, policy=policy, now=now
             )
 
+        next_attempt_at = None
+        if not terminal and not keep_claim:
+            next_attempt_at = _representable_next_attempt_at(
+                failure, new_attempts, first_failure_at, policy, now, random_source
+            )
+            # Fix Round 1 (I5): an unrepresentable due time/deadline fails
+            # closed AFTER the failed send has been counted above -- never
+            # as an escaping OverflowError that would roll it back.
+            terminal = next_attempt_at is None
+
         if terminal:
             changes.update(
                 state=OUTBOX_DEAD_LETTER, claimed_at=None, lease_until=None, claim_token=None
             )
         elif not keep_claim:
-            delay = _candidate_delay(failure, new_attempts, policy, random_source)
-            deadline = first_failure_at + timedelta(seconds=policy.max_retry_age)
-            next_attempt_at = min(now + timedelta(seconds=delay), deadline)
             changes.update(
                 state=OUTBOX_PENDING,
                 next_attempt_at=next_attempt_at,
@@ -542,6 +604,56 @@ def _recover_from_request_too_large(transport, rows, failure, policy, now):
     return _merge_flush_summaries(exhausted_here, _merge_flush_summaries(first_half, second_half))
 
 
+def _revalidate_claimed_for_send(rows, *, policy, now=None):
+    """Corrective B Task 8 Fix Round 1 (I1): the recheck run immediately
+    before EVERY automatic network send -- the initial batch and every
+    413 child/split resend. Inside ONE short transaction it re-resolves
+    each captured row under select_for_update() and requires, all at
+    once: state == IN_FLIGHT, the EXACT captured claim_token, and the
+    EXACT captured attempts. A row failing any of these has lost claim
+    authority and is simply excluded with ZERO mutation. A row that still
+    owns its claim but whose retry budget (attempts OR age, equality
+    exhausts either -- including a missing age anchor, which fails
+    closed) is now exhausted is terminalized to dead_letter with its
+    claim metadata cleared: a prevented send, never a failed send, so
+    attempts and failure evidence are untouched. Returns
+    (fresh surviving rows in original order, dead_lettered count); the
+    transaction is closed before any caller touches the network.
+    """
+    now = now if now is not None else timezone.now()
+    survivors = []
+    dead_lettered = 0
+    with transaction.atomic():
+        current_by_event_id = {
+            current.event_id: current
+            for current in OutboxMessage.objects.select_for_update().filter(
+                event_id__in=[row.event_id for row in rows], state=OUTBOX_IN_FLIGHT
+            )
+        }
+        for row in rows:
+            current = current_by_event_id.get(row.event_id)
+            if (
+                current is None
+                or current.claim_token != row.claim_token
+                or current.attempts != row.attempts
+            ):
+                continue
+            if not retry_budget_remaining(
+                current.attempts, current.first_failure_at, policy=policy, now=now
+            ):
+                _write_immutable_row_fields(
+                    current,
+                    state=OUTBOX_DEAD_LETTER,
+                    claimed_at=None,
+                    lease_until=None,
+                    claim_token=None,
+                )
+                dead_lettered += 1
+                continue
+            survivors.append(current)
+    return tuple(survivors), dead_lettered
+
+
 def _send_claimed_rows(transport, rows, now=None, policy=None):
     """Send exactly `rows` (already-claimed OutboxMessage instances)
     through `transport`, OUTSIDE any open DB transaction, then update
@@ -562,14 +674,29 @@ def _send_claimed_rows(transport, rows, now=None, policy=None):
     if policy is None:
         policy = _current_retry_policy()
 
+    # Fix Round 1 (I1): re-resolve authority and budget for exactly these
+    # rows immediately before the send -- in a short transaction that is
+    # closed again before the network call below. Rows excluded or
+    # terminalized here are accounted for in `not_sent`; only the fresh
+    # surviving rows are ever serialized and sent.
+    handed = len(rows)
+    rows, presend_dead_lettered = _revalidate_claimed_for_send(rows, policy=policy, now=now)
+    not_sent = FlushSummary(claimed=handed - len(rows), dead_lettered=presend_dead_lettered)
+    if not rows:
+        return not_sent
+
     envelopes = tuple(envelope_for(row) for row in rows)
 
     try:
         batch_ack = transport.send_batch(envelopes)
     except RequestTooLargeError as exc:
-        return _recover_from_request_too_large(transport, rows, exc.failure, policy, now)
+        return _merge_flush_summaries(
+            not_sent, _recover_from_request_too_large(transport, rows, exc.failure, policy, now)
+        )
     except (AuthTransportError, ProtocolTransportError, TransientTransportError) as exc:
-        return _record_batch_failure(rows, exc.failure, policy, now)
+        return _merge_flush_summaries(
+            not_sent, _record_batch_failure(rows, exc.failure, policy, now)
+        )
 
     # Never trust that batch_ack.results is already deduplicated --
     # BatchAck can be constructed directly by any transport (or a test),
@@ -627,11 +754,14 @@ def _send_claimed_rows(transport, rows, now=None, policy=None):
             else:
                 released_transient += 1
 
-    return FlushSummary(
-        claimed=len(rows),
-        delivered=len(delivered_rows),
-        dead_lettered=dead_lettered,
-        released_transient=released_transient,
+    return _merge_flush_summaries(
+        not_sent,
+        FlushSummary(
+            claimed=len(rows),
+            delivered=len(delivered_rows),
+            dead_lettered=dead_lettered,
+            released_transient=released_transient,
+        ),
     )
 
 
@@ -642,12 +772,24 @@ def flush_outbox(transport, *, max_events, max_bytes, lease_seconds, now=None):
     T14-D40). Never reserializes from current domain state -- every
     envelope sent is exactly what claim_outbox_batch() returned. Owns
     no business mutation and no Central projection.
+
+    Corrective B Task 8 Fix Round 1 (I3): this public entry point
+    performs the complete typed WORKER-purpose configuration preflight
+    itself (Task 3's `load_sync_configuration(purpose="worker")` --
+    capability, enabled, retry policy, credentials, batch and lease
+    settings) BEFORE any claim, state mutation, claim-token creation,
+    attempt mutation, or transport call, so a malformed or disabled
+    local deployment makes zero writes and zero network calls even when
+    this function is called directly rather than through `sync_events`.
+    The typed SyncConfigurationError carries only the setting name and a
+    fixed code -- never a setting's value. The retry policy used for the
+    whole cycle is the one that preflight resolved.
     """
+    configuration = load_sync_configuration(purpose="worker")
     claimed = claim_outbox_batch(
         max_events=max_events, max_bytes=max_bytes, lease_seconds=lease_seconds, now=now
     )
-    policy = _current_retry_policy()
-    return _send_claimed_rows(transport, list(claimed), now=now, policy=policy)
+    return _send_claimed_rows(transport, list(claimed), now=now, policy=configuration.retry_policy)
 
 
 class OutboxRequeueError(ValueError):
