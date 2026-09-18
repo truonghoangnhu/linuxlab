@@ -224,17 +224,33 @@ def _candidate_delay(failure, new_attempts, policy, random_source):
 def _representable_next_attempt_at(
     failure, new_attempts, first_failure_at, policy, now, random_source
 ):
-    """Compute `min(now + delay, first_failure_at + max_retry_age)` for a
-    retryable failure, or None when compliant scheduling cannot produce a
-    representable datetime (Corrective B Task 8 Fix Round 1, I5). Only
-    the datetime/timedelta arithmetic itself is guarded, and only for
-    the two exceptions it raises on overflow (OverflowError from
-    datetime + timedelta and timedelta(seconds=...) range, ValueError
-    from a non-finite seconds value) -- nothing else is swallowed."""
+    """The earlier of `now + delay` and `first_failure_at + max_retry_age`
+    for a retryable failure, or None when the FINAL compliant due time
+    cannot be represented (Corrective B Task 8 Fix Round 1 I5, Fix Round
+    2 R2). The clamp is evaluated in DURATION space before the one and
+    only datetime addition:
+
+        elapsed         = now - first_failure_at        (exact, microseconds)
+        remaining_age   = max_retry_age - elapsed
+        effective_delay = min(candidate_delay, remaining_age)
+        next_attempt_at = now + effective_delay
+
+    which equals min(now + delay, first_failure_at + max_retry_age)
+    exactly (datetime subtraction is exact), so no un-clamped candidate
+    or raw deadline datetime is ever materialized -- neither can overflow
+    on its own and wrongly fail a representable result closed. Only the
+    final addition (and the timedelta conversions feeding it) is guarded,
+    and only for OverflowError/ValueError; nothing else is swallowed.
+    `remaining_age <= 0` (only reachable through sub-microsecond policy
+    rounding, since the caller already verified budget remains) is
+    treated as exhausted rather than ever producing a negative offset.
+    """
     delay = _candidate_delay(failure, new_attempts, policy, random_source)
     try:
-        deadline = first_failure_at + timedelta(seconds=policy.max_retry_age)
-        return min(now + timedelta(seconds=delay), deadline)
+        remaining_age = timedelta(seconds=policy.max_retry_age) - (now - first_failure_at)
+        if remaining_age <= timedelta(0):
+            return None
+        return now + min(timedelta(seconds=delay), remaining_age)
     except (OverflowError, ValueError):
         return None
 
@@ -619,8 +635,14 @@ def _revalidate_claimed_for_send(rows, *, policy, now=None):
     attempts and failure evidence are untouched. Returns
     (fresh surviving rows in original order, dead_lettered count); the
     transaction is closed before any caller touches the network.
+
+    Fix Round 2 (R1): an explicitly injected `now` is authoritative
+    (deterministic tests); otherwise the production clock is sampled
+    ONLY AFTER the authoritative rows have been acquired under the
+    select_for_update() lock -- never before, because the lock wait can
+    itself take long enough for the age budget to expire, and a
+    pre-lock sample would then authorize a send past the deadline.
     """
-    now = now if now is not None else timezone.now()
     survivors = []
     dead_lettered = 0
     with transaction.atomic():
@@ -630,6 +652,8 @@ def _revalidate_claimed_for_send(rows, *, policy, now=None):
                 event_id__in=[row.event_id for row in rows], state=OUTBOX_IN_FLIGHT
             )
         }
+        if now is None:
+            now = timezone.now()
         for row in rows:
             current = current_by_event_id.get(row.event_id)
             if (

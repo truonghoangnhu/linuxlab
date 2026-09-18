@@ -700,9 +700,14 @@ def test_unrepresentable_retry_after_schedule_fails_closed_after_counting():
     assert updated.last_failure_category == "RATE_LIMITED"
 
 
-def test_unrepresentable_age_deadline_fails_closed_after_counting(monkeypatch):
-    # Due time itself is representable (zero jitter) but the age deadline
-    # first_failure_at + max_retry_age is not.
+def test_representable_clamped_due_time_is_retried_even_when_raw_deadline_overflows(
+    monkeypatch,
+):
+    # Fix Round 2 (R2) coordinator ruling: representability is judged on
+    # the FINAL compliant next_attempt_at. Zero jitter makes the final due
+    # time `now` itself (representable) even though the raw deadline
+    # first_failure_at + max_retry_age would overflow -- so the row is
+    # retried, not dead-lettered.
     now = _NEAR_DATETIME_MAX
     row = _make_outbox(attempts=0, first_failure_at=None)
     failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
@@ -711,7 +716,8 @@ def test_unrepresentable_age_deadline_fails_closed_after_counting(monkeypatch):
     updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
 
     assert updated.attempts == 1
-    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now
 
 
 def test_representable_near_boundary_schedule_still_returns_to_pending(monkeypatch):
@@ -725,3 +731,136 @@ def test_representable_near_boundary_schedule_still_returns_to_pending(monkeypat
     assert updated.attempts == 1
     assert updated.state == OUTBOX_PENDING
     assert updated.next_attempt_at == now + timedelta(seconds=_POLICY.base_delay)
+
+
+# --- Corrective B Task 8 Fix Round 2 (R2): clamp in duration space BEFORE
+# the final datetime addition; only a truly unrepresentable FINAL
+# next_attempt_at fails closed.
+
+# attempts 1 -> 2 doubles the jitter ceiling once: base 5 s -> candidate 10 s.
+_R2_POLICY = SyncRetryPolicy(
+    base_delay=5.0, max_delay=3600.0, max_attempts=10, max_retry_age=100.0
+)
+
+
+def test_r2_reviewer_reproduction_schedules_at_remaining_age_not_overflow(monkeypatch):
+    now = _NEAR_DATETIME_MAX
+    first_failure_at = now - timedelta(seconds=99)  # remaining age: 1 s
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status=503)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)  # candidate 10 s
+
+    updated = record_delivery_failure(row, failure, policy=_R2_POLICY, now=now)
+
+    assert updated.attempts == 2
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=1)
+    assert updated.first_failure_at == first_failure_at
+    assert updated.last_failure_category == "TRANSIENT_FAILURE"
+    assert updated.last_http_status == 503
+    assert updated.claim_token is None
+
+
+def test_r2_reviewer_reproduction_with_retry_after_schedules_at_remaining_age():
+    now = _NEAR_DATETIME_MAX
+    first_failure_at = now - timedelta(seconds=99)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=10)
+
+    updated = record_delivery_failure(row, failure, policy=_R2_POLICY, now=now)
+
+    assert updated.attempts == 2
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=1)
+    assert updated.last_failure_category == "RATE_LIMITED"
+
+
+def test_r2_huge_retry_after_is_capped_then_clamped_to_remaining_age():
+    now = _NEAR_DATETIME_MAX
+    first_failure_at = now - timedelta(seconds=99)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=10**400)
+
+    updated = record_delivery_failure(row, failure, policy=_R2_POLICY, now=now)
+
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=1)
+
+
+def test_r2_malformed_retry_after_still_uses_clamped_jitter(monkeypatch):
+    now = _NEAR_DATETIME_MAX
+    first_failure_at = now - timedelta(seconds=99)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.RATE_LIMITED, retry_after_seconds=None)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)
+
+    updated = record_delivery_failure(row, failure, policy=_R2_POLICY, now=now)
+
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=1)
+
+
+def test_r2_candidate_earlier_than_deadline_uses_candidate(monkeypatch):
+    now = timezone.now()
+    first_failure_at = now - timedelta(seconds=80)  # remaining age: 20 s
+    policy = SyncRetryPolicy(base_delay=2.5, max_delay=3600.0, max_attempts=10, max_retry_age=100.0)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)  # candidate 5 s
+
+    updated = record_delivery_failure(row, failure, policy=policy, now=now)
+
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=5)
+
+
+def test_r2_deadline_earlier_than_candidate_uses_remaining_age(monkeypatch):
+    now = timezone.now()
+    first_failure_at = now - timedelta(seconds=95)  # remaining age: 5 s
+    policy = SyncRetryPolicy(base_delay=20.0, max_delay=3600.0, max_attempts=10, max_retry_age=100.0)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)  # candidate 20 s
+
+    updated = record_delivery_failure(row, failure, policy=policy, now=now)
+
+    assert updated.state == OUTBOX_PENDING
+    assert updated.next_attempt_at == now + timedelta(seconds=5)
+    assert updated.next_attempt_at == first_failure_at + timedelta(seconds=policy.max_retry_age)
+
+
+def test_r2_final_clamped_due_time_itself_unrepresentable_fails_closed_after_counting(
+    monkeypatch,
+):
+    # Valid configuration/state: remaining age 10 s, candidate 5 s -> the
+    # FINAL compliant due time is now + 5 s, which is past datetime.max.
+    now = _NEAR_DATETIME_MAX
+    first_failure_at = now - timedelta(seconds=90)
+    row = _make_outbox(attempts=1, first_failure_at=first_failure_at)
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE, http_status=503)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)
+
+    updated = record_delivery_failure(row, failure, policy=_POLICY, now=now)
+
+    assert updated.attempts == 2
+    assert updated.state == OUTBOX_DEAD_LETTER
+    assert updated.first_failure_at == first_failure_at
+    assert updated.last_failure_category == "TRANSIENT_FAILURE"
+    assert updated.last_http_status == 503
+    assert updated.claim_token is None
+    assert updated.claimed_at is None
+    assert updated.lease_until is None
+
+
+def test_r2_never_schedules_past_the_age_boundary_and_never_negative(monkeypatch):
+    now = timezone.now()
+    policy = SyncRetryPolicy(base_delay=1000.0, max_delay=3600.0, max_attempts=100, max_retry_age=100.0)
+    row = _make_outbox(attempts=1, first_failure_at=now - timedelta(seconds=99.5))
+    failure = DeliveryFailure(category=SyncOutcome.TRANSIENT_FAILURE)
+    monkeypatch.setattr("linuxlab.sync.outbox.random.random", lambda: 1.0)
+
+    updated = record_delivery_failure(row, failure, policy=policy, now=now)
+
+    assert updated.state == OUTBOX_PENDING
+    assert now <= updated.next_attempt_at <= row.first_failure_at + timedelta(seconds=100)
+    assert updated.next_attempt_at == now + timedelta(milliseconds=500)

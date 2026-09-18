@@ -4,10 +4,13 @@ only for confirmed event IDs. Owns no business mutation and no Central
 projection.
 """
 
+import threading
+import time
 import uuid
 from datetime import timedelta
 
 import pytest
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
 from linuxlab.sync.contracts import (
@@ -26,6 +29,7 @@ from linuxlab.sync.contracts import (
 from linuxlab.sync.models import (
     OUTBOX_DEAD_LETTER,
     OUTBOX_DELIVERED,
+    OUTBOX_IN_FLIGHT,
     OUTBOX_PENDING,
     OutboxMessage,
     _insert_immutable_row,
@@ -843,3 +847,137 @@ def test_public_flush_outbox_preflights_worker_configuration_before_any_write(
     assert after["claim_token"] is None
     assert "CONFIG_SENTINEL_VALUE" not in str(caught.value)
     assert "the-secret" not in str(caught.value)
+
+
+# --- Corrective B Task 8 Fix Round 2 (R1): the pre-send retry-budget clock
+# is sampled only AFTER the authoritative rows are acquired under the
+# pre-send validation lock -- a real separate-connection PostgreSQL
+# lock-wait, not a sleep-only proof.
+
+
+class _OwnConnectionThread(threading.Thread):
+    def __init__(self, action, results, key):
+        super().__init__()
+        self.action = action
+        self.results = results
+        self.key = key
+
+    def run(self):
+        close_old_connections()
+        try:
+            self.results[self.key] = self.action()
+        except Exception as exc:  # noqa: BLE001 - captured across threads for assertion
+            self.results[self.key] = exc
+        finally:
+            connection.close()
+
+
+def _wait_until_a_backend_is_blocked_on_a_row_lock(timeout=10.0):
+    """Deterministic PostgreSQL blocking observation: poll pg_stat_activity
+    until some backend in this database is reported blocked by another
+    pid (pg_blocking_pids). Returns True only once that state is actually
+    observed -- the test never relies on elapsed time alone."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() "
+                "AND cardinality(pg_blocking_pids(pid)) > 0"
+            )
+            (blocked,) = cursor.fetchone()
+        if blocked:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _run_presend_lock_wait_scenario(monkeypatch, *, age_after_lock_seconds):
+    """IN_FLIGHT row at age 99 s (max_retry_age 100 s). Connection A holds
+    the row lock; the sender enters the REAL shared pre-send validation
+    path (`_send_claimed_rows`, production clock: no injected `now`) and
+    is observed blocked on the row lock; the controlled production clock
+    is then moved to `age_after_lock_seconds` and A releases."""
+    from linuxlab.sync import outbox as outbox_module
+    from linuxlab.sync.configuration import SyncRetryPolicy
+
+    policy = SyncRetryPolicy(base_delay=5.0, max_delay=3600.0, max_attempts=10, max_retry_age=100.0)
+    t0 = timezone.now()
+    clock = _advancing_clock(monkeypatch, t0)
+    first_failure_at = t0 - timedelta(seconds=99)
+    row = _make_outbox(
+        state=OUTBOX_IN_FLIGHT,
+        attempts=1,
+        first_failure_at=first_failure_at,
+        claimed_at=t0,
+        lease_until=t0 + timedelta(minutes=5),
+        claim_token=uuid.uuid4(),
+    )
+    transport = _ScriptedTransport(
+        result=BatchAck(results=(EventAck(event_id=row.event_id, status=ACCEPTED),))
+    )
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    results = {}
+
+    def _hold_row_lock():
+        with transaction.atomic():
+            OutboxMessage.objects.select_for_update().get(pk=row.pk)
+            lock_held.set()
+            assert release_lock.wait(timeout=30)
+        return "released"
+
+    def _sender():
+        return outbox_module._send_claimed_rows(transport, [row], policy=policy)
+
+    holder = _OwnConnectionThread(_hold_row_lock, results, "holder")
+    holder.start()
+    assert lock_held.wait(timeout=10)
+
+    sender = _OwnConnectionThread(_sender, results, "sender")
+    sender.start()
+    assert _wait_until_a_backend_is_blocked_on_a_row_lock()
+    # Blocked on the DB row lock: nothing has been sent and nothing resolved.
+    assert "sender" not in results
+    assert transport.calls == []
+
+    clock["now"] = first_failure_at + timedelta(seconds=age_after_lock_seconds)
+    release_lock.set()
+    holder.join(timeout=30)
+    sender.join(timeout=30)
+    assert results["holder"] == "released"
+    assert not isinstance(results["sender"], Exception), results["sender"]
+    return row, transport, results["sender"], first_failure_at
+
+
+@pytest.mark.django_db(transaction=True)
+def test_presend_clock_sampled_after_lock_blocks_send_at_exact_age_expiry(monkeypatch):
+    row, transport, summary, first_failure_at = _run_presend_lock_wait_scenario(
+        monkeypatch, age_after_lock_seconds=100
+    )
+
+    assert transport.calls == []
+    assert summary.claimed == 1
+    assert summary.dead_lettered == 1
+    assert summary.delivered == 0
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert refreshed.state == OUTBOX_DEAD_LETTER
+    assert refreshed.attempts == 1
+    assert refreshed.first_failure_at == first_failure_at
+    assert refreshed.last_failure_category == ""
+    assert refreshed.claim_token is None
+    assert refreshed.claimed_at is None
+    assert refreshed.lease_until is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_presend_clock_sampled_after_lock_still_sends_at_age_99(monkeypatch):
+    row, transport, summary, _ = _run_presend_lock_wait_scenario(
+        monkeypatch, age_after_lock_seconds=99
+    )
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0][0].event_id == row.event_id
+    assert summary.delivered == 1
+    assert summary.dead_lettered == 0
+    assert OutboxMessage.objects.get(pk=row.pk).state == OUTBOX_DELIVERED
