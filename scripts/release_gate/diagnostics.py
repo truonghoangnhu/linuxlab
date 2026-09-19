@@ -41,10 +41,17 @@ diagnostics. Both processes inherit the actual deployment database; the
 
 Bounds: child timeout 60 s, supervisor timeout 120 s, stdout and stderr
 each capped at 65536 bytes (overflow of either fails closed and stops the
-process), concurrent draining so a pipe can never deadlock, and the
-supervisor runs in its own process group that is killed and reaped on
-timeout/overflow so an inner child cannot outlive it. No policy is
-parsed from the environment here -- only the canonical validator decides.
+process), concurrent draining so a pipe can never deadlock. Process-tree
+containment (T13-I1): EVERY process this module launches -- the
+supervisor from the harness, and the diagnostic command child from the
+supervisor -- runs in its own session/process group, so a forced
+termination on timeout/overflow kills that whole owned tree (child plus
+any descendants it spawned) with killpg, escalating SIGTERM -> grace ->
+SIGKILL, and reaps the direct child before a fixed safe failure is
+returned. The supervisor also handles SIGTERM from the harness by
+killing its own active child group first, so a harness-side timeout can
+never orphan an inner diagnostic tree either. No policy is parsed from
+the environment here -- only the canonical validator decides.
 """
 
 import argparse
@@ -74,7 +81,14 @@ CHILD_TIMEOUT_SECONDS = 60
 SUPERVISOR_TIMEOUT_SECONDS = 120
 OUTPUT_LIMIT_BYTES = 65536
 _READ_CHUNK_BYTES = 8192
+_TERMINATION_GRACE_SECONDS = 5
 _PROFILES = ("central", "node")
+
+# Process groups of children this process launched and has not yet
+# reaped (T13-I1): consulted by the SIGTERM handler installed in the
+# target so a termination request from the harness kills the active
+# diagnostic tree before this process itself exits.
+_ACTIVE_CHILD_GROUPS: set[int] = set()
 
 # Fixed safe messages -- the ONLY text this module ever attaches to an
 # error or writes to stderr.
@@ -121,25 +135,48 @@ def _drain(stream, sink: list, overflow: threading.Event) -> None:
             pass
 
 
-def _kill(process: subprocess.Popen, *, group: bool) -> None:
+def _signal_group(pgid: int, signum: int) -> None:
     try:
-        if group:
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        os.killpg(pgid, signum)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+def _kill_tree(process: subprocess.Popen) -> None:
+    """Terminate the whole process group `process` leads (it was started
+    with start_new_session=True, so the group holds the child and every
+    descendant that did not itself leave the group): SIGTERM first, a
+    bounded grace period, then SIGKILL; the direct child is reaped."""
+    _signal_group(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(process.pid, signal.SIGKILL)
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
 
 
-def _run_command(argv, *, env, stdin_text, timeout_seconds, new_process_group=False) -> CommandOutcome:
+def _terminate_active_children(signum, frame) -> None:
+    """SIGTERM handler for the target process: the harness asked this
+    supervisor to stop (its own timeout escalation), so kill every child
+    group we own before exiting with a fixed failure -- never let the
+    inner diagnostic tree outlive us."""
+    del signum, frame
+    for pgid in list(_ACTIVE_CHILD_GROUPS):
+        _signal_group(pgid, signal.SIGKILL)
+    os._exit(1)
+
+
+def _run_command(argv, *, env, stdin_text, timeout_seconds, new_process_group=True) -> CommandOutcome:
     """Run one argv (never a shell string) with bounded, concurrently
-    drained stdout/stderr and a hard timeout. On timeout or output
-    overflow the process (or its whole process group) is killed and
-    reaped before returning; the partial output is discarded."""
+    drained stdout/stderr and a hard timeout. The child always leads its
+    own session/process group (T13-I1), so on timeout or output overflow
+    its WHOLE owned tree is killed (SIGTERM, grace, SIGKILL) and the direct
+    child reaped before returning; the partial output is discarded."""
+    del new_process_group  # every child owns its tree; kept for call-site compatibility
     try:
         process = subprocess.Popen(  # an argv list, never a shell string
             list(argv),
@@ -148,10 +185,11 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, new_process_group=Fa
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=new_process_group,
+            start_new_session=True,
         )
     except (OSError, ValueError):
         raise ReleaseDiagnosticsError(_MSG_LAUNCH) from None
+    _ACTIVE_CHILD_GROUPS.add(process.pid)
 
     out_chunks: list = []
     err_chunks: list = []
@@ -173,21 +211,26 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, new_process_group=Fa
     # than only once the timeout elapses.
     timed_out = False
     deadline = time.monotonic() + timeout_seconds
-    while process.poll() is None and not overflow.is_set():
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(0.05)
-    if timed_out or overflow.is_set():
-        _kill(process, group=new_process_group)
-    for reader in readers:
-        reader.join(timeout=10)
-    if overflow.is_set():
-        _kill(process, group=new_process_group)  # reap even if it exited on its own
-        return CommandOutcome(returncode=process.returncode, stdout=b"", stderr=b"", overflow=True)
-    if timed_out:
-        return CommandOutcome(returncode=process.returncode, stdout=b"", stderr=b"", timed_out=True)
-    return CommandOutcome(returncode=process.returncode, stdout=b"".join(out_chunks), stderr=b"".join(err_chunks))
+    try:
+        while process.poll() is None and not overflow.is_set():
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.05)
+        if timed_out or overflow.is_set():
+            _kill_tree(process)
+        for reader in readers:
+            reader.join(timeout=10)
+        if overflow.is_set():
+            _kill_tree(process)  # the tree is gone and the child reaped even if it exited on its own
+            return CommandOutcome(returncode=process.returncode, stdout=b"", stderr=b"", overflow=True)
+        if timed_out:
+            return CommandOutcome(returncode=process.returncode, stdout=b"", stderr=b"", timed_out=True)
+        return CommandOutcome(
+            returncode=process.returncode, stdout=b"".join(out_chunks), stderr=b"".join(err_chunks)
+        )
+    finally:
+        _ACTIVE_CHILD_GROUPS.discard(process.pid)
 
 
 def _validate_fixture_paths(expected_profile, fixture_key_paths):
@@ -289,6 +332,9 @@ def target_release_diagnostics(expected_profile, *, fixture_key_paths=None) -> i
         import django
 
         django.setup()
+        # T13-I1: a harness-side termination must take our active child
+        # tree down with us, never orphan it.
+        signal.signal(signal.SIGTERM, _terminate_active_children)
         from linuxlab.core.diagnostics import build_diagnostic_context, diagnostic_providers
 
         context = build_diagnostic_context("release")

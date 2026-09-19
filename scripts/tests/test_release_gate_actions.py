@@ -428,3 +428,79 @@ def test_revoke_and_find_adapters_reject_malformed_identifiers_before_the_servic
     with pytest.raises((ValueError, TypeError)):
         actions_module.find_node_registration(bad)
     assert calls == []
+
+
+# --- Corrective (T13-I2): a malformed selector never leaks into any CLI
+# output; it fails with the fixed safe error before the service is called --
+
+MALFORMED_SELECTORS = [
+    "z" * 32,  # reviewer reproduction: 32 non-hex characters
+    "not-a-uuid",
+    "$(id)",
+    "'; DROP TABLE sync_noderegistration; --",
+    "../../etc/passwd",
+    "Q" * 300,
+]
+
+
+def _run_cli(capsys, monkeypatch, *argv):
+    from scripts.release_gate import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_setup_django", lambda: None)  # pytest-django already configured
+    code = cli_module.main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+@pytest.mark.parametrize("selector", MALFORMED_SELECTORS)
+@pytest.mark.parametrize("action", ["revoke-node-credential", "find-node-registration"])
+def test_cli_malformed_selector_never_leaks_and_never_reaches_the_service(
+    settings, monkeypatch, capsys, selector, action
+):
+    _issue(settings)
+    calls = []
+    monkeypatch.setattr(actions_module, "_revoke_node_registration", lambda node_id: calls.append(node_id))
+    monkeypatch.setattr(actions_module, "get_active_node_registration", lambda node_id: calls.append(node_id))
+
+    code, out, err = _run_cli(capsys, monkeypatch, action, "--node-id", selector)
+
+    assert code == 1
+    assert calls == []
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert set(payload) == {"error"}
+    assert payload["error"] == "ValueError: invalid node identifier"
+    for channel in (out, err, json.dumps(payload)):
+        assert selector not in channel
+        assert selector[:8] not in channel
+        assert "Traceback" not in channel
+        assert "hexadecimal" not in channel and "invalid literal" not in channel
+
+
+def test_cli_valid_uuid_revokes_and_refuses_authentication_afterwards(settings, monkeypatch, capsys):
+    from linuxlab.sync.authentication import NodeAuthenticationError, authenticate_node
+    from linuxlab.sync.models import NodeRegistration
+
+    credential = _issue(settings)
+    code, out, _err = _run_cli(capsys, monkeypatch, "revoke-node-credential", "--node-id", str(credential.node_id))
+    assert code == 0
+    assert json.loads(out.strip().splitlines()[-1]) == {"revoked": True, "node_id": str(credential.node_id)}
+    assert NodeRegistration.objects.get(node_id=credential.node_id).state == "revoked"
+    with pytest.raises(NodeAuthenticationError):
+        authenticate_node(credential.node_id, credential.secret)
+    assert credential.secret not in out
+
+
+def test_cli_unknown_and_already_revoked_valid_uuids_fail_safely(settings, monkeypatch, capsys):
+    credential = _issue(settings)
+    unknown = str(uuid.uuid4())
+    code, out, _ = _run_cli(capsys, monkeypatch, "revoke-node-credential", "--node-id", unknown)
+    assert code == 1
+    assert json.loads(out.strip().splitlines()[-1])["error"].startswith("NodeRegistrationError")
+
+    assert _run_cli(capsys, monkeypatch, "revoke-node-credential", "--node-id", str(credential.node_id))[0] == 0
+    code, out, _ = _run_cli(capsys, monkeypatch, "revoke-node-credential", "--node-id", str(credential.node_id))
+    assert code == 1
+    assert json.loads(out.strip().splitlines()[-1])["error"].startswith("NodeRegistrationError")
+    code, out, _ = _run_cli(capsys, monkeypatch, "find-node-registration", "--node-id", str(credential.node_id))
+    assert code == 0
+    assert json.loads(out.strip().splitlines()[-1]) == {"found": False}

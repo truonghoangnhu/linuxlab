@@ -215,18 +215,26 @@ def find_publication_snapshot(source_public_id, package_version):
     ).first()
 
 
+_INVALID_NODE_ID = "invalid node identifier"
+
+
 def _node_uuid(node_id):
     """Canonical registration selector at this adapter boundary
     (Corrective B Task 13): the Task-5 services accept ONLY a
     uuid.UUID, so a textual selector from cli.py argv is converted and
-    validated HERE, before any service call. A malformed value raises
-    ValueError (uuid.UUID's own, which never echoes the value) or
-    TypeError; nothing is ever inferred from message text."""
+    validated HERE, before any service call. A malformed value fails
+    with the FIXED safe message only (T13-I2): the parser's own
+    exception text can echo the attacker/operator-controlled selector
+    (e.g. `int(text, 16)` for a 32-character non-hex string), so it is
+    never propagated. Nothing is ever inferred from message text."""
     if isinstance(node_id, uuid.UUID):
         return node_id
     if isinstance(node_id, str):
-        return uuid.UUID(node_id)
-    raise TypeError("node_id must be a UUID or its canonical text form")
+        try:
+            return uuid.UUID(node_id)
+        except ValueError:
+            raise ValueError(_INVALID_NODE_ID) from None
+    raise TypeError(_INVALID_NODE_ID)
 
 
 def find_node_registration(node_id):

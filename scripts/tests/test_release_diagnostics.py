@@ -422,3 +422,113 @@ def test_production_code_never_imports_the_release_harness():
         if "from scripts" in text or "import scripts" in text:
             offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == []
+
+
+# --- Corrective (T13-I1): the whole process tree owned by the inner
+# diagnostic execution must be gone when the bridge returns failure -------
+
+# A supervisor stand-in that runs the REAL target (real django.setup, real
+# _run_command with its real timeout/overflow/kill logic) but points the
+# inner diagnostic child at a script that spawns a sleeping DESCENDANT,
+# records its PID, and then misbehaves (sleeps past the timeout, or floods
+# stdout). Only the child argv and the inner timeout are replaced.
+_DESCENDANT_TARGET_SCRIPT = """
+import json, os, sys
+from scripts.release_gate import diagnostics
+mode, pid_dir = sys.argv[1], sys.argv[2]
+child_script = '''
+import os, subprocess, sys, time
+pid_dir, mode = sys.argv[1], sys.argv[2]
+descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+open(os.path.join(pid_dir, "descendant.pid"), "w").write(str(descendant.pid))
+open(os.path.join(pid_dir, "child.pid"), "w").write(str(os.getpid()))
+if mode == "overflow":
+    sys.stdout.write("x" * 70000)
+    sys.stdout.flush()
+elif mode == "stderr-overflow":
+    sys.stderr.write("y" * 70000)
+    sys.stderr.flush()
+elif mode == "nonzero":
+    descendant.kill(); descendant.wait()
+    sys.exit(3)
+time.sleep(600)
+'''
+diagnostics._child_invocation = lambda paths: ([sys.executable, "-c", child_script, pid_dir, mode], "")
+diagnostics.CHILD_TIMEOUT_SECONDS = 2
+sys.exit(diagnostics.main(sys.argv[3:]))
+"""
+
+
+def _descendant_supervisor(monkeypatch, mode, pid_dir):
+    from scripts.release_gate import diagnostics
+
+    monkeypatch.setattr(
+        diagnostics,
+        "_supervisor_command",
+        lambda: [sys.executable, "-c", _DESCENDANT_TARGET_SCRIPT, mode, str(pid_dir)],
+    )
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # Our own killed-but-unreaped child answers kill(0); reap it if it is ours.
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return False
+    except ChildProcessError:
+        pass
+    return True
+
+
+def _pid(pid_dir, name, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    path = pid_dir / name
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.05)
+    raise AssertionError(f"{name} never written")
+
+
+@pytest.mark.parametrize("mode", ["timeout", "overflow", "stderr-overflow"])
+def test_inner_failure_kills_every_owned_descendant(node_target, monkeypatch, tmp_path, mode):
+    from scripts.release_gate.diagnostics import run_release_diagnostics
+
+    _descendant_supervisor(monkeypatch, mode, tmp_path)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert str(caught.value) == "release diagnostics target process failed"
+    assert "xxx" not in str(caught.value) and "yyy" not in str(caught.value)
+    assert time.monotonic() - started < 60  # the inner 2 s timeout/overflow path, not the supervisor's
+    descendant_pid = _pid(tmp_path, "descendant.pid")
+    child_pid = _pid(tmp_path, "child.pid")
+    assert _wait_gone(child_pid)
+    assert _wait_gone(descendant_pid, timeout=5.0), f"descendant {descendant_pid} survived the {mode} failure"
+
+
+def test_ordinary_nonzero_child_exit_leaves_no_stray_descendant(node_target, monkeypatch, tmp_path):
+    from scripts.release_gate.diagnostics import run_release_diagnostics
+
+    _descendant_supervisor(monkeypatch, "nonzero", tmp_path)
+    with pytest.raises(ReleaseDiagnosticsError):
+        run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    assert _wait_gone(_pid(tmp_path, "descendant.pid"), timeout=5.0)
+
+
+def test_successful_real_command_is_not_killed_prematurely(node_target):
+    """The real chain with the real command: no false timeout/overflow
+    kill, canonical WARN report still returned (Task-13 D)."""
+    from scripts.release_gate.diagnostics import run_release_diagnostics
+
+    report = run_release_diagnostics(
+        node_target.env, expected_profile="node", repo_root=REPO_ROOT,
+        fixture_key_paths=(None, node_target.trust_path),
+    )
+    assert report.overall_status == "WARN"
