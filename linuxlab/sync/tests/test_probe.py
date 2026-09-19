@@ -809,6 +809,49 @@ class _IncompleteContentLengthHandler(_BaseHandler):
         self.close_connection = True
 
 
+class _LongDecimalContentLengthHandler(_BaseHandler):
+    """T11-I3 reviewer reproduction: HTTP 200 whose Content-Length is an
+    attacker-controlled decimal string far longer than Python's integer
+    string-conversion limit (sys.get_int_max_str_digits(), 4300 here)."""
+
+    content_length = "9" * 5000
+
+    def do_GET(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", self.content_length)
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+        self.wfile.flush()
+        self.close_connection = True
+
+
+class _NinesContentLengthHandler(_LongDecimalContentLengthHandler):
+    content_length = "9" * 5000
+
+
+class _ZeroPaddedContentLengthHandler(_LongDecimalContentLengthHandler):
+    content_length = "0" * 5000 + "15"
+
+
+@pytest.mark.parametrize("handler", [_NinesContentLengthHandler, _ZeroPaddedContentLengthHandler])
+def test_oversized_decimal_content_length_is_reachable_not_accepted(handler, caplog):
+    port, requests, cleanup = _serve(handler)
+    try:
+        credentials = _credentials(f"http://127.0.0.1:{port}", allow_insecure_http=True)
+
+        result = probe_central(credentials)  # production opener, real socket
+
+        assert [(m, path) for m, path, _h in requests] == [("GET", "/api/v1/sync/probe/")]
+        assert result == CentralProbeResult(
+            reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+        )
+        assert TOKEN_SENTINEL not in _rendered(result, caplog.text)
+    finally:
+        cleanup()
+
+
 class _CompleteContentLengthHandler(_BaseHandler):
     def do_GET(self):
         self._record()
@@ -846,11 +889,17 @@ def test_complete_content_length_200_is_still_accepted():
         cleanup()
 
 
+_PADDED_4096 = b'{"status": "ok"' + b" " * (4096 - len(b'{"status": "ok"}')) + b"}"
+
+
 @pytest.mark.parametrize(
     "headers,body",
     [
         ([], b'{"status": "ok"}'),  # no Content-Length: close-delimited framing
         ([("Content-Length", "16")], b'{"status": "ok"}'),  # exact match
+        ([("Content-Length", "15")], b'{"status":"ok"}'),  # exact match, compact
+        ([("Content-Length", " 16 ")], b'{"status": "ok"}'),  # surrounding whitespace tolerated
+        ([("Content-Length", "4096")], _PADDED_4096),  # exact body limit
     ],
 )
 def test_framing_that_is_complete_or_close_delimited_is_accepted(headers, body):
@@ -872,6 +921,16 @@ def test_framing_that_is_complete_or_close_delimited_is_accepted(headers, body):
         ([("Content-Length", "16"), ("Content-Length", "100")], b'{"status": "ok"}'),  # conflict
         ([("Content-Length", "16"), ("Transfer-Encoding", "chunked")], b'{"status": "ok"}'),
         ([("Content-Length", "15")], b'{"status": "ok"}'),  # declared < received
+        ([("Content-Length", "0")], b""),  # empty semantic body
+        ([("Content-Length", "4097")], b"x" * 4097),  # one past the body limit
+        ([("Content-Length", "99999")], b'{"status": "ok"}'),  # ordinary large decimal
+        ([("Content-Length", "9" * 5000)], b'{"status": "ok"}'),  # beyond int str limit
+        ([("Content-Length", "0" * 5000 + "16")], b'{"status": "ok"}'),  # zero-padded
+        ([("Content-Length", "+16")], b'{"status": "ok"}'),  # signed
+        ([("Content-Length", "-16")], b'{"status": "ok"}'),  # negative
+        ([("Content-Length", "1\t6")], b'{"status": "ok"}'),  # embedded whitespace
+        ([("Content-Length", "١٦")], b'{"status": "ok"}'),  # non-ASCII decimal digits
+        ([("Content-Length", "")], b'{"status": "ok"}'),  # empty header value
     ],
 )
 def test_untrustworthy_or_incomplete_framing_is_reachable_not_accepted(headers, body):
@@ -886,7 +945,13 @@ def test_untrustworthy_or_incomplete_framing_is_reachable_not_accepted(headers, 
 
 
 @pytest.mark.parametrize(
-    "handler", [_IncompleteChunkedHandler, _IncompleteContentLengthHandler]
+    "handler",
+    [
+        _IncompleteChunkedHandler,
+        _IncompleteContentLengthHandler,
+        _NinesContentLengthHandler,
+        _ZeroPaddedContentLengthHandler,
+    ],
 )
 def test_incomplete_200_does_not_collapse_local_checks_to_provider_failed(
     settings, monkeypatch, tmp_path, handler

@@ -41,6 +41,7 @@ from .transports import _TRANSPORT_OPENER
 _PROBE_PATH = "/api/v1/sync/probe/"
 _PROBE_TIMEOUT_SECONDS = 30
 _MAX_PROBE_BODY_BYTES = 4096
+_MAX_CONTENT_LENGTH_DIGITS = len(str(_MAX_PROBE_BODY_BYTES))  # 4
 _SUCCESS_BODY = {"status": "ok"}
 
 PROBE_UNREACHABLE = "PROBE_UNREACHABLE"
@@ -100,8 +101,18 @@ def _declared_content_length(response):
         return True, None
     if len(values) != 1 or headers.get_all("Transfer-Encoding"):
         return False, None
+    # T11-I3: the header value is attacker-controlled remote input, and
+    # int() on a long decimal string raises ValueError under Python's
+    # integer string-conversion limit (sys.get_int_max_str_digits(), 4300
+    # here) -- so bound the LENGTH first. The largest acceptable value,
+    # 4096, has four digits: any longer digit string (including a
+    # zero-padded one) cannot be accepted and is rejected without ever
+    # asking int() to parse it. Only a 1-4 character ASCII-decimal string
+    # is converted, which is total and bounded.
     text = values[0].strip()
-    if not text or not text.isascii() or not text.isdecimal():
+    if not 1 <= len(text) <= _MAX_CONTENT_LENGTH_DIGITS:
+        return False, None
+    if not text.isascii() or not text.isdecimal():
         return False, None
     declared = int(text)
     if declared > _MAX_PROBE_BODY_BYTES:
