@@ -185,6 +185,11 @@ def load_node_credentials(*, settings_obj=None) -> NodeCredentials:
             or parsed.username is not None
             or parsed.password is not None
             or "#" in url
+            # Corrective B Task 11 (T11-C1): a Central BASE URL carries no
+            # query string -- endpoint paths are appended to it, and a
+            # query would let an appended path be swallowed into the query.
+            or "?" in url
+            or parsed.query
             or (parsed.scheme == "http" and not allow_http)
         ):
             raise ValueError

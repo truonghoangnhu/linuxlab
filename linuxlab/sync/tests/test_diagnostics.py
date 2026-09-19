@@ -725,6 +725,7 @@ def test_remote_malformed_success_is_connectivity_pass_auth_fail(settings, trust
         ("LINUXLAB_CENTRAL_URL", None),
         ("LINUXLAB_CENTRAL_URL", CONFIG_SENTINEL),
         ("LINUXLAB_CENTRAL_URL", "http://central.example.org"),
+        ("LINUXLAB_CENTRAL_URL", "https://central.example.org/health/?deployment=lab"),
         ("LINUXLAB_CAN_RUN_SYNC_WORKER", False),
     ],
 )

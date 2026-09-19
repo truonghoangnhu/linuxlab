@@ -17,6 +17,7 @@ one rejected event never affects any other event in the same batch.
 import json
 import uuid
 from datetime import datetime
+from typing import ClassVar
 
 from django.http import JsonResponse
 from django.utils.decorators import method_decorator
@@ -174,7 +175,11 @@ class SyncProbeView(View):
     session state, no password-hash upgrade, no audit record. Every
     credential failure is the same generic 401 as ingestion; the
     unrelated profile/capability-disabled 403 stays exactly as it is.
-    GET only -- Django's View answers every other method with 405."""
+    Strictly GET only (T11-M1): HEAD and OPTIONS are NOT routed through
+    get() or auto-answered -- every other method is 405 before any
+    authentication work."""
+
+    http_method_names: ClassVar[list[str]] = ["get"]
 
     def get(self, request):
         if not can_receive_sync_events():

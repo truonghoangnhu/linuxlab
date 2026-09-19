@@ -5,19 +5,25 @@ reuses ingestion's header parsing and Task-5 authenticate_node authority,
 performs zero persistent mutation, and answers exactly {"status": "ok"}.
 """
 
+import http.client
+import http.server
 import json
 import socket
 import ssl
+import threading
 import urllib.error
 import urllib.request
 import uuid
 from contextlib import ExitStack
 from email.message import Message
+from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
 from django.contrib.sessions.models import Session
 
+from linuxlab.core.diagnostics import DiagnosticContext, diagnose_deployment
 from linuxlab.core.models import DomainEvent
 from linuxlab.sync.authentication import (
     NodeRegistrationInvariantError,
@@ -25,7 +31,12 @@ from linuxlab.sync.authentication import (
     revoke_node_registration,
     rotate_node_credential,
 )
-from linuxlab.sync.configuration import NodeCredentials
+from linuxlab.sync.configuration import (
+    NodeCredentials,
+    SyncConfigurationError,
+    load_node_credentials,
+)
+from linuxlab.sync.diagnostics import SyncDiagnosticProvider
 from linuxlab.sync.models import (
     REGISTRATION_SUPERSEDED,
     InboxMessage,
@@ -34,6 +45,7 @@ from linuxlab.sync.models import (
     _insert_immutable_row,
 )
 from linuxlab.sync.probe import CentralProbeResult, probe_central
+from linuxlab.sync.transports import _TRANSPORT_OPENER
 
 pytestmark = pytest.mark.django_db
 
@@ -557,3 +569,276 @@ def test_central_probe_result_is_frozen_and_safe():
         "http_status": 200,
         "error_code": "",
     }
+
+
+# --- Task-11 corrective patch: T11-C1 / T11-I1 / T11-M1 ----------------------
+
+
+_OK_BODY = b'{"status": "ok"}'
+
+
+class _QuietServer(http.server.HTTPServer):
+    def handle_error(self, request, client_address):
+        pass
+
+
+def _serve(handler_class):
+    """Start a loopback HTTP server; returns (port, requests, cleanup)."""
+    requests = []
+    handler_class.requests = requests
+    server = _QuietServer(("127.0.0.1", 0), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def cleanup():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    return server.server_address[1], requests, cleanup
+
+
+class _BaseHandler(http.server.BaseHTTPRequestHandler):
+    requests: ClassVar[list] = []
+
+    def log_message(self, format_, *args):
+        del format_, args
+
+    def _record(self):
+        self.requests.append((self.command, self.path, dict(self.headers.items())))
+
+
+# T11-C1 -----------------------------------------------------------------------
+
+
+class _HealthLeakHandler(_BaseHandler):
+    """Answers the unrelated /health/ path (any query) with the probe's
+    success object WITHOUT authentication, and everything else with the
+    generic 401 -- so a misbuilt probe URL that lands on /health/ would
+    falsely "prove" acceptance."""
+
+    def do_GET(self):
+        self._record()
+        if self.path.split("?", 1)[0] == "/health/":
+            body = _OK_BODY
+            self.send_response(200)
+        else:
+            body = b'{"detail": "authentication failed"}'
+            self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_query_bearing_base_url_can_never_satisfy_auth_via_an_unrelated_path():
+    port, requests, cleanup = _serve(_HealthLeakHandler)
+    try:
+        credentials = _credentials(
+            f"http://127.0.0.1:{port}/health/?deployment=lab", allow_insecure_http=True
+        )
+
+        result = probe_central(credentials)
+
+        assert result.accepted is False
+        for _method, path, _headers in requests:
+            assert "?" not in path
+            assert path.endswith("/api/v1/sync/probe/")
+            assert path.split("?", 1)[0] != "/health/"
+    finally:
+        cleanup()
+
+
+def test_probe_url_is_built_as_a_path_component_never_after_a_query():
+    opener = _FakeOpener(response=_FakeResponse(status=401, body=b""))
+    credentials = _credentials("https://central.example.org/base/?x=1", allow_insecure_http=False)
+
+    result = probe_central(credentials, opener=opener)
+
+    assert result.accepted is False
+    for request, _timeout in opener.calls:
+        assert request.full_url == "https://central.example.org/base/api/v1/sync/probe/"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://central.example.org/?deployment=lab",
+        "https://central.example.org/health/?deployment=lab",
+        "https://central.example.org?x=1",
+    ],
+)
+def test_configuration_authority_rejects_query_bearing_central_url(url):
+    source = SimpleNamespace(
+        LINUXLAB_NODE_ID=str(uuid.uuid4()),
+        LINUXLAB_SYNC_SECRET="secret",
+        LINUXLAB_CENTRAL_URL=url,
+        LINUXLAB_SYNC_ALLOW_INSECURE_HTTP=False,
+    )
+    with pytest.raises(SyncConfigurationError) as caught:
+        load_node_credentials(settings_obj=source)
+    assert caught.value.setting_name == "LINUXLAB_CENTRAL_URL"
+    assert "deployment" not in str(caught.value)
+
+
+# T11-I1 -----------------------------------------------------------------------
+
+
+class _StalledBodyHandler(_BaseHandler):
+    """Valid HTTP 200 headers, then the body never arrives."""
+
+    release = threading.Event()
+
+    def do_GET(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "16")
+        self.end_headers()
+        self.wfile.flush()
+        self.release.wait(timeout=10)
+
+
+class _ShortSocketTimeoutOpener:
+    """Delegates to the production no-redirect opener but with a short
+    socket timeout so a stalled body surfaces in test time; records the
+    timeout probe_central actually requested (must be exactly 30)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def open(self, request, timeout=None):
+        self.calls.append(timeout)
+        return _TRANSPORT_OPENER.open(request, timeout=0.5)
+
+
+def test_http_200_headers_then_stalled_body_is_reachable_not_accepted():
+    port, requests, cleanup = _serve(_StalledBodyHandler)
+    try:
+        opener = _ShortSocketTimeoutOpener()
+        credentials = _credentials(f"http://127.0.0.1:{port}", allow_insecure_http=True)
+
+        result = probe_central(credentials, opener=opener)
+
+        assert opener.calls == [30]
+        assert len(requests) == 1  # no retry
+        assert result == CentralProbeResult(
+            reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+        )
+        assert TOKEN_SENTINEL not in _rendered(result)
+    finally:
+        _StalledBodyHandler.release.set()
+        cleanup()
+
+
+class _IncompleteChunkedHandler(_BaseHandler):
+    """HTTP 200 with Transfer-Encoding: chunked whose chunk framing claims
+    more bytes than are ever sent, then closes -- http.client raises
+    IncompleteRead while reading the body."""
+
+    def do_GET(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"40\r\n" + _OK_BODY)  # claims 64 bytes, sends 16, then EOF
+        self.wfile.flush()
+        self.close_connection = True
+
+
+def test_malformed_chunked_200_is_reachable_not_accepted_without_escaping():
+    port, requests, cleanup = _serve(_IncompleteChunkedHandler)
+    try:
+        credentials = _credentials(f"http://127.0.0.1:{port}", allow_insecure_http=True)
+
+        result = probe_central(credentials)  # production opener, real socket
+
+        assert len(requests) == 1
+        assert result == CentralProbeResult(
+            reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+        )
+    finally:
+        cleanup()
+
+
+@pytest.mark.parametrize(
+    "read_exception",
+    [
+        http.client.IncompleteRead(b"partial"),
+        TimeoutError("body stalled"),
+        ConnectionResetError("reset mid-body"),
+        ssl.SSLError("tls error mid-body"),
+    ],
+)
+def test_body_read_failures_after_headers_keep_reachability_and_status(read_exception):
+    class _FailingReadResponse(_FakeResponse):
+        def read(self, amount=None):
+            raise read_exception
+
+    opener = _FakeOpener(response=_FailingReadResponse(status=200))
+
+    result = probe_central(_credentials(), opener=opener)
+
+    assert result == CentralProbeResult(
+        reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+    )
+    assert len(opener.calls) == 1
+
+
+def test_malformed_chunked_200_does_not_collapse_local_checks_to_provider_failed(
+    settings, monkeypatch, tmp_path
+):
+    port, _requests, cleanup = _serve(_IncompleteChunkedHandler)
+    try:
+        settings.LINUXLAB_PROFILE = "node"
+        settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True
+        settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = False
+        settings.LINUXLAB_SYNC_ENABLED = True
+        settings.LINUXLAB_NODE_ID = str(uuid.uuid4())
+        settings.LINUXLAB_SYNC_SECRET = TOKEN_SENTINEL
+        settings.LINUXLAB_SYNC_ALLOW_INSECURE_HTTP = True
+        settings.LINUXLAB_CENTRAL_URL = f"http://127.0.0.1:{port}"
+        settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = False
+        context = DiagnosticContext(
+            "node", "remote", frozenset({"LINUXLAB_CAN_RUN_SYNC_WORKER"})
+        )
+
+        report = diagnose_deployment(context, providers=[SyncDiagnosticProvider()])
+
+        checks = {c.code: c for c in report.checks}
+        assert checks["NODE_REGISTRATION"].status == "WARN"
+        assert checks["SYNC_RETRY_POLICY"].status == "PASS"
+        assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+        assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+        assert checks["CENTRAL_AUTH_ACCEPTANCE"].details["error_code"] == "PROBE_RESPONSE_INVALID"
+        assert all(c.details.get("error_code") != "PROVIDER_FAILED" for c in report.checks)
+        assert TOKEN_SENTINEL not in repr(report)
+    finally:
+        cleanup()
+
+
+# T11-M1 -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["get", "head", "options", "post", "put", "patch", "delete"])
+def test_probe_endpoint_is_strictly_get_only(client, central, method):
+    credential = issue_node_registration("Probe Node")
+    before = _snapshot()
+    with patch("linuxlab.sync.api.authenticate_node", wraps=None) as auth:
+        auth.side_effect = AssertionError("must not authenticate")
+        if method == "get":
+            auth.side_effect = None
+            from linuxlab.sync.authentication import authenticate_node as real_auth
+
+            auth.side_effect = real_auth
+        response = getattr(client, method)(
+            PROBE_URL, **_probe_headers(credential.node_id, credential.secret)
+        )
+    if method == "get":
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+    else:
+        assert response.status_code == 405
+        auth.assert_not_called()
+    assert _snapshot() == before

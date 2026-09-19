@@ -20,15 +20,18 @@ Concrete evidence mapping:
     401/403                     -> reachable=True,  accepted=False, AUTH_REJECTED
     any other HTTP response     -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
     malformed/oversized 200     -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
+    headers ok, body stalled/
+      truncated/unreadable      -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
     DNS/TLS/timeout/network     -> reachable=False, accepted=False, PROBE_UNREACHABLE
     unusable credentials/URL    -> reachable=False, accepted=False, CONFIG_INVALID (no request)
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .configuration import NodeCredentials
 from .transports import _TRANSPORT_OPENER
@@ -88,12 +91,25 @@ def _usable_credentials(credentials) -> bool:
     return scheme == "http" and credentials.allow_insecure_http is True
 
 
+def _probe_url(central_url: str) -> str:
+    """The dedicated probe endpoint as a URL PATH component of the
+    configured Central base URL (T11-C1): scheme and host are kept, the
+    probe path is joined onto the base PATH, and no query/fragment is ever
+    carried -- so the request can never land on an unrelated path such as
+    /health/ with the probe path swallowed into a query string. (The
+    configuration authority already rejects a query-bearing base URL;
+    this is the structural construction, not a second rule.)"""
+    parts = urlsplit(central_url)
+    path = parts.path.rstrip("/") + _PROBE_PATH
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
 def probe_central(credentials: NodeCredentials, *, opener=None) -> CentralProbeResult:
     if not _usable_credentials(credentials):
         return CentralProbeResult(reachable=False, accepted=False, error_code=CONFIG_INVALID)
 
     request = urllib.request.Request(
-        credentials.central_url.rstrip("/") + _PROBE_PATH,
+        _probe_url(credentials.central_url),
         method="GET",
         headers={
             "Authorization": f"Bearer {credentials.secret}",
@@ -102,10 +118,11 @@ def probe_central(credentials: NodeCredentials, *, opener=None) -> CentralProbeR
     )
     active_opener = opener if opener is not None else _TRANSPORT_OPENER
 
+    # Boundary 1 (T11-I1): transport / open-response failure. Only here can
+    # Central be "unreachable" -- DNS, TLS, connection, timeout BEFORE any
+    # response headers arrive.
     try:
-        with active_opener.open(request, timeout=_PROBE_TIMEOUT_SECONDS) as response:
-            status = _safe_status(getattr(response, "status", None))
-            raw_body = response.read(_MAX_PROBE_BODY_BYTES + 1)
+        response = active_opener.open(request, timeout=_PROBE_TIMEOUT_SECONDS)
     except urllib.error.HTTPError as exc:
         # Reachable: Central answered. Only the status code crosses this
         # boundary -- never the response body, headers or str(exc).
@@ -118,6 +135,20 @@ def probe_central(credentials: NodeCredentials, *, opener=None) -> CentralProbeR
         # DNS/TLS/timeout/socket failure: fixed safe outcome, never str(exc)
         # (which can embed the host, URL or Authorization material).
         return CentralProbeResult(reachable=False, accepted=False, error_code=PROBE_UNREACHABLE)
+
+    # Boundary 2 (T11-I1): valid response headers were received, so HTTP
+    # reachability is established and the status is known. A stalled,
+    # truncated, malformed-framing or otherwise unreadable BODY can only
+    # mean "reachable but not accepted" -- never unreachable, never an
+    # escaping exception. Only the fixed classification crosses here.
+    status = _safe_status(getattr(response, "status", None))
+    try:
+        with response:
+            raw_body = response.read(_MAX_PROBE_BODY_BYTES + 1)
+    except (http.client.HTTPException, TimeoutError, OSError):
+        return CentralProbeResult(
+            reachable=True, accepted=False, http_status=status, error_code=PROBE_RESPONSE_INVALID
+        )
 
     if status != 200 or not isinstance(raw_body, bytes) or not _is_exact_success_body(raw_body):
         return CentralProbeResult(
