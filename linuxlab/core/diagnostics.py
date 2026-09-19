@@ -299,19 +299,113 @@ def diagnostic_providers() -> tuple[DiagnosticProvider, ...]:
     return providers
 
 
-def required_check_codes(
+def _provider_requirements(
     context: DiagnosticContext, providers: Sequence[DiagnosticProvider]
-) -> frozenset[str]:
-    _require(isinstance(context, DiagnosticContext))
-    _require(isinstance(providers, Sequence) and not isinstance(providers, (str, bytes)))
+) -> tuple[frozenset[str], ...]:
+    """Per-provider required codes, validated against each provider's
+    ownership -- the one place requirements are resolved, so orchestration
+    and the public union view can never disagree."""
     ownership = _provider_codes(providers)
-    required = set()
+    result = []
     try:
         for provider, owned in zip(providers, ownership):
             codes = provider.required_codes(context)
             _code_set(codes)
             _require(codes <= owned)
-            required.update(codes)
+            result.append(codes)
     except Exception:  # noqa: BLE001 — requirements are a module-owned failure boundary.
         raise DiagnosticContractError("Invalid diagnostic provider requirements.") from None
-    return frozenset(required)
+    return tuple(result)
+
+
+def _provider_sequence(providers: object) -> tuple[DiagnosticProvider, ...]:
+    _require(isinstance(providers, Sequence) and not isinstance(providers, (str, bytes)))
+    return tuple(providers)
+
+
+def required_check_codes(
+    context: DiagnosticContext, providers: Sequence[DiagnosticProvider]
+) -> frozenset[str]:
+    _require(isinstance(context, DiagnosticContext))
+    return frozenset().union(*_provider_requirements(context, _provider_sequence(providers)))
+
+
+# --- Task 10 orchestration -----------------------------------------------------
+
+_PRODUCTION_PROFILES = ("central", "node")
+
+# Fixed safe evidence for a provider that failed unexpectedly (raised, or
+# returned checks outside its ownership/requirements): its required codes
+# are emitted as FAIL with this metadata -- never the exception text.
+_PROVIDER_FAILED_MESSAGE = "Diagnostic provider failed to produce this check."
+_PROVIDER_FAILED_DETAILS = {"error_code": "PROVIDER_FAILED"}
+
+
+def build_diagnostic_context(mode: Mode, *, settings_obj=None) -> DiagnosticContext:
+    """Profile + the exact enabled LINUXLAB_CAN_* setting names, nothing
+    else: no sync secret parsing, key loading, DB or network access, and
+    no module-provider imports. Django settings are resolved lazily only
+    when no explicit settings object is supplied, so this contract module
+    still imports without Django. A nonproduction/unknown profile or a
+    non-boolean capability flag is rejected with the fixed contract error
+    (never echoing the rejected value) rather than coerced by truthiness.
+    """
+    _choice(mode, ("local", "remote", "release"))
+    if settings_obj is None:
+        from django.conf import settings as settings_obj
+    profile = getattr(settings_obj, "LINUXLAB_PROFILE", None)
+    _require(type(profile) is str and profile in _PRODUCTION_PROFILES)
+    enabled = set()
+    for name in sorted(_CAPABILITIES):
+        flag = getattr(settings_obj, name, False)
+        _require(type(flag) is bool)
+        if flag:
+            enabled.add(name)
+    return DiagnosticContext(profile, mode, frozenset(enabled))
+
+
+def _contained_provider_checks(
+    provider: DiagnosticProvider,
+    context: DiagnosticContext,
+    owned: frozenset[str],
+    required: frozenset[str],
+) -> tuple[DiagnosticCheck, ...]:
+    """Run one provider's checks; ANY unexpected failure (an exception, a
+    non-check result, an unowned or duplicated code, or an omitted
+    required code) is contained here as fixed PROVIDER_FAILED FAIL checks
+    for that provider's required codes, so no required code can disappear
+    and no raw exception text can reach a report."""
+    try:
+        produced = tuple(provider.checks(context))
+        _require(all(isinstance(check, DiagnosticCheck) for check in produced))
+        codes = {check.code for check in produced}
+        _require(len(codes) == len(produced))
+        _require(codes <= owned)
+        _require(required <= codes)
+    except Exception:  # noqa: BLE001 — orchestration owns unexpected-provider containment.
+        return tuple(
+            DiagnosticCheck(code, "FAIL", _PROVIDER_FAILED_MESSAGE, _PROVIDER_FAILED_DETAILS)
+            for code in sorted(required)
+        )
+    return produced
+
+
+def diagnose_deployment(
+    context: DiagnosticContext, *, providers: Sequence[DiagnosticProvider] | None = None
+) -> DiagnosticReport:
+    """Resolve provider factories exactly once (when `providers` is None),
+    compute required codes from that same provider snapshot, collect each
+    provider's checks under containment, aggregate through the canonical
+    aggregator, and validate report_to_dict(report) with the canonical
+    validator using the SAME context and required-code set."""
+    _require(isinstance(context, DiagnosticContext))
+    resolved = diagnostic_providers() if providers is None else _provider_sequence(providers)
+    ownership = _provider_codes(resolved)
+    requirements = _provider_requirements(context, resolved)
+    required = frozenset().union(*requirements)
+    collected = []
+    for provider, owned, provider_required in zip(resolved, ownership, requirements):
+        collected.extend(_contained_provider_checks(provider, context, owned, provider_required))
+    report = aggregate_diagnostics(context, collected)
+    validate_diagnostic_report(report_to_dict(report), context=context, required_codes=required)
+    return report
