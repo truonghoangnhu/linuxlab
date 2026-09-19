@@ -327,10 +327,18 @@ def _credentials(url="https://central.example.org", **overrides):
 
 
 class _FakeResponse:
-    def __init__(self, status=200, body=b'{"status": "ok"}'):
+    def __init__(self, status=200, body=b'{"status": "ok"}', headers=None):
         self.status = status
         self._body = body
         self.read_requests = []
+        # Realistic framing: an accurate Content-Length by default; pass an
+        # explicit list of (name, value) pairs to model malformed/duplicate
+        # headers, or [] for a close-delimited response with no framing.
+        self.headers = Message()
+        if headers is None:
+            headers = [("Content-Length", str(len(body)))]
+        for name, value in headers:
+            self.headers[name] = value
 
     def read(self, amount=None):
         self.read_requests.append(amount)
@@ -786,10 +794,104 @@ def test_body_read_failures_after_headers_keep_reachability_and_status(read_exce
     assert len(opener.calls) == 1
 
 
-def test_malformed_chunked_200_does_not_collapse_local_checks_to_provider_failed(
-    settings, monkeypatch, tmp_path
+class _IncompleteContentLengthHandler(_BaseHandler):
+    """T11-I2 reviewer reproduction: HTTP 200, Content-Length: 100, then
+    only the 15-byte semantically valid success object, then EOF."""
+
+    def do_GET(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+        self.wfile.flush()
+        self.close_connection = True
+
+
+class _CompleteContentLengthHandler(_BaseHandler):
+    def do_GET(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "15")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+
+
+def test_incomplete_content_length_200_is_reachable_not_accepted(caplog):
+    port, requests, cleanup = _serve(_IncompleteContentLengthHandler)
+    try:
+        credentials = _credentials(f"http://127.0.0.1:{port}", allow_insecure_http=True)
+
+        result = probe_central(credentials)  # production opener, real socket
+
+        assert [(m, path) for m, path, _h in requests] == [("GET", "/api/v1/sync/probe/")]
+        assert result == CentralProbeResult(
+            reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+        )
+        assert TOKEN_SENTINEL not in _rendered(result, caplog.text)
+    finally:
+        cleanup()
+
+
+def test_complete_content_length_200_is_still_accepted():
+    port, requests, cleanup = _serve(_CompleteContentLengthHandler)
+    try:
+        credentials = _credentials(f"http://127.0.0.1:{port}", allow_insecure_http=True)
+        result = probe_central(credentials)
+        assert len(requests) == 1
+        assert result == CentralProbeResult(reachable=True, accepted=True, http_status=200)
+    finally:
+        cleanup()
+
+
+@pytest.mark.parametrize(
+    "headers,body",
+    [
+        ([], b'{"status": "ok"}'),  # no Content-Length: close-delimited framing
+        ([("Content-Length", "16")], b'{"status": "ok"}'),  # exact match
+    ],
+)
+def test_framing_that_is_complete_or_close_delimited_is_accepted(headers, body):
+    result = probe_central(
+        _credentials(), opener=_FakeOpener(response=_FakeResponse(body=body, headers=headers))
+    )
+    assert result.accepted is True
+
+
+@pytest.mark.parametrize(
+    "headers,body",
+    [
+        ([("Content-Length", "100")], b'{"status": "ok"}'),  # declared > received
+        ([("Content-Length", "4097")], b'{"status": "ok"}'),  # declared > body limit
+        ([("Content-Length", "abc")], b'{"status": "ok"}'),  # malformed
+        ([("Content-Length", "-1")], b'{"status": "ok"}'),  # malformed
+        ([("Content-Length", "1 6")], b'{"status": "ok"}'),  # malformed
+        ([("Content-Length", "16"), ("Content-Length", "16")], b'{"status": "ok"}'),  # dup
+        ([("Content-Length", "16"), ("Content-Length", "100")], b'{"status": "ok"}'),  # conflict
+        ([("Content-Length", "16"), ("Transfer-Encoding", "chunked")], b'{"status": "ok"}'),
+        ([("Content-Length", "15")], b'{"status": "ok"}'),  # declared < received
+    ],
+)
+def test_untrustworthy_or_incomplete_framing_is_reachable_not_accepted(headers, body):
+    opener = _FakeOpener(response=_FakeResponse(body=body, headers=headers))
+
+    result = probe_central(_credentials(), opener=opener)
+
+    assert result == CentralProbeResult(
+        reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+    )
+    assert len(opener.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "handler", [_IncompleteChunkedHandler, _IncompleteContentLengthHandler]
+)
+def test_incomplete_200_does_not_collapse_local_checks_to_provider_failed(
+    settings, monkeypatch, tmp_path, handler
 ):
-    port, _requests, cleanup = _serve(_IncompleteChunkedHandler)
+    port, _requests, cleanup = _serve(handler)
     try:
         settings.LINUXLAB_PROFILE = "node"
         settings.LINUXLAB_CAN_RUN_SYNC_WORKER = True

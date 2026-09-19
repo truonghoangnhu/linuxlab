@@ -22,6 +22,8 @@ Concrete evidence mapping:
     malformed/oversized 200     -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
     headers ok, body stalled/
       truncated/unreadable      -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
+    headers ok, Content-Length
+      unsatisfied/untrusted     -> reachable=True,  accepted=False, PROBE_RESPONSE_INVALID
     DNS/TLS/timeout/network     -> reachable=False, accepted=False, PROBE_UNREACHABLE
     unusable credentials/URL    -> reachable=False, accepted=False, CONFIG_INVALID (no request)
 """
@@ -78,6 +80,33 @@ def _is_exact_success_body(raw_body: bytes) -> bool:
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
     return type(parsed) is dict and parsed == _SUCCESS_BODY and type(parsed.get("status")) is str
+
+
+def _declared_content_length(response):
+    """Framing declared by the response headers (T11-I2): returns
+    (trusted, declared) where `declared` is the single, well-formed
+    Content-Length in bytes, or None for a close-delimited/chunked response
+    with no Content-Length. `trusted` is False for framing that must not be
+    relied on: more than one Content-Length (duplicate or conflicting), a
+    non-decimal or negative value, a Content-Length alongside
+    Transfer-Encoding, or a declared length beyond the Task-11 body limit.
+    A response object without headers (only test doubles) is treated as
+    close-delimited."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return True, None
+    values = headers.get_all("Content-Length") or []
+    if not values:
+        return True, None
+    if len(values) != 1 or headers.get_all("Transfer-Encoding"):
+        return False, None
+    text = values[0].strip()
+    if not text or not text.isascii() or not text.isdecimal():
+        return False, None
+    declared = int(text)
+    if declared > _MAX_PROBE_BODY_BYTES:
+        return False, None
+    return True, declared
 
 
 def _usable_credentials(credentials) -> bool:
@@ -144,8 +173,21 @@ def probe_central(credentials: NodeCredentials, *, opener=None) -> CentralProbeR
     status = _safe_status(getattr(response, "status", None))
     try:
         with response:
+            framing_trusted, declared_length = _declared_content_length(response)
             raw_body = response.read(_MAX_PROBE_BODY_BYTES + 1)
     except (http.client.HTTPException, TimeoutError, OSError):
+        return CentralProbeResult(
+            reachable=True, accepted=False, http_status=status, error_code=PROBE_RESPONSE_INVALID
+        )
+
+    # Framing completeness (T11-I2): http.client's bounded read(amt) returns
+    # a SHORT byte sequence on premature EOF without raising IncompleteRead
+    # when Content-Length is unsatisfied, so exception handling alone cannot
+    # establish complete framing. The body is accepted only when the
+    # declared Content-Length is trustworthy and EXACTLY equals the bytes
+    # actually consumed by the bounded read (a declared length above the
+    # body limit is untrusted outright, so the read stays bounded).
+    if not framing_trusted or (declared_length is not None and len(raw_body) != declared_length):
         return CentralProbeResult(
             reachable=True, accepted=False, http_status=status, error_code=PROBE_RESPONSE_INVALID
         )
