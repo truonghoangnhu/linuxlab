@@ -23,8 +23,13 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from linuxlab.core import diagnostics as d
+from linuxlab.core.diagnostics import build_diagnostic_context, diagnostic_providers
 from linuxlab.core.local_diagnostics import CoreDiagnosticProvider
 from linuxlab.core.models import DomainEvent
+from linuxlab.core.release_diagnostics import (
+    ReleaseDiagnosticsError,
+    validate_release_diagnostics,
+)
 from linuxlab.sync.authentication import issue_node_registration
 from linuxlab.sync.models import (
     REGISTRATION_ACTIVE,
@@ -400,23 +405,6 @@ def test_database_failure_fails_both_core_checks_via_command(node_local):
 
 
 # --- unavailable modes / invalid invocation ---------------------------------
-
-
-def test_release_is_rejected_before_any_check(node_local, monkeypatch):
-    # Task 12 owns RELEASE: still rejected exactly as before, never mapped
-    # to REMOTE or LOCAL.
-    with (
-        patch("linuxlab.core.management.commands.diagnose_deployment.diagnose_deployment") as run,
-        patch("linuxlab.core.management.commands.diagnose_deployment.build_diagnostic_context") as ctx,
-        patch("linuxlab.sync.diagnostics.probe_central") as probe,
-    ):
-        stdout, _stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
-    run.assert_not_called()
-    ctx.assert_not_called()
-    probe.assert_not_called()
-    assert stdout == ""
-    assert error.returncode == 2
-    assert str(error) == "diagnostic mode is not available in this release"
 
 
 @pytest.mark.parametrize(
@@ -831,4 +819,165 @@ def test_central_remote_is_rejected_before_any_check_or_network(central_local, p
 def test_local_mode_still_never_probes(node_local, probe):
     stdout, _ = _run("--mode", "local", "--format", "json")
     assert "CENTRAL_CONNECTIVITY" not in {c["code"] for c in _json_report(stdout)["checks"]}
+    assert probe.calls == []
+
+
+# --- Corrective B Task 12: RELEASE mode (both profiles; policy decides) -------
+
+_REJECTED_PROBE = CentralProbeResult(
+    reachable=True, accepted=False, http_status=401, error_code="AUTH_REJECTED"
+)
+_REMOTE = {"CENTRAL_CONNECTIVITY", "CENTRAL_AUTH_ACCEPTANCE"}
+
+
+def _validate_release_stdout(stdout, returncode=0):
+    return validate_release_diagnostics(
+        stdout, returncode, context=build_diagnostic_context("release"), providers=diagnostic_providers()
+    )
+
+
+def test_node_release_policy_false_offline_passes_required_local_checks(node_local, settings, probe):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = False
+    before = _persistent_rows()
+
+    stdout, stderr = _run("--mode", "release", "--format", "json")
+
+    report = _json_report(stdout)
+    checks = {c["code"]: c for c in report["checks"]}
+    assert report["mode"] == "release"
+    assert set(checks) == {
+        "DB_CONNECTIVITY", "SCHEMA_STATE", "TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY"
+    }
+    assert checks["NODE_REGISTRATION"]["status"] == "WARN"
+    assert report["overall_status"] == "WARN"
+    assert stderr == ""
+    assert probe.calls == []  # policy false: neither remote check runs
+    assert _persistent_rows() == before
+    # The very same stdout passes the canonical release validator (WARN allowed).
+    assert _validate_release_stdout(stdout).overall_status == "WARN"
+
+
+def test_node_release_policy_false_with_sync_disabled_needs_no_credentials(node_local, settings, probe):
+    settings.LINUXLAB_SYNC_ENABLED = False
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = False
+    settings.LINUXLAB_SYNC_SECRET = None
+    settings.LINUXLAB_CENTRAL_URL = None
+
+    stdout, _ = _run("--mode", "release", "--format", "json")
+
+    report = _json_report(stdout)
+    assert {c["code"] for c in report["checks"]} == {"DB_CONNECTIVITY", "SCHEMA_STATE", "TRUST_KEY"}
+    assert report["overall_status"] == "PASS"
+    assert probe.calls == []
+    assert _validate_release_stdout(stdout).overall_status == "PASS"
+
+
+def test_node_release_policy_true_requires_and_runs_one_probe(node_local, settings, probe):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+
+    stdout, _ = _run("--mode", "release", "--format", "json")
+
+    report = _json_report(stdout)
+    checks = {c["code"]: c for c in report["checks"]}
+    assert _REMOTE <= set(checks)
+    assert checks["CENTRAL_CONNECTIVITY"]["status"] == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["status"] == "PASS"
+    assert checks["NODE_REGISTRATION"]["status"] == "WARN"
+    assert len(probe.calls) == 1
+    assert _validate_release_stdout(stdout).overall_status == "WARN"
+
+
+def test_node_release_policy_true_offline_fails_and_readiness_stays_up(node_local, settings, probe, client):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    probe.result = _UNREACHABLE_PROBE
+    before = _persistent_rows()
+
+    stdout, _stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
+
+    checks = {c["code"]: c for c in _json_report(stdout)["checks"]}
+    assert checks["CENTRAL_CONNECTIVITY"]["status"] == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["status"] == "FAIL"
+    assert error.returncode == 1
+    with pytest.raises(ReleaseDiagnosticsError):
+        _validate_release_stdout(stdout, error.returncode)
+    with pytest.raises(ReleaseDiagnosticsError):
+        _validate_release_stdout(stdout, 0)  # overall FAIL fails closed regardless
+    assert _persistent_rows() == before
+    responses = [client.get(path) for path in ("/ready/", "/readyz")]
+    assert [r.status_code for r in responses] == [200, 200]
+
+
+def test_node_release_policy_true_rejecting_central_fails_auth(node_local, settings, probe):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    probe.result = _REJECTED_PROBE
+    stdout, _stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
+    checks = {c["code"]: c for c in _json_report(stdout)["checks"]}
+    assert checks["CENTRAL_CONNECTIVITY"]["status"] == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["status"] == "FAIL"
+    assert error.returncode == 1
+
+
+@pytest.mark.parametrize("policy", ["maybe", CONFIG_SENTINEL])
+def test_node_release_malformed_policy_fails_closed(node_local, settings, probe, policy):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = policy
+    stdout, stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
+    checks = {c["code"]: c for c in _json_report(stdout)["checks"]}
+    assert checks["SYNC_RETRY_POLICY"]["status"] == "FAIL"
+    assert error.returncode == 1
+    assert probe.calls == []
+    assert CONFIG_SENTINEL not in stdout + stderr + str(error)
+
+
+@pytest.mark.parametrize("policy", [True, "maybe"])
+def test_central_release_ignores_node_policy_and_never_probes(central_local, settings, probe, policy):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = policy
+
+    stdout, _ = _run("--mode", "release", "--format", "json")
+
+    report = _json_report(stdout)
+    checks = {c["code"]: c for c in report["checks"]}
+    assert report["profile"] == "central"
+    assert report["mode"] == "release"
+    assert set(checks) == {"DB_CONNECTIVITY", "SCHEMA_STATE", "SIGNING_KEY", "NODE_REGISTRATION"}
+    assert probe.calls == []
+    assert _validate_release_stdout(stdout).overall_status == "PASS"
+
+
+def test_release_text_renders_the_same_report(node_local, settings, probe):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    json_stdout, _ = _run("--mode", "release", "--format", "json")
+    text_stdout, _ = _run("--mode", "release", "--format", "text")
+    report = _json_report(json_stdout)
+    header, text_checks = _parse_text(text_stdout)
+    assert header["mode"] == "release"
+    assert text_checks == {c["code"]: c for c in report["checks"]}
+    assert len(probe.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--mode", "release", "--require-central-probe", "false"),
+        ("--mode", "release", "--no-remote"),
+        ("--mode", "release", "--skip-check", "CENTRAL_CONNECTIVITY"),
+        ("--mode", "release", "--force"),
+    ],
+)
+def test_no_cli_switch_can_override_release_policy(node_local, settings, probe, argv):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    probe.result = _UNREACHABLE_PROBE
+    out = io.StringIO()
+    with pytest.raises((CommandError, SystemExit)):
+        call_command("diagnose_deployment", *argv, stdout=out)
+    assert out.getvalue() == ""
+    assert probe.calls == []
+
+
+def test_release_sentinels_never_leak(node_local, settings, probe, caplog, tmp_path):
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    settings.LINUXLAB_CENTRAL_URL = f"https://central.example.org/#{AUTHORIZATION_SENTINEL}"
+    stdout, stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
+    everything = stdout + stderr + str(error) + repr(error) + caplog.text
+    for sentinel in (NODE_SECRET_SENTINEL, "AUTHZ_SENTINEL", "Bearer", str(tmp_path)):
+        assert sentinel not in everything
     assert probe.calls == []

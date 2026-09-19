@@ -2,7 +2,12 @@
 §§4-6): the LOCAL checks TRUST_KEY, NODE_REGISTRATION and
 SYNC_RETRY_POLICY; Corrective B Task 11 (spec §7) adds the REMOTE checks
 CENTRAL_CONNECTIVITY and CENTRAL_AUTH_ACCEPTANCE, Node-only, derived from
-exactly ONE probe_central() call per diagnosis. Task 12 adds RELEASE.
+exactly ONE probe_central() call per diagnosis. Corrective B Task 12 adds
+RELEASE: the canonical purpose="release" configuration (Task 3) decides
+Node requirements -- policy false requires only the applicable local
+checks, policy true requires both remote checks and their prerequisites,
+a malformed switch fails SYNC_RETRY_POLICY closed -- and no CLI switch can
+override it. Central never applies the Node-only policy.
 
 Every relevant setting is read ONCE, into a private per-instance snapshot
 at construction (typed loader results and typed deferred failures kept as
@@ -67,6 +72,7 @@ class _SyncSettingsSnapshot:
     identity: UUID | SyncConfigurationError
     worker: SyncConfiguration | SyncConfigurationError
     probe: SyncConfiguration | SyncConfigurationError
+    release: SyncConfiguration | SyncConfigurationError
 
 
 def _capture_snapshot(source) -> _SyncSettingsSnapshot:
@@ -89,7 +95,11 @@ def _capture_snapshot(source) -> _SyncSettingsSnapshot:
         probe = load_sync_configuration(settings_obj=source, purpose="probe")
     except SyncConfigurationError as exc:
         probe = exc
-    return _SyncSettingsSnapshot(enabled, require_probe, identity, worker, probe)
+    try:
+        release = load_sync_configuration(settings_obj=source, purpose="release")
+    except SyncConfigurationError as exc:
+        release = exc
+    return _SyncSettingsSnapshot(enabled, require_probe, identity, worker, probe, release)
 
 
 def _config_failure(setting_name: str, code: str) -> DiagnosticCheck:
@@ -112,6 +122,16 @@ class SyncDiagnosticProvider:
 
     # -- selection -----------------------------------------------------------
 
+    def _probe_requested(self, context: DiagnosticContext) -> bool:
+        """A Central probe is requested by an explicit REMOTE diagnosis, or
+        REQUIRED in RELEASE by the typed deployment policy
+        LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE being exactly True (Task
+        12, spec §7): "true means both run and are required. No manual flag
+        can disable this production requirement."""
+        if context.mode == "remote":
+            return True
+        return context.mode == "release" and self._snapshot.require_central_probe is True
+
     def required_codes(self, context: DiagnosticContext) -> frozenset[str]:
         required = set()
         if "LINUXLAB_CAN_IMPORT_PACKAGES" in context.capabilities:
@@ -121,9 +141,18 @@ class SyncDiagnosticProvider:
                 required.add("NODE_REGISTRATION")
         elif context.profile == "node":
             enabled = self._snapshot.enabled
-            remote = context.mode == "remote"
+            remote = self._probe_requested(context)
+            if context.mode == "release" and isinstance(
+                self._snapshot.release, SyncConfigurationError
+            ):
+                # Task 12: the canonical purpose="release" configuration is
+                # the policy authority; if it is not typed and usable
+                # (malformed switch/enablement/policy/prerequisites) the
+                # deployment fails release closed through SYNC_RETRY_POLICY.
+                required.add("SYNC_RETRY_POLICY")
             # Spec §5: NODE_REGISTRATION and SYNC_RETRY_POLICY are required
-            # when outbound sync is enabled OR a remote probe is requested.
+            # when outbound sync is enabled OR a remote probe is requested/
+            # required.
             if enabled is True or remote:
                 required.update({"NODE_REGISTRATION", "SYNC_RETRY_POLICY"})
             elif isinstance(enabled, DeferredSyncSettingError):
@@ -139,9 +168,10 @@ class SyncDiagnosticProvider:
                 # decided by the typed enabled value above.
                 required.add("SYNC_RETRY_POLICY")
             if remote:
-                # Task 11: explicit REMOTE request, Node only. Central
-                # never owns the remote checks (the command rejects
-                # Central REMOTE before any provider runs).
+                # Task 11: explicit REMOTE request; Task 12: RELEASE with
+                # policy true. Node only -- Central never owns the remote
+                # checks (the command rejects Central REMOTE before any
+                # provider runs, and Central RELEASE ignores Node policy).
                 required.update(_REMOTE_CODES)
         return frozenset(required)
 
@@ -262,11 +292,15 @@ class SyncDiagnosticProvider:
             )
         if snapshot.enabled is True and isinstance(snapshot.worker, SyncConfigurationError):
             return _config_failure(snapshot.worker.setting_name, snapshot.worker.code)
-        if context.mode == "remote" and isinstance(snapshot.probe, SyncConfigurationError):
+        if context.mode == "release" and isinstance(snapshot.release, SyncConfigurationError):
+            # Task 12: the typed release policy/prerequisite error itself.
+            return _config_failure(snapshot.release.setting_name, snapshot.release.code)
+        if self._probe_requested(context) and isinstance(snapshot.probe, SyncConfigurationError):
             # Task 11 (spec §5): a remote probe does not require outbound
             # sync to be enabled, but its credentials/URL must still be
             # valid typed configuration -- URL/credential failures belong
-            # to SYNC_RETRY_POLICY, never to NODE_REGISTRATION.
+            # to SYNC_RETRY_POLICY, never to NODE_REGISTRATION. Task 12
+            # applies the same rule when RELEASE policy requires the probe.
             return _config_failure(snapshot.probe.setting_name, snapshot.probe.code)
         return DiagnosticCheck(
             "SYNC_RETRY_POLICY", "PASS", "Sync retry policy and worker prerequisites are valid."

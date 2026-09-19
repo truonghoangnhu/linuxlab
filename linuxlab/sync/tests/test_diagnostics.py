@@ -788,3 +788,181 @@ def test_remote_diagnosis_makes_no_client_side_mutation(settings, trust_key, pro
         row.next_attempt_at,
         row.first_failure_at,
     )
+
+
+# --- Corrective B Task 12: RELEASE mode (canonical policy decides) -----------
+
+NODE_RELEASE = DiagnosticContext(
+    "node",
+    "release",
+    frozenset(
+        {
+            "LINUXLAB_CAN_IMPORT_PACKAGES",
+            "LINUXLAB_CAN_SERVE_LEARNER_CONTENT",
+            "LINUXLAB_CAN_RUN_SYNC_WORKER",
+        }
+    ),
+)
+CENTRAL_RELEASE = DiagnosticContext(
+    "central", "release", frozenset({"LINUXLAB_CAN_AUTHOR", "LINUXLAB_CAN_RECEIVE_SYNC_EVENTS"})
+)
+_LOCAL_SYNC_CODES = frozenset({"NODE_REGISTRATION", "SYNC_RETRY_POLICY"})
+
+
+def test_release_policy_false_with_sync_disabled_requires_only_local_applicable(
+    settings, trust_key, probe
+):
+    _configure_node(
+        settings,
+        LINUXLAB_SYNC_ENABLED=False,
+        LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=False,
+        LINUXLAB_SYNC_SECRET=None,
+        LINUXLAB_CENTRAL_URL=None,
+    )
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(NODE_RELEASE) == frozenset({"TRUST_KEY"})
+    assert set(_checks(provider, NODE_RELEASE)) == {"TRUST_KEY"}
+    assert probe.calls == []
+
+
+def test_release_policy_false_with_sync_enabled_requires_local_sync_checks_only(
+    settings, trust_key, probe
+):
+    _configure_node(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=False)
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(NODE_RELEASE) == frozenset({"TRUST_KEY", *_LOCAL_SYNC_CODES})
+    checks = _checks(provider, NODE_RELEASE)
+    assert not set(checks) & _REMOTE_CODES
+    assert checks["NODE_REGISTRATION"].status == "WARN"
+    assert checks["SYNC_RETRY_POLICY"].status == "PASS"
+    assert probe.calls == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_release_policy_true_requires_both_remote_checks_and_prerequisites(
+    settings, trust_key, probe, enabled
+):
+    _configure_node(
+        settings, LINUXLAB_SYNC_ENABLED=enabled, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True
+    )
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(NODE_RELEASE) == frozenset(
+        {"TRUST_KEY", *_LOCAL_SYNC_CODES, *_REMOTE_CODES}
+    )
+    checks = _checks(provider, NODE_RELEASE)
+    assert len(probe.calls) == 1
+    assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "PASS"
+    assert checks["SYNC_RETRY_POLICY"].status == "PASS"
+    assert checks["NODE_REGISTRATION"].status == "WARN"
+    assert checks["NODE_REGISTRATION"].details["authority_verified"] is False
+
+
+def test_release_policy_true_with_offline_central_fails_both_remote_checks(
+    settings, trust_key, probe
+):
+    _configure_node(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True)
+    probe.result = _UNREACHABLE
+    checks = _checks(SyncDiagnosticProvider(), NODE_RELEASE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert len(probe.calls) == 1
+
+
+def test_release_policy_true_with_rejecting_central_fails_auth_only(settings, trust_key, probe):
+    _configure_node(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True)
+    probe.result = _REJECTED
+    checks = _checks(SyncDiagnosticProvider(), NODE_RELEASE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details["error_code"] == "AUTH_REJECTED"
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("LINUXLAB_CENTRAL_URL", None),
+        ("LINUXLAB_CENTRAL_URL", CONFIG_SENTINEL),
+        ("LINUXLAB_SYNC_SECRET", ""),
+        ("LINUXLAB_NODE_ID", "not-a-uuid"),
+    ],
+)
+def test_release_policy_true_with_invalid_prerequisites_fails_closed_without_network(
+    settings, trust_key, probe, name, value
+):
+    _configure_node(
+        settings,
+        LINUXLAB_SYNC_ENABLED=False,
+        LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True,
+        **{name: value},
+    )
+    provider = SyncDiagnosticProvider()
+    required = provider.required_codes(NODE_RELEASE)
+    assert "SYNC_RETRY_POLICY" in required
+    checks = _checks(provider, NODE_RELEASE)
+    assert checks["SYNC_RETRY_POLICY"].status == "FAIL"
+    assert checks["SYNC_RETRY_POLICY"].details["error_code"].startswith("SYNC_CONFIG_")
+    if _REMOTE_CODES <= required:
+        assert checks["CENTRAL_CONNECTIVITY"].details == {"error_code": "CONFIG_INVALID"}
+        assert checks["CENTRAL_AUTH_ACCEPTANCE"].details == {"error_code": "CONFIG_INVALID"}
+    assert probe.calls == []
+    assert CONFIG_SENTINEL not in _rendered(NODE_RELEASE, checks.values())
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["maybe", CONFIG_SENTINEL, "", None, 1,
+     DeferredSyncSettingError("LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE", "INVALID_VALUE")],
+)
+def test_release_malformed_policy_fails_closed_never_false(settings, trust_key, probe, value):
+    _configure_node(
+        settings, LINUXLAB_SYNC_ENABLED=False, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=value
+    )
+    provider = SyncDiagnosticProvider()
+    assert "SYNC_RETRY_POLICY" in provider.required_codes(NODE_RELEASE)
+    checks = _checks(provider, NODE_RELEASE)
+    assert checks["SYNC_RETRY_POLICY"].status == "FAIL"
+    assert probe.calls == []
+    assert CONFIG_SENTINEL not in _rendered(NODE_RELEASE, checks.values())
+
+
+def test_release_malformed_enabled_fails_closed(settings, trust_key, probe):
+    _configure_node(settings, LINUXLAB_SYNC_ENABLED=CONFIG_SENTINEL)
+    checks = _checks(SyncDiagnosticProvider(), NODE_RELEASE)
+    assert checks["SYNC_RETRY_POLICY"].status == "FAIL"
+    assert probe.calls == []
+    assert CONFIG_SENTINEL not in _rendered(NODE_RELEASE, checks.values())
+
+
+@pytest.mark.parametrize("policy", [True, "maybe", CONFIG_SENTINEL])
+def test_central_release_ignores_node_policy_and_never_probes(settings, probe, policy):
+    _configure_central(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=policy)
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(CENTRAL_RELEASE) == frozenset({"NODE_REGISTRATION"})
+    checks = _checks(provider, CENTRAL_RELEASE)
+    assert set(checks) == {"NODE_REGISTRATION"}
+    assert probe.calls == []
+    assert CONFIG_SENTINEL not in _rendered(CENTRAL_RELEASE, checks.values())
+
+
+def test_release_requirements_come_from_the_construction_snapshot(settings, trust_key, probe):
+    _configure_node(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=False)
+    provider = SyncDiagnosticProvider()
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = True
+    assert not provider.required_codes(NODE_RELEASE) & _REMOTE_CODES
+    assert SyncDiagnosticProvider().required_codes(NODE_RELEASE) >= _REMOTE_CODES
+
+
+def test_release_diagnosis_makes_no_client_side_mutation(settings, trust_key, probe):
+    _configure_node(settings, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True)
+    before = list(OutboxMessage.objects.order_by("pk").values()), _registration_rows()
+    with (
+        patch("linuxlab.sync.outbox.claim_outbox_batch") as claim,
+        patch("linuxlab.sync.outbox.flush_outbox") as flush,
+        patch("linuxlab.sync.outbox.requeue_outbox_message") as requeue,
+    ):
+        _checks(SyncDiagnosticProvider(), NODE_RELEASE)
+    claim.assert_not_called()
+    flush.assert_not_called()
+    requeue.assert_not_called()
+    assert (list(OutboxMessage.objects.order_by("pk").values()), _registration_rows()) == before
