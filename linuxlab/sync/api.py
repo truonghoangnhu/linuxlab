@@ -1,5 +1,6 @@
 """Task 14 authenticated sync ingestion API (T14-D07, T14-D08, T14-D09,
-T14-D30).
+T14-D30), plus Corrective B Task 11's dedicated read-only Central probe
+(`GET /api/v1/sync/probe/`, approved spec §7).
 
 `POST /api/v1/sync/events/` is a thin adapter: it authenticates once,
 validates the batch's structural shape, then delegates every event
@@ -31,6 +32,7 @@ from .ingestion import ingest_event
 _BEARER_PREFIX = "Bearer "
 _AUTH_FAILED_BODY = {"detail": "authentication failed"}
 _PROFILE_DISABLED_BODY = {"detail": "sync ingestion is not enabled on this deployment profile"}
+_PROBE_OK_BODY = {"status": "ok"}
 
 
 def _parse_bearer_credential(request):
@@ -159,3 +161,31 @@ class SyncEventsView(View):
         results = [_ack_to_dict(ingest_event(node, envelope)) for envelope in envelopes]
 
         return JsonResponse({"results": results}, status=200)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SyncProbeView(View):
+    """GET /api/v1/sync/probe/ -- Corrective B Task 11 (approved spec §7):
+    a dedicated, strictly read-only Central probe. Exactly the same
+    receive-capability gate, header parsing and Task-5 authenticate_node
+    authority as event ingestion (no second auth interpretation), then a
+    fixed HTTP 200 {"status": "ok"}. It ingests nothing and writes
+    nothing: no InboxMessage/OutboxMessage/DomainEvent/registration/
+    session state, no password-hash upgrade, no audit record. Every
+    credential failure is the same generic 401 as ingestion; the
+    unrelated profile/capability-disabled 403 stays exactly as it is.
+    GET only -- Django's View answers every other method with 405."""
+
+    def get(self, request):
+        if not can_receive_sync_events():
+            return JsonResponse(_PROFILE_DISABLED_BODY, status=403)
+
+        node_id, secret = _parse_bearer_credential(request)
+        if node_id is None:
+            return JsonResponse(_AUTH_FAILED_BODY, status=401)
+
+        node, error_status = _authenticate_request(node_id, secret)
+        if node is None:
+            return JsonResponse(_AUTH_FAILED_BODY, status=error_status)
+
+        return JsonResponse(_PROBE_OK_BODY, status=200)

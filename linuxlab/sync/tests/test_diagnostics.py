@@ -26,6 +26,7 @@ from linuxlab.sync.models import (
     OutboxMessage,
     _insert_immutable_row,
 )
+from linuxlab.sync.probe import CentralProbeResult
 from linuxlab.sync.transports import _TRANSPORT_OPENER
 
 _ORIGINAL_OPENER_OPEN = urllib.request.OpenerDirector.open
@@ -127,10 +128,19 @@ def _registration_rows():
 # --- ownership / LOCAL selection matrix ------------------------------------
 
 
-def test_provider_owns_exactly_the_three_local_sync_codes():
+def test_provider_owns_the_three_local_sync_codes_and_the_two_remote_codes():
+    # Task 10 ownership (three LOCAL codes) extended by Task 11 with the
+    # two REMOTE codes; core's and publication's codes are never owned here.
     assert SyncDiagnosticProvider.codes == frozenset(
-        {"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY"}
+        {
+            "TRUST_KEY",
+            "NODE_REGISTRATION",
+            "SYNC_RETRY_POLICY",
+            "CENTRAL_CONNECTIVITY",
+            "CENTRAL_AUTH_ACCEPTANCE",
+        }
     )
+    assert not SyncDiagnosticProvider.codes & {"DB_CONNECTIVITY", "SCHEMA_STATE", "SIGNING_KEY"}
 
 
 def test_node_with_outbound_sync_enabled_requires_registration_policy_and_trust(settings, trust_key):
@@ -543,3 +553,237 @@ def test_network_poison_is_effective_and_leaves_no_instance_shadow():
     # ...and no earlier test in this module left an instance shadow behind.
     assert "open" not in vars(_TRANSPORT_OPENER)
     assert urllib.request.OpenerDirector.open is not _ORIGINAL_OPENER_OPEN  # patched now
+
+
+# --- Corrective B Task 11: REMOTE mode (Node only) ---------------------------
+
+
+NODE_REMOTE = DiagnosticContext(
+    "node",
+    "remote",
+    frozenset(
+        {
+            "LINUXLAB_CAN_IMPORT_PACKAGES",
+            "LINUXLAB_CAN_SERVE_LEARNER_CONTENT",
+            "LINUXLAB_CAN_RUN_SYNC_WORKER",
+        }
+    ),
+)
+CENTRAL_REMOTE = DiagnosticContext(
+    "central", "remote", frozenset({"LINUXLAB_CAN_AUTHOR", "LINUXLAB_CAN_RECEIVE_SYNC_EVENTS"})
+)
+_REMOTE_CODES = frozenset({"CENTRAL_CONNECTIVITY", "CENTRAL_AUTH_ACCEPTANCE"})
+_ACCEPTED = CentralProbeResult(reachable=True, accepted=True, http_status=200)
+_REJECTED = CentralProbeResult(
+    reachable=True, accepted=False, http_status=401, error_code="AUTH_REJECTED"
+)
+_UNREACHABLE = CentralProbeResult(reachable=False, accepted=False, error_code="PROBE_UNREACHABLE")
+_MALFORMED = CentralProbeResult(
+    reachable=True, accepted=False, http_status=200, error_code="PROBE_RESPONSE_INVALID"
+)
+
+
+class _ProbeSpy:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, credentials, *, opener=None):
+        self.calls.append((credentials, opener))
+        return self.result
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    spy = _ProbeSpy(_ACCEPTED)
+    monkeypatch.setattr("linuxlab.sync.diagnostics.probe_central", spy)
+    return spy
+
+
+def test_provider_now_owns_the_two_remote_codes():
+    assert _REMOTE_CODES <= SyncDiagnosticProvider.codes
+    assert SyncDiagnosticProvider.codes == frozenset(
+        {"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY", *_REMOTE_CODES}
+    )
+
+
+def test_node_remote_requires_both_remote_codes_plus_local_registration_and_policy(
+    settings, trust_key, probe
+):
+    _configure_node(settings)
+    assert SyncDiagnosticProvider().required_codes(NODE_REMOTE) == frozenset(
+        {"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY", *_REMOTE_CODES}
+    )
+
+
+def test_node_remote_with_outbound_sync_disabled_still_requires_probe_checks(
+    settings, trust_key, probe
+):
+    # Spec §5: NODE_REGISTRATION / SYNC_RETRY_POLICY are required when a
+    # remote probe is requested, even if outbound sync is disabled.
+    _configure_node(settings, LINUXLAB_SYNC_ENABLED=False)
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(NODE_REMOTE) == frozenset(
+        {"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY", *_REMOTE_CODES}
+    )
+    checks = _checks(provider, NODE_REMOTE)
+    assert checks["SYNC_RETRY_POLICY"].status == "PASS"
+    assert checks["NODE_REGISTRATION"].status == "WARN"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "PASS"
+
+
+def test_local_mode_never_requires_or_emits_remote_codes(settings, trust_key, probe):
+    _configure_node(settings)
+    provider = SyncDiagnosticProvider()
+    assert not provider.required_codes(NODE_FULL) & _REMOTE_CODES
+    assert not set(_checks(provider, NODE_FULL)) & _REMOTE_CODES
+    assert probe.calls == []
+
+
+def test_central_remote_context_never_requires_remote_codes(settings, probe):
+    _configure_central(settings)
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(CENTRAL_REMOTE) == frozenset({"NODE_REGISTRATION"})
+    assert set(_checks(provider, CENTRAL_REMOTE)) == {"NODE_REGISTRATION"}
+    assert probe.calls == []
+
+
+def test_remote_probe_is_called_exactly_once_and_both_checks_share_its_result(
+    settings, trust_key, probe
+):
+    _configure_node(settings)
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+
+    assert len(probe.calls) == 1
+    (credentials, opener) = probe.calls[0]
+    assert opener is None
+    assert str(credentials.node_id) == settings.LINUXLAB_NODE_ID
+    assert credentials.secret == SECRET_SENTINEL
+    assert credentials.central_url == settings.LINUXLAB_CENTRAL_URL
+    assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+    assert checks["CENTRAL_CONNECTIVITY"].details["http_status"] == 200
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details["http_status"] == 200
+    assert SECRET_SENTINEL not in _rendered(NODE_REMOTE, checks.values())
+
+
+def test_remote_auth_success_keeps_local_registration_warn(settings, trust_key, probe):
+    _configure_node(settings)
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "PASS"
+    assert checks["NODE_REGISTRATION"].status == "WARN"
+    assert checks["NODE_REGISTRATION"].details["authority_verified"] is False
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_remote_auth_rejection_is_connectivity_pass_auth_fail_without_inference(
+    settings, trust_key, probe, status
+):
+    _configure_node(settings)
+    probe.result = CentralProbeResult(
+        reachable=True, accepted=False, http_status=status, error_code="AUTH_REJECTED"
+    )
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details == {
+        "error_code": "AUTH_REJECTED",
+        "http_status": status,
+    }
+    message = checks["CENTRAL_AUTH_ACCEPTANCE"].message.lower()
+    for word in ("revoked", "unknown", "superseded", "registration exists"):
+        assert word not in message
+    assert len(probe.calls) == 1
+
+
+def test_remote_unreachable_fails_both_checks(settings, trust_key, probe):
+    _configure_node(settings)
+    probe.result = _UNREACHABLE
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "FAIL"
+    assert checks["CENTRAL_CONNECTIVITY"].details == {"error_code": "PROBE_UNREACHABLE"}
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details == {"error_code": "PROBE_UNREACHABLE"}
+    assert len(probe.calls) == 1
+
+
+def test_remote_malformed_success_is_connectivity_pass_auth_fail(settings, trust_key, probe):
+    _configure_node(settings)
+    probe.result = _MALFORMED
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details["error_code"] == "PROBE_RESPONSE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("LINUXLAB_NODE_ID", None),
+        ("LINUXLAB_NODE_ID", "not-a-uuid"),
+        ("LINUXLAB_SYNC_SECRET", ""),
+        ("LINUXLAB_CENTRAL_URL", None),
+        ("LINUXLAB_CENTRAL_URL", CONFIG_SENTINEL),
+        ("LINUXLAB_CENTRAL_URL", "http://central.example.org"),
+        ("LINUXLAB_CAN_RUN_SYNC_WORKER", False),
+    ],
+)
+def test_remote_missing_or_malformed_probe_config_fails_both_without_network(
+    settings, trust_key, probe, name, value
+):
+    _configure_node(settings, LINUXLAB_SYNC_ENABLED=False, **{name: value})
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["CENTRAL_CONNECTIVITY"].status == "FAIL"
+    assert checks["CENTRAL_CONNECTIVITY"].details == {"error_code": "CONFIG_INVALID"}
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].status == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"].details == {"error_code": "CONFIG_INVALID"}
+    assert probe.calls == []  # and the autouse opener poison proves zero network
+    assert CONFIG_SENTINEL not in _rendered(NODE_REMOTE, checks.values())
+
+
+def test_remote_invalid_probe_config_also_fails_sync_retry_policy_as_owner(
+    settings, trust_key, probe
+):
+    _configure_node(settings, LINUXLAB_SYNC_ENABLED=False, LINUXLAB_CENTRAL_URL=CONFIG_SENTINEL)
+    checks = _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    assert checks["SYNC_RETRY_POLICY"].status == "FAIL"
+    assert checks["SYNC_RETRY_POLICY"].details["error_code"] == "SYNC_CONFIG_INVALID_VALUE"
+    assert "LINUXLAB_CENTRAL_URL" in checks["SYNC_RETRY_POLICY"].message
+    assert CONFIG_SENTINEL not in _rendered(NODE_REMOTE, checks.values())
+
+
+def test_remote_probe_uses_construction_time_credentials_snapshot(settings, trust_key, probe):
+    _configure_node(settings)
+    provider = SyncDiagnosticProvider()
+    settings.LINUXLAB_SYNC_SECRET = "changed-after-construction"
+    settings.LINUXLAB_NODE_ID = "not-a-uuid"
+
+    _checks(provider, NODE_REMOTE)
+
+    assert probe.calls[0][0].secret == SECRET_SENTINEL
+
+
+def test_remote_diagnosis_makes_no_client_side_mutation(settings, trust_key, probe):
+    _configure_node(settings)
+    from linuxlab.sync.tests.test_retry_policy import _make_outbox as _make_in_flight
+
+    row = _make_in_flight(attempts=1)
+    before_outbox = list(OutboxMessage.objects.order_by("pk").values())
+    before_registrations = _registration_rows()
+    with (
+        patch("linuxlab.sync.outbox.claim_outbox_batch") as claim,
+        patch("linuxlab.sync.outbox.flush_outbox") as flush,
+        patch("linuxlab.sync.outbox.requeue_outbox_message") as requeue,
+    ):
+        _checks(SyncDiagnosticProvider(), NODE_REMOTE)
+    claim.assert_not_called()
+    flush.assert_not_called()
+    requeue.assert_not_called()
+    assert list(OutboxMessage.objects.order_by("pk").values()) == before_outbox
+    assert _registration_rows() == before_registrations
+    refreshed = OutboxMessage.objects.get(pk=row.pk)
+    assert (refreshed.attempts, refreshed.next_attempt_at, refreshed.first_failure_at) == (
+        row.attempts,
+        row.next_attempt_at,
+        row.first_failure_at,
+    )

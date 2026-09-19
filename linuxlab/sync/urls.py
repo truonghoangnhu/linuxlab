@@ -1,6 +1,6 @@
 from django.urls import path
 
-from linuxlab.sync.api import SyncEventsView
+from linuxlab.sync.api import SyncEventsView, SyncProbeView
 from linuxlab.sync.views import (
     ActivityLandingView,
     ActivityStartView,
@@ -36,4 +36,7 @@ urlpatterns = [
     ),
     path("learn/<uuid:source_public_id>/", LearnView.as_view(), name="learn"),
     path("api/v1/sync/events/", SyncEventsView.as_view(), name="sync-events"),
+    # Corrective B Task 11: dedicated read-only Central probe, beside the
+    # events route and ahead of wagtail's catch-all in the project urls.
+    path("api/v1/sync/probe/", SyncProbeView.as_view(), name="sync-probe"),
 ]

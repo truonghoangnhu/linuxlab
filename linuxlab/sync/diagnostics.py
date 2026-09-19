@@ -1,6 +1,8 @@
 """Sync's own diagnostic provider (Corrective B Task 10, approved spec
 §§4-6): the LOCAL checks TRUST_KEY, NODE_REGISTRATION and
-SYNC_RETRY_POLICY. Tasks 11/12 add the remote/release checks.
+SYNC_RETRY_POLICY; Corrective B Task 11 (spec §7) adds the REMOTE checks
+CENTRAL_CONNECTIVITY and CENTRAL_AUTH_ACCEPTANCE, Node-only, derived from
+exactly ONE probe_central() call per diagnosis. Task 12 adds RELEASE.
 
 Every relevant setting is read ONCE, into a private per-instance snapshot
 at construction (typed loader results and typed deferred failures kept as
@@ -35,6 +37,13 @@ from .configuration import (
     parse_sync_setting,
 )
 from .models import REGISTRATION_ACTIVE, NodeRegistration
+from .probe import (
+    AUTH_REJECTED,
+    CONFIG_INVALID,
+    PROBE_RESPONSE_INVALID,
+    PROBE_UNREACHABLE,
+    probe_central,
+)
 from .trust import PackageTrustConfigurationError, load_package_trusted_public_key
 
 _TRUST_KEY_INVALID = {"error_code": "TRUST_KEY_INVALID"}
@@ -43,6 +52,10 @@ _NODE_UNVERIFIED = {"authority_verified": False}
 _REGISTRATION_INVALID_CODE = "REGISTRATION_AUTHORITY_INVALID"
 _DB_UNAVAILABLE = {"error_code": "DB_UNAVAILABLE"}
 _ACTIVE_ROW_CHUNK = 200
+_REMOTE_CODES = frozenset({"CENTRAL_CONNECTIVITY", "CENTRAL_AUTH_ACCEPTANCE"})
+_PROBE_CONFIG_INVALID = {"error_code": CONFIG_INVALID}
+_PROBE_UNREACHABLE_DETAILS = {"error_code": PROBE_UNREACHABLE}
+_PROBE_FAILURE_CODES = frozenset({AUTH_REJECTED, PROBE_RESPONSE_INVALID})
 
 
 @dataclass(frozen=True)
@@ -53,6 +66,7 @@ class _SyncSettingsSnapshot:
     require_central_probe: bool | DeferredSyncSettingError
     identity: UUID | SyncConfigurationError
     worker: SyncConfiguration | SyncConfigurationError
+    probe: SyncConfiguration | SyncConfigurationError
 
 
 def _capture_snapshot(source) -> _SyncSettingsSnapshot:
@@ -71,7 +85,11 @@ def _capture_snapshot(source) -> _SyncSettingsSnapshot:
         worker = load_sync_configuration(settings_obj=source, purpose="worker")
     except SyncConfigurationError as exc:
         worker = exc
-    return _SyncSettingsSnapshot(enabled, require_probe, identity, worker)
+    try:
+        probe = load_sync_configuration(settings_obj=source, purpose="probe")
+    except SyncConfigurationError as exc:
+        probe = exc
+    return _SyncSettingsSnapshot(enabled, require_probe, identity, worker, probe)
 
 
 def _config_failure(setting_name: str, code: str) -> DiagnosticCheck:
@@ -87,7 +105,7 @@ def _config_failure(setting_name: str, code: str) -> DiagnosticCheck:
 
 
 class SyncDiagnosticProvider:
-    codes = frozenset({"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY"})
+    codes = frozenset({"TRUST_KEY", "NODE_REGISTRATION", "SYNC_RETRY_POLICY", *_REMOTE_CODES})
 
     def __init__(self):
         self._snapshot = _capture_snapshot(settings)
@@ -103,7 +121,10 @@ class SyncDiagnosticProvider:
                 required.add("NODE_REGISTRATION")
         elif context.profile == "node":
             enabled = self._snapshot.enabled
-            if enabled is True:
+            remote = context.mode == "remote"
+            # Spec §5: NODE_REGISTRATION and SYNC_RETRY_POLICY are required
+            # when outbound sync is enabled OR a remote probe is requested.
+            if enabled is True or remote:
                 required.update({"NODE_REGISTRATION", "SYNC_RETRY_POLICY"})
             elif isinstance(enabled, DeferredSyncSettingError):
                 # A malformed/deferred opt-in is a required configuration
@@ -117,15 +138,29 @@ class SyncDiagnosticProvider:
                 # NOT infer outbound sync, so NODE_REGISTRATION stays as
                 # decided by the typed enabled value above.
                 required.add("SYNC_RETRY_POLICY")
+            if remote:
+                # Task 11: explicit REMOTE request, Node only. Central
+                # never owns the remote checks (the command rejects
+                # Central REMOTE before any provider runs).
+                required.update(_REMOTE_CODES)
         return frozenset(required)
 
     def checks(self, context: DiagnosticContext) -> tuple[DiagnosticCheck, ...]:
+        required = self.required_codes(context)
+        # Task 11: at most ONE probe per diagnosis, shared by both remote
+        # checks -- never one call for connectivity and another for auth,
+        # and never any call when the remote codes are not required.
+        probe_result = self._probe_once() if required & _REMOTE_CODES else None
         handlers = {
             "TRUST_KEY": self._check_trust_key,
             "NODE_REGISTRATION": self._check_node_registration,
             "SYNC_RETRY_POLICY": self._check_sync_retry_policy,
+            "CENTRAL_CONNECTIVITY": lambda ctx: self._check_central_connectivity(probe_result),
+            "CENTRAL_AUTH_ACCEPTANCE": lambda ctx: self._check_central_auth_acceptance(
+                probe_result
+            ),
         }
-        return tuple(handlers[code](context) for code in sorted(self.required_codes(context)))
+        return tuple(handlers[code](context) for code in sorted(required))
 
     # -- TRUST_KEY -----------------------------------------------------------
 
@@ -214,7 +249,6 @@ class SyncDiagnosticProvider:
     # -- SYNC_RETRY_POLICY ---------------------------------------------------
 
     def _check_sync_retry_policy(self, context: DiagnosticContext) -> DiagnosticCheck:
-        del context
         snapshot = self._snapshot
         if isinstance(snapshot.enabled, DeferredSyncSettingError):
             return _config_failure(snapshot.enabled.setting_name, snapshot.enabled.code)
@@ -228,6 +262,80 @@ class SyncDiagnosticProvider:
             )
         if snapshot.enabled is True and isinstance(snapshot.worker, SyncConfigurationError):
             return _config_failure(snapshot.worker.setting_name, snapshot.worker.code)
+        if context.mode == "remote" and isinstance(snapshot.probe, SyncConfigurationError):
+            # Task 11 (spec §5): a remote probe does not require outbound
+            # sync to be enabled, but its credentials/URL must still be
+            # valid typed configuration -- URL/credential failures belong
+            # to SYNC_RETRY_POLICY, never to NODE_REGISTRATION.
+            return _config_failure(snapshot.probe.setting_name, snapshot.probe.code)
         return DiagnosticCheck(
             "SYNC_RETRY_POLICY", "PASS", "Sync retry policy and worker prerequisites are valid."
         )
+
+    # -- REMOTE: CENTRAL_CONNECTIVITY / CENTRAL_AUTH_ACCEPTANCE (Task 11) ----
+
+    def _probe_once(self):
+        """None when the typed probe configuration is unusable (both remote
+        checks then FAIL with CONFIG_INVALID and no network call is made);
+        otherwise the single CentralProbeResult for this diagnosis."""
+        if isinstance(self._snapshot.probe, SyncConfigurationError):
+            return None
+        return probe_central(self._snapshot.probe.credentials)
+
+    @staticmethod
+    def _check_central_connectivity(result) -> DiagnosticCheck:
+        if result is None:
+            return DiagnosticCheck(
+                "CENTRAL_CONNECTIVITY",
+                "FAIL",
+                "Local probe configuration is missing or invalid; no Central probe was attempted.",
+                _PROBE_CONFIG_INVALID,
+            )
+        if result.reachable:
+            details = {"http_status": result.http_status} if result.http_status is not None else {}
+            return DiagnosticCheck(
+                "CENTRAL_CONNECTIVITY", "PASS", "Central sync probe endpoint is reachable.", details
+            )
+        return DiagnosticCheck(
+            "CENTRAL_CONNECTIVITY",
+            "FAIL",
+            "Central could not be reached (network, DNS, TLS or timeout failure).",
+            _PROBE_UNREACHABLE_DETAILS,
+        )
+
+    @staticmethod
+    def _check_central_auth_acceptance(result) -> DiagnosticCheck:
+        if result is None:
+            return DiagnosticCheck(
+                "CENTRAL_AUTH_ACCEPTANCE",
+                "FAIL",
+                "Local probe configuration is missing or invalid; no Central probe was attempted.",
+                _PROBE_CONFIG_INVALID,
+            )
+        if result.accepted:
+            return DiagnosticCheck(
+                "CENTRAL_AUTH_ACCEPTANCE",
+                "PASS",
+                "Central accepted the provisioned Node credential.",
+                {"http_status": 200},
+            )
+        if not result.reachable:
+            return DiagnosticCheck(
+                "CENTRAL_AUTH_ACCEPTANCE",
+                "FAIL",
+                "Central credential acceptance could not be established: Central could not "
+                "be reached.",
+                _PROBE_UNREACHABLE_DETAILS,
+            )
+        # Reachable but not accepted: a rejection (401/403) or a response
+        # that cannot prove acceptance. Neither infers whether or in what
+        # state a registration exists on Central.
+        code = result.error_code if result.error_code in _PROBE_FAILURE_CODES else PROBE_RESPONSE_INVALID
+        details = {"error_code": code}
+        if result.http_status is not None:
+            details["http_status"] = result.http_status
+        if code == AUTH_REJECTED:
+            message = "Central rejected the provisioned Node credential."
+        else:
+            message = "Central's probe response could not prove credential acceptance."
+        return DiagnosticCheck("CENTRAL_AUTH_ACCEPTANCE", "FAIL", message, details)

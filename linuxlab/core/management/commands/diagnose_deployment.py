@@ -3,10 +3,12 @@ command adapter over core's canonical diagnostics (approved spec §5).
 
     manage.py diagnose_deployment [--mode local|remote|release] [--format text|json]
 
-Defaults: --mode local --format text. Task 10 enables LOCAL only; REMOTE
-(Task 11) and RELEASE (Task 12) are rejected with a fixed safe nonzero
-CommandError BEFORE any check, claim, write or network call -- never
-silently downgraded to LOCAL. Normal Django --settings selects the
+Defaults: --mode local --format text. Task 10 enables LOCAL; Task 11
+enables REMOTE for the node profile only (Central REMOTE is rejected
+before any provider, configuration load or network call); RELEASE
+(Task 12) is still rejected with a fixed safe nonzero CommandError
+BEFORE any check, claim, write or network call -- never silently
+downgraded to LOCAL or mapped to REMOTE. Normal Django --settings selects the
 deployment: there is no --profile spoof, --skip-check, --no-remote,
 --force, policy override, key-path override or remediation flag.
 
@@ -32,8 +34,9 @@ from linuxlab.core.diagnostics import (
     report_to_json,
 )
 
-_AVAILABLE_MODES = frozenset({"local"})
+_AVAILABLE_MODES = frozenset({"local", "remote"})
 _MODE_UNAVAILABLE = "diagnostic mode is not available in this release"
+_REMOTE_NODE_ONLY = "remote diagnostics are available only on the node profile"
 _REPORT_INVALID = "deployment diagnostics could not produce a valid report"
 _REPORT_FAILED = "deployment diagnostics reported FAIL"
 
@@ -87,6 +90,13 @@ class Command(BaseCommand):
 
         try:
             context = build_diagnostic_context(mode)
+        except DiagnosticContractError:
+            raise CommandError(_REPORT_INVALID, returncode=2) from None
+        if mode == "remote" and context.profile != "node":
+            # Task 11: Central refuses REMOTE before any provider check,
+            # probe configuration load, probe client or network call.
+            raise CommandError(_REMOTE_NODE_ONLY, returncode=2)
+        try:
             report = diagnose_deployment(context)
         except DiagnosticContractError:
             raise CommandError(_REPORT_INVALID, returncode=2) from None

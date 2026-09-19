@@ -33,6 +33,7 @@ from linuxlab.sync.models import (
     OutboxMessage,
     _insert_immutable_row,
 )
+from linuxlab.sync.probe import CentralProbeResult
 from linuxlab.sync.transports import _TRANSPORT_OPENER
 
 # Captured at import time, before any fixture runs, so the teardown-proof
@@ -401,15 +402,18 @@ def test_database_failure_fails_both_core_checks_via_command(node_local):
 # --- unavailable modes / invalid invocation ---------------------------------
 
 
-@pytest.mark.parametrize("mode", ["remote", "release"])
-def test_remote_and_release_are_rejected_before_any_check(node_local, monkeypatch, mode):
+def test_release_is_rejected_before_any_check(node_local, monkeypatch):
+    # Task 12 owns RELEASE: still rejected exactly as before, never mapped
+    # to REMOTE or LOCAL.
     with (
         patch("linuxlab.core.management.commands.diagnose_deployment.diagnose_deployment") as run,
         patch("linuxlab.core.management.commands.diagnose_deployment.build_diagnostic_context") as ctx,
+        patch("linuxlab.sync.diagnostics.probe_central") as probe,
     ):
-        stdout, _stderr, error = _run_expecting_failure("--mode", mode, "--format", "json")
+        stdout, _stderr, error = _run_expecting_failure("--mode", "release", "--format", "json")
     run.assert_not_called()
     ctx.assert_not_called()
+    probe.assert_not_called()
     assert stdout == ""
     assert error.returncode == 2
     assert str(error) == "diagnostic mode is not available in this release"
@@ -456,6 +460,14 @@ class _ExplodingProvider:
 
     def checks(self, context):
         raise RuntimeError(RAW_BODY_SENTINEL)
+
+
+class _ExplodingSigningProvider(_ExplodingProvider):
+    """Stands in for the real publication factory in a REAL registry
+    (Task 11: every one of the eight codes is now owned by a real
+    provider, so a fake must replace an owner rather than add a code)."""
+
+    codes = frozenset({"SIGNING_KEY"})
 
 
 def test_unexpected_provider_failure_is_contained_in_command_output(
@@ -562,7 +574,9 @@ def test_sentinels_never_leak_through_any_output_channel(
     trust_path.write_bytes(b"TRUST_PEM_SENTINEL")
     monkeypatch.setattr("linuxlab.sync.trust._TRUST_ANCHOR_PATH", trust_path)
     real_factories = dict(d._factories)
-    monkeypatch.setattr(d, "_factories", {**real_factories, "zz_fake": _ExplodingProvider})
+    monkeypatch.setattr(
+        d, "_factories", {**real_factories, "publication": _ExplodingSigningProvider}
+    )
 
     stdout, stderr, error = _run_expecting_failure("--format", "json")
     text_stdout, text_stderr, text_error = _run_expecting_failure("--format", "text")
@@ -699,3 +713,122 @@ def test_network_poison_is_still_effective_for_the_transport_opener(monkeypatch)
     _poison_network(monkeypatch)
     with pytest.raises(AssertionError, match="never call Central"):
         _TRANSPORT_OPENER.open("https://central.example.org/api/v1/sync/events/")
+
+
+# --- Corrective B Task 11: REMOTE mode (Node only) ---------------------------
+
+
+_ACCEPTED_PROBE = CentralProbeResult(reachable=True, accepted=True, http_status=200)
+_UNREACHABLE_PROBE = CentralProbeResult(
+    reachable=False, accepted=False, error_code="PROBE_UNREACHABLE"
+)
+
+
+class _ProbeSpy:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, credentials, *, opener=None):
+        self.calls.append(credentials)
+        return self.result
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    spy = _ProbeSpy(_ACCEPTED_PROBE)
+    monkeypatch.setattr("linuxlab.sync.diagnostics.probe_central", spy)
+    return spy
+
+
+def test_node_remote_json_reports_both_remote_checks_and_keeps_local_warn(node_local, probe):
+    before = _persistent_rows()
+
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        spies = [
+            stack.enter_context(patch(target, side_effect=AssertionError("mutation")))
+            for target in _MUTATION_TARGETS
+        ]
+        stdout, stderr = _run("--mode", "remote", "--format", "json")
+
+    for spy in spies:
+        spy.assert_not_called()
+    report = _json_report(stdout)
+    checks = {c["code"]: c for c in report["checks"]}
+    assert report["mode"] == "remote"
+    assert set(checks) == {
+        "DB_CONNECTIVITY",
+        "SCHEMA_STATE",
+        "TRUST_KEY",
+        "NODE_REGISTRATION",
+        "SYNC_RETRY_POLICY",
+        "CENTRAL_CONNECTIVITY",
+        "CENTRAL_AUTH_ACCEPTANCE",
+    }
+    assert checks["CENTRAL_CONNECTIVITY"]["status"] == "PASS"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["status"] == "PASS"
+    assert checks["NODE_REGISTRATION"]["status"] == "WARN"
+    assert checks["NODE_REGISTRATION"]["details"]["authority_verified"] is False
+    assert report["overall_status"] == "WARN"
+    assert stderr == ""
+    assert len(probe.calls) == 1
+    assert NODE_SECRET_SENTINEL not in stdout
+    assert _persistent_rows() == before
+
+
+def test_node_remote_text_renders_the_same_remote_report(node_local, probe):
+    json_stdout, _ = _run("--mode", "remote", "--format", "json")
+    text_stdout, _ = _run("--mode", "remote", "--format", "text")
+    report = _json_report(json_stdout)
+    header, text_checks = _parse_text(text_stdout)
+    assert header["mode"] == "remote"
+    assert text_checks == {c["code"]: c for c in report["checks"]}
+    assert len(probe.calls) == 2  # exactly one probe per command invocation
+
+
+def test_node_remote_unreachable_central_emits_report_then_returncode_1(node_local, probe):
+    probe.result = _UNREACHABLE_PROBE
+    before = _persistent_rows()
+
+    stdout, _stderr, error = _run_expecting_failure("--mode", "remote", "--format", "json")
+
+    checks = {c["code"]: c for c in _json_report(stdout)["checks"]}
+    assert checks["CENTRAL_CONNECTIVITY"]["status"] == "FAIL"
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["status"] == "FAIL"
+    assert error.returncode == 1
+    assert _persistent_rows() == before
+
+
+def test_node_remote_missing_probe_config_fails_both_with_zero_network(node_local, settings, probe):
+    settings.LINUXLAB_SYNC_ENABLED = False
+    settings.LINUXLAB_CENTRAL_URL = None
+
+    stdout, _stderr, error = _run_expecting_failure("--mode", "remote", "--format", "json")
+
+    checks = {c["code"]: c for c in _json_report(stdout)["checks"]}
+    assert checks["CENTRAL_CONNECTIVITY"]["details"] == {"error_code": "CONFIG_INVALID"}
+    assert checks["CENTRAL_AUTH_ACCEPTANCE"]["details"] == {"error_code": "CONFIG_INVALID"}
+    assert error.returncode == 1
+    assert probe.calls == []
+
+
+def test_central_remote_is_rejected_before_any_check_or_network(central_local, probe):
+    with (
+        patch("linuxlab.core.management.commands.diagnose_deployment.diagnose_deployment") as run,
+        patch("linuxlab.sync.configuration.load_sync_configuration") as config,
+    ):
+        stdout, _stderr, error = _run_expecting_failure("--mode", "remote", "--format", "json")
+    run.assert_not_called()
+    config.assert_not_called()
+    assert probe.calls == []
+    assert stdout == ""
+    assert error.returncode == 2
+    assert str(error) == "remote diagnostics are available only on the node profile"
+
+
+def test_local_mode_still_never_probes(node_local, probe):
+    stdout, _ = _run("--mode", "local", "--format", "json")
+    assert "CENTRAL_CONNECTIVITY" not in {c["code"] for c in _json_report(stdout)["checks"]}
+    assert probe.calls == []
