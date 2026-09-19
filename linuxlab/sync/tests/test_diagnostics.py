@@ -4,6 +4,7 @@ Private per-instance settings snapshot; Central registration inventory
 semantics; Node local credential evidence is WARN/authority_verified=false;
 typed configuration authority; zero network; zero mutation."""
 
+import urllib.request
 import uuid
 from unittest.mock import patch
 
@@ -25,6 +26,9 @@ from linuxlab.sync.models import (
     OutboxMessage,
     _insert_immutable_row,
 )
+from linuxlab.sync.transports import _TRANSPORT_OPENER
+
+_ORIGINAL_OPENER_OPEN = urllib.request.OpenerDirector.open
 
 pytestmark = pytest.mark.django_db
 
@@ -53,12 +57,17 @@ CENTRAL_NO_RECEIVE = DiagnosticContext("central", "local", frozenset({"LINUXLAB_
 
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
+    """Zero-network poison via the CLASS method only: _TRANSPORT_OPENER
+    resolves `.open` through OpenerDirector, so no instance-level patch is
+    layered on top (Fix Round 1, T10-I2 -- that layering restored a
+    poisoned bound method as an instance shadow attribute after teardown)."""
+
     def _forbidden(*args, **kwargs):
         raise AssertionError("LOCAL diagnostics must never call Central")
 
+    assert "open" not in vars(_TRANSPORT_OPENER)
     monkeypatch.setattr("urllib.request.OpenerDirector.open", _forbidden)
     monkeypatch.setattr("urllib.request.urlopen", _forbidden)
-    monkeypatch.setattr("linuxlab.sync.transports._TRANSPORT_OPENER.open", _forbidden)
 
 
 @pytest.fixture
@@ -307,6 +316,55 @@ def test_malformed_or_deferred_enabled_is_a_configuration_fail_not_truthiness(
     assert CONFIG_SENTINEL not in _rendered(NODE_FULL, checks.values())
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["maybe", CONFIG_SENTINEL, DeferredSyncSettingError(
+        "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE", "INVALID_VALUE"
+    )],
+)
+def test_disabled_node_with_malformed_require_probe_still_fails_retry_policy(
+    settings, trust_key, value
+):
+    # Fix Round 1 (T10-I1): a malformed Node release-probe policy is itself
+    # invalid configuration and selects SYNC_RETRY_POLICY even while
+    # outbound sync is typed False -- it can never silently disappear (or
+    # become false). NODE_REGISTRATION is NOT inferred from it.
+    _configure_node(
+        settings,
+        LINUXLAB_SYNC_ENABLED=False,
+        LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=value,
+        # Irrelevant disabled-worker prerequisites deliberately absent: the
+        # failure must come from the typed policy error itself.
+        LINUXLAB_CAN_RUN_SYNC_WORKER=False,
+        LINUXLAB_SYNC_SECRET=None,
+        LINUXLAB_CENTRAL_URL=None,
+    )
+    provider = SyncDiagnosticProvider()
+
+    required = provider.required_codes(NODE_FULL)
+
+    assert "SYNC_RETRY_POLICY" in required
+    assert "NODE_REGISTRATION" not in required
+    checks = _checks(provider, NODE_FULL)
+    check = checks["SYNC_RETRY_POLICY"]
+    assert check.status == "FAIL"
+    assert check.details["error_code"] == "SYNC_CONFIG_INVALID_VALUE"
+    assert "LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE" in check.message
+    rendered = _rendered(NODE_FULL, checks.values())
+    assert CONFIG_SENTINEL not in rendered
+    assert "maybe" not in rendered
+    assert "NODE_REGISTRATION" not in checks
+
+
+def test_disabled_node_with_valid_require_probe_omits_retry_policy(settings, trust_key):
+    _configure_node(
+        settings, LINUXLAB_SYNC_ENABLED=False, LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE=True
+    )
+    provider = SyncDiagnosticProvider()
+    assert provider.required_codes(NODE_FULL) == frozenset({"TRUST_KEY"})
+    assert set(_checks(provider, NODE_FULL)) == {"TRUST_KEY"}
+
+
 def test_retry_policy_check_performs_no_claim_flush_or_requeue(settings, trust_key):
     _configure_node(settings)
     with (
@@ -473,3 +531,15 @@ def test_central_registration_check_never_mutates_or_provisions(settings):
     rotate.assert_not_called()
     revoke.assert_not_called()
     assert _registration_rows() == before
+
+
+# --- Fix Round 1 (T10-I2): teardown proof, runs last in file order ---------
+
+
+def test_network_poison_is_effective_and_leaves_no_instance_shadow():
+    # Inside this test the autouse poison is active through the class...
+    with pytest.raises(AssertionError, match="never call Central"):
+        _TRANSPORT_OPENER.open("https://central.example.org/api/v1/sync/events/")
+    # ...and no earlier test in this module left an instance shadow behind.
+    assert "open" not in vars(_TRANSPORT_OPENER)
+    assert urllib.request.OpenerDirector.open is not _ORIGINAL_OPENER_OPEN  # patched now

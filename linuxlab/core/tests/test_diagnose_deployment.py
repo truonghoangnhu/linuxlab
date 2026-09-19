@@ -5,6 +5,7 @@ mutation, and JSON stdout is exactly one canonical report."""
 
 import io
 import json
+import urllib.request
 import uuid
 from unittest.mock import patch
 
@@ -32,6 +33,12 @@ from linuxlab.sync.models import (
     OutboxMessage,
     _insert_immutable_row,
 )
+from linuxlab.sync.transports import _TRANSPORT_OPENER
+
+# Captured at import time, before any fixture runs, so the teardown-proof
+# test at the end of this module can compare against the real originals.
+_ORIGINAL_OPENER_OPEN = urllib.request.OpenerDirector.open
+_ORIGINAL_URLOPEN = urllib.request.urlopen
 
 pytestmark = pytest.mark.django_db
 
@@ -46,12 +53,20 @@ def _write_trust_key(tmp_path):
 
 
 def _poison_network(monkeypatch):
+    """Zero-network poison. Patching the CLASS method OpenerDirector.open is
+    what every opener instance -- including the transport's private
+    _TRANSPORT_OPENER -- resolves `.open` through, so the instance is never
+    patched separately (Fix Round 1, T10-I2): an instance-level monkeypatch
+    layered over the class patch would record the already-poisoned bound
+    method as its "original" and restore it as an instance shadow attribute
+    that outlives the test."""
+
     def _forbidden(*args, **kwargs):
         raise AssertionError("LOCAL diagnostics must never call Central")
 
+    assert "open" not in vars(_TRANSPORT_OPENER)
     monkeypatch.setattr("urllib.request.OpenerDirector.open", _forbidden)
     monkeypatch.setattr("urllib.request.urlopen", _forbidden)
-    monkeypatch.setattr("linuxlab.sync.transports._TRANSPORT_OPENER.open", _forbidden)
 
 
 def _persistent_rows():
@@ -248,6 +263,35 @@ def test_central_never_reports_node_sync_policy(central_local, settings):
     assert "SYNC_RETRY_POLICY" not in {c["code"] for c in report["checks"]}
     assert report["overall_status"] == "PASS"
     assert CONFIG_SENTINEL not in stdout
+
+
+def test_disabled_node_with_malformed_require_probe_never_passes(node_local, settings):
+    # Fix Round 1 (T10-I1): outbound sync typed False, but the Node release-
+    # probe policy is malformed -- with healthy core diagnostics this must
+    # still be a policy FAIL, never a silent PASS, and NODE_REGISTRATION is
+    # not inferred from it.
+    settings.LINUXLAB_SYNC_ENABLED = False
+    settings.LINUXLAB_REQUIRE_CENTRAL_PROBE_FOR_RELEASE = CONFIG_SENTINEL
+    settings.LINUXLAB_SYNC_SECRET = None
+    settings.LINUXLAB_CENTRAL_URL = None
+    settings.LINUXLAB_CAN_RUN_SYNC_WORKER = False
+    before = _persistent_rows()
+
+    stdout, stderr, error = _run_expecting_failure("--mode", "local", "--format", "json")
+
+    report = _json_report(stdout)
+    checks = {c["code"]: c for c in report["checks"]}
+    assert checks["DB_CONNECTIVITY"]["status"] == "PASS"
+    assert checks["SCHEMA_STATE"]["status"] == "PASS"
+    assert checks["SYNC_RETRY_POLICY"]["status"] == "FAIL"
+    assert checks["SYNC_RETRY_POLICY"]["details"]["error_code"] == "SYNC_CONFIG_INVALID_VALUE"
+    assert "NODE_REGISTRATION" not in checks
+    assert report["overall_status"] == "FAIL"
+    assert error.returncode == 1
+    everything = stdout + stderr + str(error)
+    assert CONFIG_SENTINEL not in everything
+    assert "Traceback" not in everything
+    assert _persistent_rows() == before
 
 
 # --- defaults, JSON contract, text/JSON semantic equality -------------------
@@ -639,3 +683,19 @@ def test_report_stays_within_contract_limits_for_a_large_inventory(central_local
         assert len(json.dumps(check["details"]).encode("utf-8")) <= 4096
     registration = {c["code"]: c for c in report["checks"]}["NODE_REGISTRATION"]
     assert registration["details"] == {"node_count": 40, "invalid_count": 0}
+
+
+# --- Fix Round 1 (T10-I2): fixture teardown leaves global state exact -------
+# Runs last in this module (file order), after every fixture-using test.
+
+
+def test_network_poison_fixture_leaves_no_opener_state_behind():
+    assert "open" not in vars(_TRANSPORT_OPENER)
+    assert urllib.request.OpenerDirector.open is _ORIGINAL_OPENER_OPEN
+    assert urllib.request.urlopen is _ORIGINAL_URLOPEN
+
+
+def test_network_poison_is_still_effective_for_the_transport_opener(monkeypatch):
+    _poison_network(monkeypatch)
+    with pytest.raises(AssertionError, match="never call Central"):
+        _TRANSPORT_OPENER.open("https://central.example.org/api/v1/sync/events/")

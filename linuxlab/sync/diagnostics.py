@@ -109,6 +109,14 @@ class SyncDiagnosticProvider:
                 # A malformed/deferred opt-in is a required configuration
                 # FAIL -- never truthiness-based enablement or silent false.
                 required.add("SYNC_RETRY_POLICY")
+            if isinstance(self._snapshot.require_central_probe, DeferredSyncSettingError):
+                # Fix Round 1 (T10-I1): a malformed Node release-probe policy
+                # is itself invalid configuration and selects
+                # SYNC_RETRY_POLICY even while outbound sync is typed False;
+                # it can never silently disappear or become false. It does
+                # NOT infer outbound sync, so NODE_REGISTRATION stays as
+                # decided by the typed enabled value above.
+                required.add("SYNC_RETRY_POLICY")
         return frozenset(required)
 
     def checks(self, context: DiagnosticContext) -> tuple[DiagnosticCheck, ...]:
@@ -210,12 +218,16 @@ class SyncDiagnosticProvider:
         snapshot = self._snapshot
         if isinstance(snapshot.enabled, DeferredSyncSettingError):
             return _config_failure(snapshot.enabled.setting_name, snapshot.enabled.code)
-        if isinstance(snapshot.worker, SyncConfigurationError):
-            return _config_failure(snapshot.worker.setting_name, snapshot.worker.code)
         if isinstance(snapshot.require_central_probe, DeferredSyncSettingError):
+            # The typed policy error itself -- evaluated before, and
+            # independently of, worker prerequisites, so a disabled Node
+            # never fails on an absent secret/URL/worker capability that is
+            # irrelevant while outbound sync is off (Fix Round 1, T10-I1).
             return _config_failure(
                 snapshot.require_central_probe.setting_name, snapshot.require_central_probe.code
             )
+        if snapshot.enabled is True and isinstance(snapshot.worker, SyncConfigurationError):
+            return _config_failure(snapshot.worker.setting_name, snapshot.worker.code)
         return DiagnosticCheck(
             "SYNC_RETRY_POLICY", "PASS", "Sync retry policy and worker prerequisites are valid."
         )
