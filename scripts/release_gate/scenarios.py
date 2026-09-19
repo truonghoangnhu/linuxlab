@@ -870,7 +870,7 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
 
     registration = run_action(restored_central_env, "find-node-registration", "--node-id", deployment.node_id)
     assert registration["found"] is True
-    assert registration["enabled"] is True
+    assert registration["state"] == "active"
 
     inbox = run_action(restored_central_env, "find-inbox-message", "--event-id", first_outbox["event_id"])
     assert inbox["found"] is True
@@ -982,7 +982,7 @@ def _restore_and_verify(deployment, authored, workspace, dumps, first, second):
         snapshot["found"] is True
         and snapshot["source_public_id"] == authored["source_public_id"]
         and registration["found"] is True
-        and registration["enabled"] is True
+        and registration["state"] == "active"
         and inbox["found"] is True
     )
     assert central_business_state_restored

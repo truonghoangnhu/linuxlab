@@ -30,6 +30,7 @@ build_default_question_registry()) every other runtime/service code path
 uses -- never a release-gate-only or test-only registry.
 """
 
+import uuid
 from dataclasses import dataclass
 
 from django.conf import settings
@@ -49,7 +50,12 @@ from linuxlab.assessment.services import (
 from linuxlab.content.models import LearningPathPage, LessonPage, ModulePage
 from linuxlab.publication.package import build_package as _build_package
 from linuxlab.publication.snapshots import publish_learning_path
-from linuxlab.sync.authentication import issue_node_registration
+from linuxlab.sync.authentication import (
+    NodeRegistrationError,
+    NodeRegistrationInvariantError,
+    get_active_node_registration,
+    issue_node_registration,
+)
 from linuxlab.sync.authentication import revoke_node_registration as _revoke_node_registration
 from linuxlab.sync.models import InboxMessage, InstalledPackage, OutboxMessage
 from linuxlab.sync.services import activate_package as _activate_package
@@ -209,13 +215,36 @@ def find_publication_snapshot(source_public_id, package_version):
     ).first()
 
 
-def find_node_registration(node_id):
-    """Central-only, READ-ONLY. Returns the exact NodeRegistration for
-    `node_id`, or None -- used to prove Node registration state survives
-    a backup/restore cycle."""
-    from linuxlab.sync.models import NodeRegistration
+def _node_uuid(node_id):
+    """Canonical registration selector at this adapter boundary
+    (Corrective B Task 13): the Task-5 services accept ONLY a
+    uuid.UUID, so a textual selector from cli.py argv is converted and
+    validated HERE, before any service call. A malformed value raises
+    ValueError (uuid.UUID's own, which never echoes the value) or
+    TypeError; nothing is ever inferred from message text."""
+    if isinstance(node_id, uuid.UUID):
+        return node_id
+    if isinstance(node_id, str):
+        return uuid.UUID(node_id)
+    raise TypeError("node_id must be a UUID or its canonical text form")
 
-    return NodeRegistration.objects.filter(node_id=node_id).first()
+
+def find_node_registration(node_id):
+    """Central-only, READ-ONLY. Returns the exactly-one ACTIVE
+    NodeRegistration for the logical `node_id` through the Task-5
+    authority (get_active_node_registration()), or None when that
+    logical node has zero ACTIVE authority (revoked, superseded-only,
+    unknown). The multiple-ACTIVE invariant failure propagates unchanged.
+    Never a first-row shortcut, never a direct registration query, never
+    newest/PK/timestamp selection -- separate E2E evidence, not
+    diagnostic remediation."""
+    selector = _node_uuid(node_id)
+    try:
+        return get_active_node_registration(selector)
+    except NodeRegistrationInvariantError:
+        raise
+    except NodeRegistrationError:
+        return None
 
 
 def find_inbox_message(event_id):
@@ -235,10 +264,14 @@ def count_inbox_messages(event_id):
 
 
 def revoke_node_credential(node_id):
-    """Central-only. Immediately disables a Node's registration through
-    the existing Task 14 public/domain service (revoke_node_registration())
-    -- used by the N2 invalid/revoked-credential negative scenario."""
-    _revoke_node_registration(node_id)
+    """Central-only. Immediately revokes a Node's ACTIVE registration
+    through the existing Task-5 public/domain service
+    (revoke_node_registration(node_id: UUID)) -- used by the N2
+    invalid/revoked-credential negative scenario. The selector is
+    converted/validated to the canonical UUID here, before the service
+    call (Corrective B Task 13); the service is never weakened to accept
+    text."""
+    _revoke_node_registration(_node_uuid(node_id))
 
 
 def verify_import_and_activate_package(package_bytes, trusted_public_key):

@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from linuxlab.core.release_diagnostics import ReleaseDiagnosticsError
 from scripts.release_gate.cleanup import remove_workspace, run_cleanup_actions
 from scripts.release_gate.database import (
     GateDatabaseNames,
@@ -29,8 +30,10 @@ from scripts.release_gate.database import (
     drop_database,
     run_migrations,
 )
+from scripts.release_gate.diagnostics import run_release_diagnostics
 from scripts.release_gate.environment import DatabaseAdminConnection, generate_run_id
 from scripts.release_gate.processes import (
+    StartupError,
     reserve_listener,
     start_gunicorn,
     stop_process,
@@ -97,6 +100,25 @@ def run_action(profile_env, *args, allow_failure=False, stdin_json=None):
     if result.returncode != 0 and not allow_failure:
         raise ActionError(f"cli.py action {action_name!r} failed (exit {result.returncode}): {payload}")
     return payload
+
+
+def _run_startup_release_diagnostics(profile_env, expected_profile, fixture_key_paths):
+    """Corrective B Task 13 (spec §8): one canonical RELEASE diagnosis of
+    a deployment profile during dual_deployment() STARTUP, through the
+    target-process bridge and the cleared Task-12 validator. A failure is
+    a StartupError with fixed text -- never the bridge's exception text,
+    a path, a secret or a report -- so the gate runner maps it to
+    STARTUP_FAILURE (exit 3) with cleanup precedence unchanged. This
+    never repairs fixtures or retries."""
+    try:
+        return run_release_diagnostics(
+            profile_env,
+            expected_profile=expected_profile,
+            repo_root=REPO_ROOT,
+            fixture_key_paths=fixture_key_paths,
+        )
+    except ReleaseDiagnosticsError:
+        raise StartupError(f"release diagnostics failed for {expected_profile}") from None
 
 
 def run_sync_worker_once(node_profile_env):
@@ -305,6 +327,19 @@ def dual_deployment(
                 )
             node = start_gunicorn(node_profile_env, node_listener, node_log_path)
             wait_ready(node, timeout_seconds=READY_TIMEOUT_SECONDS)
+
+        # Corrective B Task 13: after explicit fixture provisioning,
+        # migrations, key setup, credential issue and process start --
+        # and BEFORE yield -- each profile's canonical RELEASE diagnosis
+        # must pass through the cleared Task-12 validator, using only that
+        # profile's own isolated fixture key path (Central: signing key;
+        # Node: trust anchor). Runs unconditionally, including for a
+        # scenario that will deliberately stop Central later or that
+        # never starts the Node process (the Node database and profile
+        # environment exist regardless). No readiness/capability check
+        # ever repairs fixtures after a failure.
+        _run_startup_release_diagnostics(central_profile_env, "central", (private_key_path, None))
+        _run_startup_release_diagnostics(node_profile_env, "node", (None, public_key_path))
 
         # Kept as a local reference (not just yielded) so `finally` below
         # can stop whatever process this object's .central/.node fields

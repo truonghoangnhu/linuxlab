@@ -28,6 +28,7 @@ identifier/option only.
 import argparse
 import json
 import sys
+import uuid
 from pathlib import Path
 
 # Task 15 Tasks 7-10 corrective, Critical 2: subcommand names whose
@@ -38,7 +39,19 @@ from pathlib import Path
 # therefore never in a `ps`/procfs listing, a process-table dump, or
 # any diagnostic that walks argv). CLI argv carries only non-sensitive
 # identifiers/options for every subcommand, sensitive or not.
-_SENSITIVE_STDIN_COMMANDS = frozenset({"author-and-publish", "resend-outbox-message"})
+_SENSITIVE_STDIN_COMMANDS = frozenset(
+    {"author-and-publish", "resend-outbox-message", "diagnose-release"}
+)
+
+# Corrective B Task 13: the fixture-only release diagnostics child. Its
+# stdout is the canonical report the unmodified production command
+# writes itself, and its exit code is that command's own -- it BYPASSES
+# this module's ordinary JSON action wrapper (no last-line extraction,
+# no enclosing success/error payload, no swallowed CommandError
+# returncode). See _cmd_diagnose_release()/main().
+_RAW_OUTPUT_COMMANDS = frozenset({"diagnose-release"})
+_DIAGNOSE_RELEASE_FAILED = "diagnose-release: deployment diagnostics did not pass"
+_DIAGNOSE_RELEASE_ERROR = "diagnose-release: could not run deployment diagnostics"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -129,7 +142,7 @@ def _cmd_revoke_node_credential(args):
     from scripts.release_gate import actions
 
     actions.revoke_node_credential(args.node_id)
-    return {"revoked": True, "node_id": args.node_id}
+    return {"revoked": True, "node_id": str(uuid.UUID(args.node_id))}
 
 
 def _cmd_count_installed_packages(args):
@@ -172,7 +185,7 @@ def _cmd_find_node_registration(args):
     found = actions.find_node_registration(args.node_id)
     if found is None:
         return {"found": False}
-    return {"found": True, "node_id": str(found.node_id), "enabled": found.enabled}
+    return {"found": True, "node_id": str(found.node_id), "state": found.state}
 
 
 def _cmd_find_inbox_message(args):
@@ -281,6 +294,36 @@ def _cmd_find_progress(args):
     }
 
 
+def _cmd_diagnose_release(args) -> None:
+    """Fixture-only release diagnostics child (Corrective B Task 13). Reads
+    the harness's already-created isolated key paths from the sensitive
+    stdin channel, substitutes ONLY the fixed loader path attributes for
+    this short-lived test process (the same isolated loader-boundary
+    substitution scripts/tests/_package_operator_subprocess.py uses; the
+    production command itself accepts no alternate paths and imports no
+    script helper), then calls the real, unmodified command. Parses no
+    key material; generates nothing."""
+    del args
+    from django.core.management import call_command
+
+    sensitive = _read_sensitive_stdin()
+    signing_key_path = sensitive.get("signing_key_path")
+    trust_anchor_path = sensitive.get("trust_anchor_path")
+    for value in (signing_key_path, trust_anchor_path):
+        if value is not None and not isinstance(value, str):
+            raise TypeError("fixture key path must be a string")
+    if signing_key_path:
+        import linuxlab.publication.signing as signing_module
+
+        signing_module._SIGNING_KEY_PATH = Path(signing_key_path)
+    if trust_anchor_path:
+        import linuxlab.sync.trust as trust_module
+
+        trust_module._TRUST_ANCHOR_PATH = Path(trust_anchor_path)
+
+    call_command("diagnose_deployment", "--mode", "release", "--format", "json")
+
+
 def _cmd_resend_outbox_message(args):
     from scripts.release_gate import actions
 
@@ -380,12 +423,38 @@ def _build_parser():
     resend_outbox.add_argument("--node-id", required=True)
     resend_outbox.set_defaults(func=_cmd_resend_outbox_message)
 
+    diagnose_release = subparsers.add_parser("diagnose-release")
+    diagnose_release.set_defaults(func=_cmd_diagnose_release)
+
     return parser
+
+
+def _run_raw_output_command(args) -> int:
+    """diagnose-release: the production command owns stdout and the exit
+    code. A CommandError's own returncode propagates (1 for a valid FAIL
+    report already written to stdout, 2 for an invalid invocation); any
+    other failure is a fixed safe stderr line, never a traceback or path.
+    """
+    from django.core.management.base import CommandError
+
+    try:
+        _setup_django()
+        args.func(args)
+    except CommandError as exc:
+        print(_DIAGNOSE_RELEASE_FAILED, file=sys.stderr)
+        return exc.returncode if isinstance(exc.returncode, int) and exc.returncode else 1
+    except Exception:  # noqa: BLE001 -- fixed safe text only; no paths, keys or exception detail
+        print(_DIAGNOSE_RELEASE_ERROR, file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command in _RAW_OUTPUT_COMMANDS:
+        return _run_raw_output_command(args)
 
     try:
         _setup_django()

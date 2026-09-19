@@ -19,6 +19,8 @@ seven scenarios independently and in full.
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "scripts" / "phase1_release_gate.py"
 PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -172,3 +174,31 @@ def test_cli_final_containment_when_run_release_gate_itself_raises(monkeypatch, 
     assert sentinel not in output
     assert "Traceback" not in output
     assert "RuntimeError" not in output
+
+
+# --- Corrective B Task 13: no CLI switch can bypass or weaken canonical
+# release diagnostics (spec §5/§7: "No manual flag can disable this
+# production requirement"). ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--skip-diagnostics",
+        "--no-diagnostics",
+        "--require-central-probe=false",
+        "--skip-check=TRUST_KEY",
+        "--no-remote",
+    ],
+)
+def test_cli_rejects_release_diagnostics_override_flags(flag):
+    result = subprocess.run(
+        [str(PYTHON), str(CLI_PATH), flag],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr

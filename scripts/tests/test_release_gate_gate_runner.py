@@ -1504,3 +1504,103 @@ def test_scenario_stage_transitions_are_written_onto_the_shared_run_state(tmp_pa
         state, "router0001", "fake_scenario", scenario, tmp_path, _make_factory(), gate_runner.SecretRegistry()
     )
     assert observed_stage_during_body == [gate_runner.Stage.SCENARIO]
+
+
+# --- Corrective B Task 13: the REAL dual_deployment() runs canonical RELEASE
+# diagnostics for Central and Node during STARTUP (before yield); failure is
+# a StartupError (exit 3 mapping, cleanup precedence unchanged). ------------
+
+
+def _databases_matching(db_admin, run_id):
+    import psycopg
+
+    with psycopg.connect(
+        dbname="postgres", user=db_admin.user, password=db_admin.password, host=db_admin.host, port=db_admin.port
+    ) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT datname FROM pg_database WHERE datname LIKE %s", (f"%{run_id}%",))
+        return [row[0] for row in cursor.fetchall()]
+
+
+def test_real_dual_deployment_runs_release_diagnostics_for_both_profiles(tmp_path, monkeypatch):
+    from linuxlab.core.diagnostics import DiagnosticCheck, DiagnosticContext, aggregate_diagnostics
+    from scripts.release_gate import e2e_support
+
+    calls = []
+
+    def _spy(profile_env, *, expected_profile, repo_root, fixture_key_paths=None):
+        calls.append(
+            {
+                "expected_profile": expected_profile,
+                "settings": profile_env.get("DJANGO_SETTINGS_MODULE"),
+                "db": profile_env.get("POSTGRES_DB"),
+                "fixture": fixture_key_paths,
+            }
+        )
+        context = DiagnosticContext(expected_profile, "release", frozenset())
+        return aggregate_diagnostics(context, [DiagnosticCheck("DB_CONNECTIVITY", "PASS", "ok")])
+
+    monkeypatch.setattr(e2e_support, "run_release_diagnostics", _spy)
+
+    with e2e_support.dual_deployment(tmp_path) as deployment:
+        assert [c["expected_profile"] for c in calls] == ["central", "node"]
+
+    central, node = calls
+    assert central["settings"] == "linuxlab.settings.central"
+    assert central["db"] == deployment.gate_names.central
+    assert central["fixture"] == (deployment.private_key_path, None)
+    assert node["settings"] == "linuxlab.settings.node"
+    assert node["db"] == deployment.gate_names.node
+    assert node["fixture"] == (None, deployment.public_key_path)
+
+
+def test_real_dual_deployment_startup_release_failure_is_startup_error_with_cleanup(tmp_path, monkeypatch):
+    from linuxlab.core.release_diagnostics import ReleaseDiagnosticsError
+    from scripts.release_gate import e2e_support
+
+    sentinel = "STARTUP_RAW_SENTINEL_44b0"
+
+    def _failing(profile_env, *, expected_profile, repo_root, fixture_key_paths=None):
+        raise ReleaseDiagnosticsError(f"boom {sentinel}")
+
+    monkeypatch.setattr(e2e_support, "run_release_diagnostics", _failing)
+    run_id = "rstartupdiag01"
+    db_admin = e2e_support.db_admin_from_env()
+
+    with pytest.raises(StartupError) as caught, e2e_support.dual_deployment(tmp_path, run_id=run_id):
+        pytest.fail("the deployment must never be yielded when release diagnostics fail")
+
+    assert sentinel not in str(caught.value) + repr(caught.value)
+    assert caught.value.__cause__ is None
+    # Cleanup precedence intact: both ephemeral databases and the workspace are gone.
+    assert _databases_matching(db_admin, run_id) == []
+    assert not (tmp_path / f"gate-workspace-{run_id}").exists()
+
+
+def test_real_dual_deployment_release_check_runs_before_yield_even_when_node_not_started(tmp_path, monkeypatch):
+    from linuxlab.core.diagnostics import DiagnosticCheck, DiagnosticContext, aggregate_diagnostics
+    from scripts.release_gate import e2e_support
+
+    profiles = []
+
+    def _spy(profile_env, *, expected_profile, repo_root, fixture_key_paths=None):
+        profiles.append(expected_profile)
+        context = DiagnosticContext(expected_profile, "release", frozenset())
+        return aggregate_diagnostics(context, [DiagnosticCheck("DB_CONNECTIVITY", "PASS", "ok")])
+
+    monkeypatch.setattr(e2e_support, "run_release_diagnostics", _spy)
+    with e2e_support.dual_deployment(tmp_path, start_node=False):
+        assert profiles == ["central", "node"]
+
+
+def test_startup_release_failure_maps_to_exit_3_through_the_gate_runner(tmp_path):
+    """Stage mapping authority unchanged: a StartupError raised while
+    entering the deployment factory (exactly where dual_deployment() now
+    raises for a failed canonical release check) is STARTUP_FAILURE/3."""
+    result = _run(
+        repo_root=tmp_path,
+        dual_deployment_factory=_make_factory(
+            raise_on_enter=StartupError("release diagnostics failed for central")
+        ),
+    )
+    assert result.exit_code == 3
+    assert result.evidence.primary_failure["code"] == "StartupError"

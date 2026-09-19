@@ -322,3 +322,109 @@ def test_find_outbox_message_returns_the_real_row(settings):
     assert found is not None
     assert isinstance(found, OutboxMessage)
     assert found.event_id == outbox.event_id
+
+
+# --- Corrective B Task 13: registration evidence through the Task-5 ACTIVE
+# authority, and canonical UUID identity at the adapter boundary (N2) -------
+
+
+def _issue(settings):
+    settings.LINUXLAB_CAN_RECEIVE_SYNC_EVENTS = True
+    from linuxlab.sync.authentication import issue_node_registration
+
+    return issue_node_registration("Gate node")
+
+
+def test_find_node_registration_returns_the_exactly_one_active_row(settings):
+    credential = _issue(settings)
+    found = actions_module.find_node_registration(str(credential.node_id))
+    assert found is not None
+    assert found.node_id == credential.node_id
+    assert found.state == "active"
+
+
+def test_find_node_registration_returns_none_for_zero_active(settings):
+    from linuxlab.sync.authentication import revoke_node_registration
+
+    credential = _issue(settings)
+    revoke_node_registration(credential.node_id)
+    assert actions_module.find_node_registration(str(credential.node_id)) is None
+    assert actions_module.find_node_registration(str(uuid.uuid4())) is None
+
+
+def test_find_node_registration_propagates_the_multiple_active_invariant(settings, monkeypatch):
+    from linuxlab.sync.authentication import NodeRegistrationInvariantError
+
+    credential = _issue(settings)
+
+    def _invariant(node_id):
+        raise NodeRegistrationInvariantError("multiple active")
+
+    monkeypatch.setattr(actions_module, "get_active_node_registration", _invariant)
+    with pytest.raises(NodeRegistrationInvariantError):
+        actions_module.find_node_registration(str(credential.node_id))
+
+
+def test_find_node_registration_uses_the_active_authority_not_a_direct_query():
+    source = inspect.getsource(actions_module.find_node_registration)
+    assert "get_active_node_registration" in source
+    assert ".first()" not in source
+    assert "NodeRegistration.objects" not in source
+
+
+@pytest.mark.parametrize("as_text", [True, False])
+def test_revoke_adapter_passes_a_canonical_uuid_to_the_service(settings, monkeypatch, as_text):
+    credential = _issue(settings)
+    received = []
+
+    def _spy(node_id):
+        received.append(node_id)
+
+    monkeypatch.setattr(actions_module, "_revoke_node_registration", _spy)
+    selector = str(credential.node_id) if as_text else credential.node_id
+
+    actions_module.revoke_node_credential(selector)
+
+    assert received == [credential.node_id]
+    assert type(received[0]) is uuid.UUID
+
+
+def test_revoke_adapter_reaches_the_real_service_and_revokes(settings):
+    from linuxlab.sync.authentication import NodeAuthenticationError, authenticate_node
+    from linuxlab.sync.models import NodeRegistration
+
+    credential = _issue(settings)
+    actions_module.revoke_node_credential(str(credential.node_id))
+    assert NodeRegistration.objects.get(node_id=credential.node_id).state == "revoked"
+    with pytest.raises(NodeAuthenticationError):
+        authenticate_node(credential.node_id, credential.secret)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "not-a-uuid",
+        "'; DROP TABLE sync_noderegistration; --",
+        "$(id)",
+        "../../etc/passwd",
+        "0" * 40,
+        None,
+        12345,
+        b"e3b0c442-98fc-4c14-9af1-0e6d3b1a0f47",
+    ],
+)
+def test_revoke_and_find_adapters_reject_malformed_identifiers_before_the_service(
+    settings, monkeypatch, bad
+):
+    _issue(settings)
+    calls = []
+    monkeypatch.setattr(actions_module, "_revoke_node_registration", lambda node_id: calls.append(node_id))
+    monkeypatch.setattr(
+        actions_module, "get_active_node_registration", lambda node_id: calls.append(node_id)
+    )
+    with pytest.raises((ValueError, TypeError)):
+        actions_module.revoke_node_credential(bad)
+    with pytest.raises((ValueError, TypeError)):
+        actions_module.find_node_registration(bad)
+    assert calls == []
