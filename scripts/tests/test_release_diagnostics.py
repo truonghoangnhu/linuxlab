@@ -449,7 +449,8 @@ def _identity(path, pid):
     with open(path, "w") as handle:
         json.dump({"pid": pid, "pgid": os.getpgid(pid), "sid": os.getsid(pid)}, handle)
 resistant = mode in ("sigterm-resistant", "success-daemon")
-descendant_code = "import signal, time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if resistant else "") + "time.sleep(600)"
+transient = mode == "transient-descendant"
+descendant_code = "import signal, time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if resistant else "") + ("time.sleep(0.05)" if transient else "time.sleep(600)")
 descendant = subprocess.Popen([sys.executable, "-c", descendant_code])
 if resistant:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -461,6 +462,16 @@ elif mode == "stderr-overflow":
     sys.stderr.write("y" * 70000); sys.stderr.flush()
 elif mode == "nonzero":
     sys.exit(3)  # leaves the descendant running: production must clean it
+elif mode == "transient-descendant":
+    descendant.wait()  # the descendant is already gone before the report is written
+    sys.stdout.write(json.dumps({"schema_version": 1, "profile": "node", "mode": "release", "overall_status": "WARN", "checks": [
+        {"code": "DB_CONNECTIVITY", "status": "PASS", "message": "ok"},
+        {"code": "SCHEMA_STATE", "status": "PASS", "message": "ok"},
+        {"code": "TRUST_KEY", "status": "PASS", "message": "ok"},
+        {"code": "NODE_REGISTRATION", "status": "WARN", "message": "local", "details": {"authority_verified": False}},
+        {"code": "SYNC_RETRY_POLICY", "status": "PASS", "message": "ok"}]}))
+    sys.stdout.flush()
+    sys.exit(0)
 elif mode == "success-daemon":
     sys.stdout.write(json.dumps({"schema_version": 1, "profile": "node", "mode": "release", "overall_status": "WARN", "checks": [
         {"code": "DB_CONNECTIVITY", "status": "PASS", "message": "ok"},
@@ -733,4 +744,257 @@ def test_successful_real_command_is_not_killed_prematurely(node_target, sentinel
         fixture_key_paths=(None, node_target.trust_path),
     )
     assert report.overall_status == "WARN"
+    assert _alive(sentinel_process.pid)
+
+
+# --- Corrective (T13-C-I1-A, T13-C-I1-B): post-Popen ownership protection and
+# exception-proof, monotonic cleanup ------------------------------------------
+#
+# Every case below builds a REAL tree (supervisor -> inner child ->
+# descendant), injects a failure at exactly one setup/observation point, and
+# asserts production cleanup BEFORE any emergency cleanup.
+
+SETUP_SENTINEL = "SETUP_FAILURE_SENTINEL_6b2f"
+POLL_SENTINEL = "POLL_FAILURE_SENTINEL_9c41"
+WAIT_SENTINEL = "WAIT_FAILURE_SENTINEL_2ad8"
+SIGNAL_SENTINEL = "SIGNAL_FAILURE_SENTINEL_71ce"
+JOIN_SENTINEL = "JOIN_FAILURE_SENTINEL_5fd0"
+
+
+def _record_spawned(monkeypatch, *, sabotage_poll=False, sabotage_wait=False):
+    """Wrap the parent's Popen so the test knows every PID production
+    spawned, and optionally sabotage that instance's own observation
+    methods (never the whole class, never the process tree itself)."""
+    from scripts.release_gate import diagnostics
+
+    spawned: list = []
+    real_popen = diagnostics.subprocess.Popen
+
+    def _factory(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process.pid)
+        if sabotage_poll:
+            def _failing_poll():
+                raise RuntimeError(POLL_SENTINEL)
+
+            process.poll = _failing_poll
+        if sabotage_wait:
+            def _failing_wait(timeout=None):
+                raise RuntimeError(WAIT_SENTINEL)
+
+            process.wait = _failing_wait
+        return process
+
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", _factory)
+    return spawned
+
+
+def _assert_spawned_gone(spawned, *, sentinel_process, extra_pids=()):
+    """Assert BEFORE emergency cleanup: nothing production spawned (and
+    nothing it owned) is alive, and its process group is empty."""
+    from scripts.release_gate import diagnostics
+
+    pids = [*spawned, *extra_pids]
+    try:
+        for pid in spawned:
+            assert _wait_gone(pid, timeout=10.0), f"owned process {pid} survived"
+            assert not diagnostics._signal_group(pid, 0), f"owned group {pid} survived"
+        for pid in extra_pids:
+            assert _wait_gone(pid, timeout=10.0), f"owned descendant {pid} survived"
+        assert _alive(sentinel_process.pid)
+    except AssertionError:
+        _emergency_cleanup(*pids)
+        raise
+
+
+def test_event_construction_failure_after_spawn_leaves_no_survivor(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """T13-C-I1-A: the fallible setup that used to sit between a successful
+    Popen and the protected scope must never abandon a live tree."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+
+    def _failing_event():
+        raise RuntimeError(SETUP_SENTINEL)
+
+    monkeypatch.setattr(diagnostics.threading, "Event", _failing_event)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert time.monotonic() - started < 60
+    assert SETUP_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert str(caught.value) in {
+        "release diagnostics process supervision failed",
+        "release diagnostics target process could not be launched",
+    }
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_thread_constructor_failure_after_spawn_leaves_no_survivor(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """Thread construction genuinely requires the child's pipes, so it can
+    only happen after Popen: the protected scope must contain it."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+
+    class _BrokenThread:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(SETUP_SENTINEL)
+
+    monkeypatch.setattr(diagnostics.threading, "Thread", _BrokenThread)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert SETUP_SENTINEL not in str(caught.value) + repr(caught.value)
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_persistent_poll_failure_still_contains_the_tree(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """T13-C-I1-B: liveness observation is never a gate on termination."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch, sabotage_poll=True)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    # A persistently failing poll() means "cannot confirm exit" is treated
+    # as "still running" (never as a skip signal) -- the loop legitimately
+    # runs to its deadline and reports a genuine, contained timeout. Either
+    # fixed outcome is acceptable; what matters is containment and no leak.
+    assert str(caught.value) in {
+        "release diagnostics process supervision failed",
+        "release diagnostics target process timed out",
+    }
+    assert POLL_SENTINEL not in str(caught.value) + repr(caught.value)
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_reap_failure_does_not_abort_kill_escalation(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """T13-C-I1-B, mandatory case: a SIGTERM-resistant tree plus a wait/reap
+    failure during the grace path -- SIGKILL escalation must still happen."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch, sabotage_wait=True)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert time.monotonic() - started < 60
+    assert WAIT_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert str(caught.value) in {
+        "release diagnostics target process timed out",
+        "release diagnostics process supervision failed",
+        "release diagnostics target left stray processes",
+    }
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    assert extra, "the resistant inner tree never recorded itself"
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+
+
+def test_first_signal_error_does_not_prevent_later_cleanup(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """A single failed signal attempt must not abort the sequence: later,
+    stronger attempts still run and the tree is contained."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    real_killpg = diagnostics.os.killpg
+    calls: list = []
+
+    def _flaky_killpg(pgid, signum):
+        calls.append((pgid, signum))
+        if len(calls) == 1:
+            raise OSError(SIGNAL_SENTINEL)
+        return real_killpg(pgid, signum)
+
+    monkeypatch.setattr(diagnostics.os, "killpg", _flaky_killpg)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert SIGNAL_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert len(calls) > 1, "cleanup stopped at the first failed signal"
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_reader_join_failure_does_not_abort_containment(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+
+    class _UnjoinableThread(threading.Thread):
+        def join(self, timeout=None):
+            raise RuntimeError(JOIN_SENTINEL)
+
+    monkeypatch.setattr(diagnostics.threading, "Thread", _UnjoinableThread)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert JOIN_SENTINEL not in str(caught.value) + repr(caught.value)
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_transient_descendant_that_exits_does_not_fail_a_valid_report(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """Authority nuance: only a SURVIVING stray converts success into the
+    stray-process failure. A descendant that already exited leaves the
+    valid report intact."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "transient-descendant", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+
+    report = diagnostics.run_release_diagnostics(
+        node_target.env, expected_profile="node", repo_root=REPO_ROOT
+    )
+
+    assert report.overall_status == "WARN"
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_successful_command_leaves_no_reader_thread_or_owned_group(node_target, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    before = threading.active_count()
+    report = diagnostics.run_release_diagnostics(
+        node_target.env, expected_profile="node", repo_root=REPO_ROOT,
+        fixture_key_paths=(None, node_target.trust_path),
+    )
+    assert report.overall_status == "WARN"
+    deadline = time.monotonic() + 5
+    while threading.active_count() > before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= before
     assert _alive(sentinel_process.pid)

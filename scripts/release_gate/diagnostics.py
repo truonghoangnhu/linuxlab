@@ -152,10 +152,36 @@ def _signal_group(pgid: int, signum: int) -> bool:
     return True
 
 
+def _best_effort_poll_exited(process: subprocess.Popen) -> bool:
+    """True only when poll() SUCCEEDS and reports the process has exited.
+    A failing/lying poll() is treated as "not confirmed exited" (False),
+    the SAME as "still running" -- it is never used as a gate that could
+    SKIP termination; it only ever decides whether to loop again while
+    polling for the ordinary success/overflow path (T13-C-I1-B)."""
+    try:
+        return process.poll() is not None
+    except Exception:  # noqa: BLE001 -- observation failure, never a skip signal
+        return False
+
+
 def _reap(process: subprocess.Popen, timeout: float) -> None:
+    """Best-effort wait -- ANY exception (not just the expected
+    TimeoutExpired) is swallowed here: a failing/lying wait() must never
+    prevent whatever cleanup step runs next (T13-C-I1-B)."""
     try:
         process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except Exception:  # noqa: BLE001, S110 -- observation failure must never block cleanup
+        pass
+
+
+def _best_effort(step) -> None:
+    """Run one cleanup step; ANY exception it raises is swallowed so the
+    monotonic sequence of steps around it always continues to the next,
+    stronger step (T13-C-I1-B: a single signal/observation failure must
+    never abort escalation toward SIGKILL)."""
+    try:
+        step()
+    except Exception:  # noqa: BLE001, S110 -- see _best_effort's own docstring
         pass
 
 
@@ -163,17 +189,23 @@ def _terminate_owned_group(process: subprocess.Popen) -> None:
     """Parent-enforced termination of the group `process` leads (it was
     started with start_new_session=True): SIGTERM, bounded grace, then
     SIGKILL for whatever remains -- including a stopped, deadlocked or
-    signal-ignoring member -- then reap the direct child."""
-    _signal_group(process.pid, signal.SIGTERM)
+    signal-ignoring member -- then reap the direct child. Each step is
+    independently best-effort (T13-C-I1-B): termination is driven by the
+    already-known owned PGID, never gated on a successful poll/wait, so a
+    failure in any one step cannot prevent a later, stronger one."""
+    _best_effort(lambda: _signal_group(process.pid, signal.SIGTERM))
     _reap(process, _TERMINATION_GRACE_SECONDS)
-    _signal_group(process.pid, signal.SIGKILL)
+    _best_effort(lambda: _signal_group(process.pid, signal.SIGKILL))
     _reap(process, 10)
 
 
 def _sweep_owned_group(pgid: int) -> bool:
     """After the group leader has been reaped, SIGKILL any member still in
     the group and wait (bounded) until the group is empty. Returns True
-    when a survivor existed -- the caller must then fail closed."""
+    when a survivor existed -- the caller must then fail closed. A
+    signal-send failure here is fail-closed by _signal_group's own
+    contract (True), so a transient error still leads to another sweep
+    iteration rather than silently reporting an empty group."""
     survivors = _signal_group(pgid, signal.SIGKILL)
     deadline = time.monotonic() + _SWEEP_SECONDS
     remaining = survivors
@@ -185,11 +217,9 @@ def _sweep_owned_group(pgid: int) -> bool:
 
 def _terminate_direct_child(process: subprocess.Popen) -> None:
     """Inside the supervisor: the direct child is not a group leader (it
-    shares the supervisor's group), so kill and reap it alone."""
-    try:
-        process.kill()
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    shares the supervisor's group), so kill and reap it alone. Best
+    effort: a failing kill() must not skip the reap attempt."""
+    _best_effort(process.kill)
     _reap(process, 10)
 
 
@@ -197,12 +227,14 @@ def _courtesy_terminate_shared_group() -> None:
     """Inside the supervisor: ask every other member of our shared group
     (descendants of the finished child) to exit, with SIGTERM ignored for
     ourselves only for the instant it is sent. Best effort -- the parent's
-    SIGKILL sweep is the authoritative cleanup."""
-    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    SIGKILL sweep is the authoritative cleanup, so any failure here
+    (including restoring the handler) is swallowed."""
     try:
-        _signal_group(os.getpgid(0), signal.SIGTERM)
-    finally:
-        signal.signal(signal.SIGTERM, previous)
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except Exception:  # noqa: BLE001 -- best effort only
+        return
+    _best_effort(lambda: _signal_group(os.getpgid(0), signal.SIGTERM))
+    _best_effort(lambda: signal.signal(signal.SIGTERM, previous))
 
 
 def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> CommandOutcome:
@@ -224,6 +256,9 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
     reader creation/start, stdin, polling, an internal exception --
     passes through the same protected cleanup before returning/raising.
     """
+    # T13-C-I1-A: nothing fallible runs between a successful Popen and the
+    # protected scope below -- Popen itself is the ONLY statement outside
+    # it, because ownership (the PID/PGID) does not exist until it returns.
     try:
         process = subprocess.Popen(  # an argv list, never a shell string
             list(argv),
@@ -239,12 +274,12 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
 
     out_chunks: list = []
     err_chunks: list = []
-    overflow = threading.Event()
     readers: list = []
+    overflow = None
     timed_out = False
-    forced = False
     internal_failure = False
     try:
+        overflow = threading.Event()
         readers = [
             threading.Thread(target=_drain, args=(process.stdout, out_chunks, overflow), daemon=True),
             threading.Thread(target=_drain, args=(process.stderr, err_chunks, overflow), daemon=True),
@@ -257,21 +292,29 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
         except (BrokenPipeError, OSError):
             pass
         deadline = time.monotonic() + timeout_seconds
-        while process.poll() is None and not overflow.is_set():
+        while not overflow.is_set():
             if time.monotonic() >= deadline:
                 timed_out = True
                 break
+            if _best_effort_poll_exited(process):
+                break
             time.sleep(0.05)
-        forced = timed_out or overflow.is_set()
     except Exception:  # noqa: BLE001 -- any supervision failure is contained after cleanup
         internal_failure = True
     finally:
-        # Protected cleanup for EVERY exit path from here on. Group
-        # sweep / courtesy termination runs BEFORE the reader joins: a
-        # descendant that inherited the child's pipe ends keeps a reader
-        # blocked in read1() until it dies, and the main thread must never
-        # close a stream a reader is blocked on (BufferedReader lock).
-        if process.poll() is None or forced:
+        # Protected cleanup for EVERY exit path from here on, and it is
+        # driven by OWNERSHIP (we know we spawned `process`), never by a
+        # successful poll()/wait() observation (T13-C-I1-B) -- an abnormal
+        # completion (timeout, overflow, or an internal_failure above)
+        # always attempts full termination; a clean exit still runs the
+        # SAME best-effort reap/sweep so a process that raced past our
+        # poll is still contained. Group sweep / courtesy termination
+        # runs BEFORE the reader joins: a descendant that inherited the
+        # child's pipe ends keeps a reader blocked in read1() until it
+        # dies, and the main thread must never close a stream a reader is
+        # blocked on (BufferedReader lock).
+        forced = timed_out or internal_failure or (overflow is not None and overflow.is_set())
+        if forced or not _best_effort_poll_exited(process):
             if own_group:
                 _terminate_owned_group(process)
             else:
@@ -283,14 +326,13 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
             _courtesy_terminate_shared_group()
             stray = False
         for reader in readers:
-            if reader.ident is not None:  # only threads that actually started
-                reader.join(timeout=2)
+            _best_effort(lambda reader=reader: reader.join(timeout=2) if reader.ident is not None else None)
 
     if internal_failure:
         # The owned tree has already been cleaned up above; surface only the
         # fixed message, never the internal exception text.
         raise ReleaseDiagnosticsError(_MSG_SUPERVISION)
-    if overflow.is_set():
+    if overflow is not None and overflow.is_set():
         return CommandOutcome(process.returncode, b"", b"", overflow=True, stray_processes=stray)
     if timed_out:
         return CommandOutcome(process.returncode, b"", b"", timed_out=True, stray_processes=stray)
