@@ -164,14 +164,65 @@ def _best_effort_poll_exited(process: subprocess.Popen) -> bool:
         return False
 
 
-def _reap(process: subprocess.Popen, timeout: float) -> None:
-    """Best-effort wait -- ANY exception (not just the expected
-    TimeoutExpired) is swallowed here: a failing/lying wait() must never
-    prevent whatever cleanup step runs next (T13-C-I1-B)."""
+def _reap(process: subprocess.Popen, timeout: float) -> bool:
+    """Bounded wait on the direct child. Returns True ONLY when Popen.wait()
+    itself confirmed the child reaped (or already reaped: wait() returns at
+    once when the return code is known); False when it timed out or raised
+    for any other reason. The failure is swallowed -- a failing/lying
+    wait() must never prevent the next cleanup step (T13-C-I1-B) -- but
+    it is never ERASED (T13-C-I1-B-R1): the caller records False, so a
+    reap that could not be confirmed always reaches finalization
+    accounting instead of looking like a clean return."""
     try:
         process.wait(timeout=timeout)
-    except Exception:  # noqa: BLE001, S110 -- observation failure must never block cleanup
-        pass
+    except Exception:  # noqa: BLE001 -- observation failure must never block cleanup
+        return False
+    return process.returncode is not None
+
+
+def _reap_directly(process: subprocess.Popen, deadline: float) -> bool:
+    """Independent POSIX fallback used only when Popen.wait() could not
+    confirm the reap: waitpid() on the EXACT direct-child PID (never -1,
+    never another child), non-blocking and polled until `deadline`.
+    ChildProcessError means no un-reaped child of ours with that PID
+    exists any more -- already reaped -- and counts as confirmed. A
+    successful reap records the return code in Popen's own convention
+    (exit status, or -signal) so later poll()/wait() calls stay coherent
+    and never touch the kernel for a PID that has been released. Any other
+    failure yields False; raw OSError detail stays internal."""
+    while True:
+        try:
+            waited, status = os.waitpid(process.pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        except Exception:  # noqa: BLE001 -- fallback failure is reported as False, never raised
+            return False
+        if waited == process.pid:
+            if process.returncode is None:
+                process.returncode = os.waitstatus_to_exitcode(status)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _reap_phase(process: subprocess.Popen) -> bool:
+    """One REAP PHASE of finalization (T13-C-I1-B-R1). Two separate facts:
+    (A) did the phase fail internally, (B) is the direct child ultimately
+    reaped. Returns True only when the primary reap (Popen.wait) confirmed
+    the child. Otherwise the independent waitpid fallback is attempted so
+    no zombie can outlive the bridge (fact B), but the phase STILL returns
+    False: the primary failure is fact A and finalization accounting must
+    record it -- a fallback that clears the zombie never restores success.
+    Called twice by `_run_command`: once after termination and once more as
+    the FINAL reap after the last operation that can end the child (the
+    residual sweep / last-resort kill), so a child that could only die
+    there is still reaped before the bridge returns."""
+    confirmed, _ok = _guard(lambda: _reap(process, 10), default=False)
+    if confirmed:
+        return True
+    _guard(lambda: _reap_directly(process, time.monotonic() + 10), default=False)
+    return False
 
 
 def _best_effort(step) -> None:
@@ -221,9 +272,9 @@ def _terminate_owned_group(process: subprocess.Popen) -> None:
     already-known owned PGID, never gated on a successful poll/wait, so a
     failure in any one step cannot prevent a later, stronger one."""
     _best_effort(lambda: _signal_group(process.pid, signal.SIGTERM))
-    _reap(process, _TERMINATION_GRACE_SECONDS)
+    _best_effort(lambda: _reap(process, _TERMINATION_GRACE_SECONDS))
     _best_effort(lambda: _signal_group(process.pid, signal.SIGKILL))
-    _reap(process, 10)
+    _best_effort(lambda: _reap(process, 10))
 
 
 def _sweep_owned_group(pgid: int) -> bool:
@@ -264,7 +315,7 @@ def _terminate_direct_child(process: subprocess.Popen) -> None:
     shares the supervisor's group), so kill and reap it alone. Best
     effort: a failing kill() must not skip the reap attempt."""
     _best_effort(process.kill)
-    _reap(process, 10)
+    _best_effort(lambda: _reap(process, 10))
 
 
 def _courtesy_terminate_shared_group() -> None:
@@ -372,8 +423,11 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
                 _, ok = _guard(lambda: _terminate_direct_child(process))
             finalization_ok = finalization_ok and ok
 
-        _, ok = _guard(lambda: _reap(process, 10))
-        finalization_ok = finalization_ok and ok
+        # Initial reap phase (T13-C-I1-B-R1): the result is a CONFIRMATION,
+        # never a bare "the helper returned" -- an unconfirmed reap is a
+        # finalization failure even if a fallback clears the zombie.
+        reaped, ok = _guard(lambda: _reap_phase(process), default=False)
+        finalization_ok = finalization_ok and ok and reaped
 
         if own_group:
             # Fail-closed default: if the sweep itself could not be
@@ -390,6 +444,14 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
             _, ok = _guard(_courtesy_terminate_shared_group)
             finalization_ok = finalization_ok and ok
             stray = False
+
+        # FINAL reap phase (T13-C-I1-B-R1): after the LAST operation that can
+        # terminate the direct child (sweep / last-resort kill) and before
+        # the reader joins, so the child never returns to the caller as a
+        # zombie. Accounting is monotonic: this phase can only keep or
+        # lower `finalization_ok`, never restore it.
+        reaped, ok = _guard(lambda: _reap_phase(process), default=False)
+        finalization_ok = finalization_ok and ok and reaped
 
         for reader in readers:
             _, ok = _guard(

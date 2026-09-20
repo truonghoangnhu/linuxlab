@@ -8,6 +8,7 @@ output. The canonical validator is never faked."""
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -19,6 +20,11 @@ from types import SimpleNamespace
 import pytest
 
 from linuxlab.core.release_diagnostics import ReleaseDiagnosticsError
+
+# The real Popen, captured at import: test observers must never run through a
+# test's own monkeypatched subprocess.Popen (which records/sabotages what
+# PRODUCTION spawns), or the observer would observe -- and reap -- itself.
+_REAL_POPEN = subprocess.Popen
 from scripts.release_gate.database import (
     GateDatabaseNames,
     create_database,
@@ -245,23 +251,44 @@ time.sleep(600)
 """
 
 
+def _process_state(pid):
+    """NON-REAPING observer: the ps STAT of `pid`, or None when the process
+    is not in the process table at all. Never calls wait()/waitpid(), so an
+    un-reaped child of ours is reported as 'Z' instead of being silently
+    reaped by the observation itself (T13-C-I1-B-R1 test blind spot)."""
+    process = _REAL_POPEN(["ps", "-p", str(pid), "-o", "stat="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    out, _err = process.communicate(timeout=10)
+    state = out.decode("utf-8", "replace").strip()
+    return state or None
+
+
 def _wait_gone(pid, timeout=10.0):
+    """Non-reaping: True only once `pid` has left the process table. A
+    zombie (our own killed-but-unreaped child) counts as NOT gone."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if _process_state(pid) is None:
             return True
-        # A killed-but-not-yet-reaped child of *our* process would still answer
-        # kill(0); reap via waitpid when it is ours, otherwise keep polling.
-        try:
-            waited, _status = os.waitpid(pid, os.WNOHANG)
-            if waited == pid:
-                return True
-        except ChildProcessError:
-            pass
         time.sleep(0.05)
-    return False
+    return _process_state(pid) is None
+
+
+def _assert_positively_reaped(pid, timeout=10.0):
+    """Ordering matters: (1) observe WITHOUT reaping -- the pid must leave
+    the table on production's own account, never lingering as 'Z'; (2) only
+    then prove nothing is left to reap: waitpid on the exact pid must report
+    ChildProcessError (no un-reaped child of ours with that pid exists)."""
+    deadline = time.monotonic() + timeout
+    state = _process_state(pid)
+    while state is not None and time.monotonic() < deadline:
+        time.sleep(0.05)
+        state = _process_state(pid)
+    assert state is None, f"pid {pid} still in the process table with state {state!r} (not reaped by production)"
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return
+    raise AssertionError(f"pid {pid} was still reapable after the bridge returned")
 
 
 def test_supervisor_timeout_kills_the_whole_process_group(node_target, monkeypatch, tmp_path):
@@ -449,7 +476,7 @@ def _identity(path, pid):
     with open(path, "w") as handle:
         json.dump({"pid": pid, "pgid": os.getpgid(pid), "sid": os.getsid(pid)}, handle)
 resistant = mode in ("sigterm-resistant", "success-daemon")
-transient = mode == "transient-descendant"
+transient = mode in ("transient-descendant", "success-pass")
 descendant_code = "import signal, time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if resistant else "") + ("time.sleep(0.05)" if transient else "time.sleep(600)")
 descendant = subprocess.Popen([sys.executable, "-c", descendant_code])
 if resistant:
@@ -469,6 +496,16 @@ elif mode == "transient-descendant":
         {"code": "SCHEMA_STATE", "status": "PASS", "message": "ok"},
         {"code": "TRUST_KEY", "status": "PASS", "message": "ok"},
         {"code": "NODE_REGISTRATION", "status": "WARN", "message": "local", "details": {"authority_verified": False}},
+        {"code": "SYNC_RETRY_POLICY", "status": "PASS", "message": "ok"}]}))
+    sys.stdout.flush()
+    sys.exit(0)
+elif mode == "success-pass":
+    descendant.wait()
+    sys.stdout.write(json.dumps({"schema_version": 1, "profile": "node", "mode": "release", "overall_status": "PASS", "checks": [
+        {"code": "DB_CONNECTIVITY", "status": "PASS", "message": "ok"},
+        {"code": "SCHEMA_STATE", "status": "PASS", "message": "ok"},
+        {"code": "TRUST_KEY", "status": "PASS", "message": "ok"},
+        {"code": "NODE_REGISTRATION", "status": "PASS", "message": "ok", "details": {"authority_verified": True}},
         {"code": "SYNC_RETRY_POLICY", "status": "PASS", "message": "ok"}]}))
     sys.stdout.flush()
     sys.exit(0)
@@ -516,17 +553,9 @@ def _descendant_supervisor(monkeypatch, mode, pid_dir):
 
 
 def _alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    try:  # our own killed-but-unreaped child answers kill(0); reap it if it is ours
-        waited, _status = os.waitpid(pid, os.WNOHANG)
-        if waited == pid:
-            return False
-    except ChildProcessError:
-        pass
-    return True
+    """Non-reaping liveness: a zombie is not alive, but it is not reaped here."""
+    state = _process_state(pid)
+    return state is not None and not state.startswith("Z")
 
 
 def _identity(pid_dir, name, timeout=15.0):
@@ -554,11 +583,25 @@ def sentinel_process():
 
 
 def _emergency_cleanup(*pids):
+    """Host protection ONLY, after the production assertions: kill, then
+    reap whatever is our own child so no zombie outlives the test."""
     for pid in pids:
         try:
             os.kill(pid, 9)
         except (ProcessLookupError, PermissionError):
             pass
+    deadline = time.monotonic() + 5
+    pending = set(pids)
+    while pending and time.monotonic() < deadline:
+        for pid in list(pending):
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pending.discard(pid)
+                continue
+            if waited == pid:
+                pending.discard(pid)
+        time.sleep(0.05)
 
 
 def _optional_pid(pid_dir, name, wait):
@@ -767,12 +810,17 @@ def _record_spawned(monkeypatch, *, sabotage_poll=False, sabotage_wait=False):
     methods (never the whole class, never the process tree itself)."""
     from scripts.release_gate import diagnostics
 
-    spawned: list = []
+    class _Spawned(list):
+        """PIDs production spawned; `.processes` keeps the Popen objects alive."""
+
+    spawned = _Spawned()
+    spawned.processes = []
     real_popen = diagnostics.subprocess.Popen
 
     def _factory(*args, **kwargs):
         process = real_popen(*args, **kwargs)
         spawned.append(process.pid)
+        spawned.processes.append(process)  # keep alive: no __del__ -> no _active -> no hidden reap
         if sabotage_poll:
             def _failing_poll():
                 raise RuntimeError(POLL_SENTINEL)
@@ -811,7 +859,7 @@ def _assert_spawned_gone(spawned, *, sentinel_process, extra_pids=()):
     pids = [*spawned, *extra_pids]
     try:
         for pid in spawned:
-            assert _wait_gone(pid, timeout=10.0), f"owned process {pid} survived"
+            _assert_positively_reaped(pid, timeout=10.0)
             assert _wait_group_gone(pid, timeout=10.0), f"owned group {pid} survived"
         for pid in extra_pids:
             assert _wait_gone(pid, timeout=10.0), f"owned descendant {pid} survived"
@@ -1226,3 +1274,255 @@ def test_finalization_failure_never_reports_false_success(
     descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
     extra = [pid for pid in (child, descendant) if pid is not None]
     _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+
+
+# --- Corrective (T13-C-I1-B-R1): reaping must be CONFIRMED, never assumed ----
+#
+# Two separate facts: (A) did a finalization phase fail internally? (B) is
+# the direct child ultimately reaped? A failing Popen.wait() is fact A and
+# must fail the run closed even when an independent waitpid fallback later
+# clears the zombie (fact B). Every observer below is NON-REAPING until the
+# production assertions have been made: a helper that calls wait()/waitpid()
+# first would perform the very reap whose absence is under test.
+
+REAP_DIRECT_SENTINEL = "REAP_DIRECT_FAILURE_SENTINEL_e0c4"
+
+
+def _readers_gone():
+    from scripts.release_gate import diagnostics
+
+    return not any(
+        t.is_alive() for t in threading.enumerate() if getattr(t, "_target", None) is diagnostics._drain
+    )
+
+
+def _resistant_tree_with_broken_wait(monkeypatch, tmp_path):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch, sabotage_wait=True)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+    return spawned
+
+
+def test_warn_report_with_failing_wait_is_rejected_and_supervisor_reaped(
+    node_target, monkeypatch, sentinel_process
+):
+    """RED at d50f91e: the REAL target produces a genuine canonical WARN and
+    ONLY the spawned supervisor's Popen.wait() is made to raise -- the
+    bridge accepted the WARN although the reap phase failed."""
+    from scripts.release_gate import diagnostics
+
+    spawned = _record_spawned(monkeypatch, sabotage_wait=True)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(
+            node_target.env, expected_profile="node", repo_root=REPO_ROOT,
+            fixture_key_paths=(None, node_target.trust_path),
+        )
+
+    assert time.monotonic() - started < 60
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert WAIT_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert "Traceback" not in str(caught.value) + repr(caught.value)
+    assert len(spawned) == 1
+    try:
+        _assert_positively_reaped(spawned[0])
+        assert _readers_gone()
+        assert _alive(sentinel_process.pid)
+    except AssertionError:
+        _emergency_cleanup(*spawned)
+        raise
+
+
+def test_pass_report_with_failing_wait_is_rejected(node_target, monkeypatch, tmp_path, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "success-pass", tmp_path)
+    spawned = _record_spawned(monkeypatch, sabotage_wait=True)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert WAIT_SENTINEL not in str(caught.value) + repr(caught.value)
+    try:
+        _assert_positively_reaped(spawned[0])
+        assert _alive(sentinel_process.pid)
+    except AssertionError:
+        _emergency_cleanup(*spawned)
+        raise
+
+
+def test_normal_pass_report_is_accepted_and_supervisor_reaped(node_target, monkeypatch, tmp_path, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "success-pass", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+
+    report = diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert report.overall_status == "PASS"
+    _assert_positively_reaped(spawned[0])
+    assert _readers_gone()
+    assert _alive(sentinel_process.pid)
+
+
+def test_resistant_tree_with_failing_wait_leaves_no_zombie_supervisor(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """RED at d50f91e: SIGKILL removed the live descendants but the
+    supervisor stayed a zombie (state Z) because the only reap primitive
+    was the injected-failing wait(). Process state is inspected WITHOUT
+    reaping before anything else."""
+    from scripts.release_gate import diagnostics
+
+    spawned = _resistant_tree_with_broken_wait(monkeypatch, tmp_path)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert time.monotonic() - started < 60
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert WAIT_SENTINEL not in str(caught.value) + repr(caught.value)
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    assert extra, "the resistant inner tree never recorded itself"
+    supervisor = spawned[0]
+    try:
+        # 1. non-reaping observation of the direct child FIRST
+        state = _process_state(supervisor)
+        assert state is None or not state.startswith("Z"), f"supervisor {supervisor} is a zombie: {state!r}"
+        # 2. then the positive proof that nothing is left to reap
+        _assert_positively_reaped(supervisor)
+        for pid in extra:
+            assert _wait_gone(pid), f"descendant {pid} survived"
+        assert _wait_group_gone(supervisor)
+        assert _readers_gone()
+        assert _alive(sentinel_process.pid)
+    except AssertionError:
+        _emergency_cleanup(supervisor, *extra)
+        raise
+
+
+def test_reap_phase_failure_still_performs_the_final_reap(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """RED at d50f91e: with _reap itself raising, the TERM->KILL helper
+    aborted before SIGKILL, the reap phase produced nothing, and the
+    supervisor was left a zombie."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+
+    def _failing_reap(process, timeout):
+        raise RuntimeError(REAP_FINALIZATION_SENTINEL)
+
+    monkeypatch.setattr(diagnostics, "_reap", _failing_reap)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert REAP_FINALIZATION_SENTINEL not in str(caught.value) + repr(caught.value)
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    supervisor = spawned[0]
+    try:
+        state = _process_state(supervisor)
+        assert state is None or not state.startswith("Z"), f"supervisor {supervisor} is a zombie: {state!r}"
+        _assert_positively_reaped(supervisor)
+        for pid in extra:
+            assert _wait_gone(pid), f"descendant {pid} survived"
+        assert _readers_gone()
+        assert _alive(sentinel_process.pid)
+    except AssertionError:
+        _emergency_cleanup(supervisor, *extra)
+        raise
+
+
+def test_final_reap_fallback_failure_fails_closed(node_target, monkeypatch, tmp_path, sentinel_process):
+    """Both reap primitives unusable (wait() raises AND the independent
+    waitpid fallback raises): the bridge must still fail closed with the
+    fixed error and leak neither sentinel. A zombie is then unavoidable
+    for production; the test reaps it afterwards purely as host hygiene."""
+    from scripts.release_gate import diagnostics
+
+    spawned = _resistant_tree_with_broken_wait(monkeypatch, tmp_path)
+
+    def _failing_direct(process, deadline):
+        raise RuntimeError(REAP_DIRECT_SENTINEL)
+
+    monkeypatch.setattr(diagnostics, "_reap_directly", _failing_direct)
+
+    try:
+        with pytest.raises(ReleaseDiagnosticsError) as caught:
+            diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+        assert str(caught.value) == "release diagnostics process supervision failed"
+        outward = str(caught.value) + repr(caught.value)
+        assert WAIT_SENTINEL not in outward and REAP_DIRECT_SENTINEL not in outward
+        child = _optional_pid(tmp_path, "child.json", 10.0)
+        descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+        for pid in (child, descendant):
+            if pid is not None:
+                assert _wait_gone(pid), f"descendant {pid} survived"
+        assert _alive(sentinel_process.pid)
+    finally:
+        _emergency_cleanup(*spawned)  # host hygiene: no usable reap primitive existed in production
+
+
+def test_final_reap_runs_after_the_last_kill_and_before_reader_joins(
+    node_target, monkeypatch, tmp_path
+):
+    """Call-order evidence: TERM -> KILL -> SWEEP -> FINAL_REAP -> JOIN."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    order: list = []
+    real_signal_group = diagnostics._signal_group
+    real_sweep = diagnostics._sweep_owned_group
+    real_reap_phase = diagnostics._reap_phase
+    real_thread = diagnostics.threading.Thread
+
+    def _signal(pgid, signum):
+        order.append(("signal", int(signum)))
+        return real_signal_group(pgid, signum)
+
+    def _sweep(pgid):
+        order.append(("sweep", None))
+        return real_sweep(pgid)
+
+    def _reap_phase(process):
+        order.append(("reap_phase", None))
+        return real_reap_phase(process)
+
+    class _RecordingThread(real_thread):
+        def join(self, timeout=None):
+            order.append(("join", None))
+            return super().join(timeout=timeout)
+
+    monkeypatch.setattr(diagnostics, "_signal_group", _signal)
+    monkeypatch.setattr(diagnostics, "_sweep_owned_group", _sweep)
+    monkeypatch.setattr(diagnostics, "_reap_phase", _reap_phase)
+    monkeypatch.setattr(diagnostics.threading, "Thread", _RecordingThread)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert str(caught.value) == "release diagnostics target process timed out"
+    kinds = [kind for kind, _ in order]
+    kills = [i for i, (kind, signum) in enumerate(order) if kind == "signal" and signum == int(signal.SIGKILL)]
+    terms = [i for i, (kind, signum) in enumerate(order) if kind == "signal" and signum == int(signal.SIGTERM)]
+    reaps = [i for i, kind in enumerate(kinds) if kind == "reap_phase"]
+    assert terms and kills and "sweep" in kinds and len(reaps) == 2 and kinds.count("join") == 2, order
+    assert terms[0] < kills[0] < kinds.index("sweep") < reaps[-1] < kinds.index("join"), order
+    assert reaps[-1] > max(kills), order  # the final reap follows the LAST kill (sweep included)
+    _assert_tree_gone(tmp_path)
