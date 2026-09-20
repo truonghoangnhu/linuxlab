@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -66,7 +67,7 @@ _CORRUPT_TARGET_SCRIPT = """
 import json, sys
 from scripts.release_gate import diagnostics
 canned = json.loads(sys.argv[1])
-def _canned_run(argv, *, env, stdin_text, timeout_seconds, new_process_group=False):
+def _canned_run(argv, *, env, stdin_text, timeout_seconds, own_group):
     return diagnostics.CommandOutcome(
         returncode=canned["returncode"], stdout=canned["stdout"].encode("utf-8"), stderr=b""
     )
@@ -340,8 +341,8 @@ def test_supervisor_argv_is_an_argument_array_with_the_fixed_module_entry(node_t
 
     captured = {}
 
-    def _capture(argv, *, env, stdin_text, timeout_seconds, new_process_group=False):
-        captured.update(argv=list(argv), stdin=stdin_text, timeout=timeout_seconds, group=new_process_group)
+    def _capture(argv, *, env, stdin_text, timeout_seconds, own_group):
+        captured.update(argv=list(argv), stdin=stdin_text, timeout=timeout_seconds, group=own_group)
         return diagnostics.CommandOutcome(returncode=1, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(diagnostics, "_run_command", _capture)
@@ -424,38 +425,71 @@ def test_production_code_never_imports_the_release_harness():
     assert offenders == []
 
 
-# --- Corrective (T13-I1): the whole process tree owned by the inner
-# diagnostic execution must be gone when the bridge returns failure -------
+# --- Corrective (T13-I1, T13-C-I1, T13-C-I2): process-tree containment ------
+#
+# Topology under test: the harness owns ONE session/process group led by the
+# supervisor; the inner diagnostic child and everything it spawns stay in
+# that group. Every failure path -- and the success path -- must leave no
+# live process owned by the execution when the bridge returns, enforced by
+# the PARENT (no supervisor cooperation required). Tests use real
+# processes, PID/PGID/SID evidence files, and assert BEFORE any emergency
+# cleanup; emergency cleanup exists only to protect the developer machine.
+
+_IDENTITY_SNIPPET = """
+def _identity(path, pid):
+    import json, os
+    with open(path, "w") as handle:
+        json.dump({"pid": pid, "pgid": os.getpgid(pid), "sid": os.getsid(pid)}, handle)
+"""
+
+_CHILD_SCRIPT = """
+import json, os, signal, subprocess, sys, time
+pid_dir, mode = sys.argv[1], sys.argv[2]
+def _identity(path, pid):
+    with open(path, "w") as handle:
+        json.dump({"pid": pid, "pgid": os.getpgid(pid), "sid": os.getsid(pid)}, handle)
+resistant = mode in ("sigterm-resistant", "success-daemon")
+descendant_code = "import signal, time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if resistant else "") + "time.sleep(600)"
+descendant = subprocess.Popen([sys.executable, "-c", descendant_code])
+if resistant:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+_identity(os.path.join(pid_dir, "descendant.json"), descendant.pid)
+_identity(os.path.join(pid_dir, "child.json"), os.getpid())
+if mode == "overflow":
+    sys.stdout.write("x" * 70000); sys.stdout.flush()
+elif mode == "stderr-overflow":
+    sys.stderr.write("y" * 70000); sys.stderr.flush()
+elif mode == "nonzero":
+    sys.exit(3)  # leaves the descendant running: production must clean it
+elif mode == "success-daemon":
+    sys.stdout.write(json.dumps({"schema_version": 1, "profile": "node", "mode": "release", "overall_status": "WARN", "checks": [
+        {"code": "DB_CONNECTIVITY", "status": "PASS", "message": "ok"},
+        {"code": "SCHEMA_STATE", "status": "PASS", "message": "ok"},
+        {"code": "TRUST_KEY", "status": "PASS", "message": "ok"},
+        {"code": "NODE_REGISTRATION", "status": "WARN", "message": "local", "details": {"authority_verified": False}},
+        {"code": "SYNC_RETRY_POLICY", "status": "PASS", "message": "ok"}]}))
+    sys.stdout.flush()
+    sys.exit(0)  # valid report, but a daemonized SIGTERM-ignoring descendant remains
+time.sleep(600)
+"""
 
 # A supervisor stand-in that runs the REAL target (real django.setup, real
-# _run_command with its real timeout/overflow/kill logic) but points the
-# inner diagnostic child at a script that spawns a sleeping DESCENDANT,
-# records its PID, and then misbehaves (sleeps past the timeout, or floods
-# stdout). Only the child argv and the inner timeout are replaced.
-_DESCENDANT_TARGET_SCRIPT = """
-import json, os, sys
+# _run_command with its real timeout/overflow/kill/sweep logic) but points
+# the inner diagnostic child at _CHILD_SCRIPT, which spawns a sleeping
+# DESCENDANT, records identities, then behaves per `mode`. Only the child
+# argv and the inner timeout are replaced.
+_DESCENDANT_TARGET_SCRIPT = _IDENTITY_SNIPPET + """
+import json, os, sys, threading
 from scripts.release_gate import diagnostics
-mode, pid_dir = sys.argv[1], sys.argv[2]
-child_script = '''
-import os, subprocess, sys, time
-pid_dir, mode = sys.argv[1], sys.argv[2]
-descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
-open(os.path.join(pid_dir, "descendant.pid"), "w").write(str(descendant.pid))
-open(os.path.join(pid_dir, "child.pid"), "w").write(str(os.getpid()))
-if mode == "overflow":
-    sys.stdout.write("x" * 70000)
-    sys.stdout.flush()
-elif mode == "stderr-overflow":
-    sys.stderr.write("y" * 70000)
-    sys.stderr.flush()
-elif mode == "nonzero":
-    descendant.kill(); descendant.wait()
-    sys.exit(3)
-time.sleep(600)
-'''
+mode, pid_dir, child_script = sys.argv[1], sys.argv[2], sys.argv[3]
+_identity(os.path.join(pid_dir, "supervisor.json"), os.getpid())
 diagnostics._child_invocation = lambda paths: ([sys.executable, "-c", child_script, pid_dir, mode], "")
 diagnostics.CHILD_TIMEOUT_SECONDS = 2
-sys.exit(diagnostics.main(sys.argv[3:]))
+if mode == "target-reader-failure":
+    def _boom(self):
+        raise RuntimeError("READER_START_SENTINEL")
+    threading.Thread.start = _boom
+sys.exit(diagnostics.main(sys.argv[4:]))
 """
 
 
@@ -465,8 +499,9 @@ def _descendant_supervisor(monkeypatch, mode, pid_dir):
     monkeypatch.setattr(
         diagnostics,
         "_supervisor_command",
-        lambda: [sys.executable, "-c", _DESCENDANT_TARGET_SCRIPT, mode, str(pid_dir)],
+        lambda: [sys.executable, "-c", _DESCENDANT_TARGET_SCRIPT, mode, str(pid_dir), _CHILD_SCRIPT],
     )
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
 
 
 def _alive(pid):
@@ -474,8 +509,7 @@ def _alive(pid):
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    # Our own killed-but-unreaped child answers kill(0); reap it if it is ours.
-    try:
+    try:  # our own killed-but-unreaped child answers kill(0); reap it if it is ours
         waited, _status = os.waitpid(pid, os.WNOHANG)
         if waited == pid:
             return False
@@ -484,47 +518,214 @@ def _alive(pid):
     return True
 
 
-def _pid(pid_dir, name, timeout=10.0):
+def _identity(pid_dir, name, timeout=15.0):
     deadline = time.monotonic() + timeout
     path = pid_dir / name
     while time.monotonic() < deadline:
-        if path.exists() and path.read_text().strip():
-            return int(path.read_text())
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except ValueError:
+                pass
         time.sleep(0.05)
     raise AssertionError(f"{name} never written")
 
 
-@pytest.mark.parametrize("mode", ["timeout", "overflow", "stderr-overflow"])
-def test_inner_failure_kills_every_owned_descendant(node_target, monkeypatch, tmp_path, mode):
-    from scripts.release_gate.diagnostics import run_release_diagnostics
+@pytest.fixture
+def sentinel_process():
+    """An UNRELATED process in its own session: must survive every cleanup."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True)
+    try:
+        yield process
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _emergency_cleanup(*pids):
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _optional_pid(pid_dir, name, wait):
+    try:
+        return _identity(pid_dir, name, timeout=wait)["pid"]
+    except AssertionError:
+        return None
+
+
+def _assert_tree_gone(pid_dir, *, tree_may_be_unformed=False):
+    """Assert BEFORE any emergency cleanup; clean up only if the assertion
+    fails. With `tree_may_be_unformed`, the child can have been killed
+    before it ever recorded itself or its descendant (production cleanup
+    struck within milliseconds of spawn); whatever WAS recorded must be gone."""
+    supervisor = _identity(pid_dir, "supervisor.json")["pid"]
+    wait = 1.0 if tree_may_be_unformed else 15.0
+    descendant = _optional_pid(pid_dir, "descendant.json", wait)
+    child = _optional_pid(pid_dir, "child.json", wait)
+    if not tree_may_be_unformed:
+        assert descendant is not None and child is not None
+    pids = [p for p in (supervisor, child, descendant) if p is not None]
+    try:
+        for pid in pids:
+            assert _wait_gone(pid, timeout=5.0), (
+                f"pid {pid} survived (supervisor={supervisor}, child={child}, descendant={descendant})"
+            )
+    except AssertionError:
+        _emergency_cleanup(*pids)
+        raise
+
+
+@pytest.mark.parametrize("mode", ["timeout", "overflow", "stderr-overflow", "nonzero", "sigterm-resistant"])
+def test_inner_failure_kills_every_owned_descendant(node_target, monkeypatch, tmp_path, mode, sentinel_process):
+    from scripts.release_gate import diagnostics
 
     _descendant_supervisor(monkeypatch, mode, tmp_path)
     started = time.monotonic()
 
     with pytest.raises(ReleaseDiagnosticsError) as caught:
-        run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
 
     assert str(caught.value) == "release diagnostics target process failed"
     assert "xxx" not in str(caught.value) and "yyy" not in str(caught.value)
-    assert time.monotonic() - started < 60  # the inner 2 s timeout/overflow path, not the supervisor's
-    descendant_pid = _pid(tmp_path, "descendant.pid")
-    child_pid = _pid(tmp_path, "child.pid")
-    assert _wait_gone(child_pid)
-    assert _wait_gone(descendant_pid, timeout=5.0), f"descendant {descendant_pid} survived the {mode} failure"
+    assert time.monotonic() - started < 60
+    _assert_tree_gone(tmp_path)
+    assert _alive(sentinel_process.pid)
+    assert not hasattr(diagnostics, "_ACTIVE_CHILD_GROUPS")
 
 
-def test_ordinary_nonzero_child_exit_leaves_no_stray_descendant(node_target, monkeypatch, tmp_path):
-    from scripts.release_gate.diagnostics import run_release_diagnostics
+def test_success_with_a_daemonized_descendant_fails_closed(node_target, monkeypatch, tmp_path, sentinel_process):
+    """A valid report cannot buy success if the execution left an unowned
+    live process behind (no detached-child use case exists in authority)."""
+    from scripts.release_gate import diagnostics
 
-    _descendant_supervisor(monkeypatch, "nonzero", tmp_path)
+    _descendant_supervisor(monkeypatch, "success-daemon", tmp_path)
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    assert str(caught.value) == "release diagnostics target left stray processes"
+    _assert_tree_gone(tmp_path)
+    assert _alive(sentinel_process.pid)
+
+
+def test_target_reader_start_failure_after_spawn_leaves_no_survivor(node_target, monkeypatch, tmp_path, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "target-reader-failure", tmp_path)
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    assert str(caught.value) == "release diagnostics target process failed"
+    assert "READER_START_SENTINEL" not in str(caught.value)
+    _assert_tree_gone(tmp_path, tree_may_be_unformed=True)
+    assert _alive(sentinel_process.pid)
+
+
+def test_parent_reader_start_failure_after_spawn_leaves_no_survivor(node_target, monkeypatch, tmp_path, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+
+    class _BrokenThread(threading.Thread):
+        def start(self):
+            raise RuntimeError("PARENT_READER_SENTINEL")
+
+    spawned = []
+    real_popen = diagnostics.subprocess.Popen
+
+    def _recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process.pid)
+        return process
+
+    monkeypatch.setattr(diagnostics.threading, "Thread", _BrokenThread)
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", _recording_popen)
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    assert str(caught.value) == "release diagnostics process supervision failed"
+    assert "PARENT_READER_SENTINEL" not in str(caught.value) + repr(caught.value)
+    # Ownership began at Popen: the supervisor was killed and reaped before
+    # it could even record itself, and its group holds nothing else.
+    assert len(spawned) == 1
+    try:
+        assert _wait_gone(spawned[0], timeout=5.0)
+        assert not diagnostics._signal_group(spawned[0], 0)
+    except AssertionError:
+        _emergency_cleanup(spawned[0])
+        raise
+    assert _alive(sentinel_process.pid)
+
+
+def test_unresponsive_supervisor_timeout_is_parent_enforced(node_target, monkeypatch, tmp_path, sentinel_process):
+    """T13-C-I2: the supervisor is SIGSTOP'd (it can execute NO Python, no
+    signal handler); the parent's timeout escalation alone must remove the
+    supervisor, the inner child and the descendant. Identity evidence for
+    every layer is recorded for review."""
+    import signal as _signal
+
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    stopped = {}
+
+    def _stop_supervisor_once_tree_exists():
+        descendant = _identity(tmp_path, "descendant.json")
+        supervisor = _identity(tmp_path, "supervisor.json")
+        os.kill(supervisor["pid"], _signal.SIGSTOP)
+        stopped.update(supervisor=supervisor, child=_identity(tmp_path, "child.json"), descendant=descendant)
+
+    stopper = threading.Thread(target=_stop_supervisor_once_tree_exists, daemon=True)
+    stopper.start()
+    started = time.monotonic()
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    stopper.join(timeout=10)
+    elapsed = time.monotonic() - started
+
+    assert str(caught.value) == "release diagnostics target process timed out"
+    assert elapsed < 30
+    assert stopped, "supervisor was never stopped"
+    harness = {"pid": os.getpid(), "pgid": os.getpgid(0), "sid": os.getsid(0)}
+    (tmp_path / "identity-evidence.json").write_text(json.dumps({"harness": harness, **stopped}, indent=2))
+    # Ownership model: the supervisor leads its own session/group; the child
+    # and descendant share it; the harness is outside it.
+    assert stopped["supervisor"]["pgid"] == stopped["supervisor"]["pid"]
+    assert stopped["child"]["pgid"] == stopped["supervisor"]["pgid"]
+    assert stopped["descendant"]["pgid"] == stopped["supervisor"]["pgid"]
+    assert harness["pgid"] != stopped["supervisor"]["pgid"]
+    _assert_tree_gone(tmp_path)
+    assert _alive(sentinel_process.pid)
+
+
+def test_sigterm_ignoring_supervisor_is_killed_by_escalation(node_target, monkeypatch, tmp_path, sentinel_process):
+    from scripts.release_gate import diagnostics
+
+    script = _IDENTITY_SNIPPET + """
+import os, signal, subprocess, sys, time
+pid_dir = sys.argv[1]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+_identity(os.path.join(pid_dir, "supervisor.json"), os.getpid())
+child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"])
+_identity(os.path.join(pid_dir, "child.json"), child.pid)
+_identity(os.path.join(pid_dir, "descendant.json"), child.pid)
+time.sleep(600)
+"""
+    monkeypatch.setattr(diagnostics, "_supervisor_command", lambda: [sys.executable, "-c", script, str(tmp_path)])
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+    started = time.monotonic()
     with pytest.raises(ReleaseDiagnosticsError):
-        run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
-    assert _wait_gone(_pid(tmp_path, "descendant.pid"), timeout=5.0)
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+    assert time.monotonic() - started < 30
+    _assert_tree_gone(tmp_path)
+    assert _alive(sentinel_process.pid)
 
 
-def test_successful_real_command_is_not_killed_prematurely(node_target):
-    """The real chain with the real command: no false timeout/overflow
-    kill, canonical WARN report still returned (Task-13 D)."""
+def test_successful_real_command_is_not_killed_prematurely(node_target, sentinel_process):
+    """The real chain with the real command: no false timeout/overflow kill,
+    no stray-process false positive, canonical WARN report still returned."""
     from scripts.release_gate.diagnostics import run_release_diagnostics
 
     report = run_release_diagnostics(
@@ -532,3 +733,4 @@ def test_successful_real_command_is_not_killed_prematurely(node_target):
         fixture_key_paths=(None, node_target.trust_path),
     )
     assert report.overall_status == "WARN"
+    assert _alive(sentinel_process.pid)
