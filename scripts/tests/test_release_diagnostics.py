@@ -789,16 +789,30 @@ def _record_spawned(monkeypatch, *, sabotage_poll=False, sabotage_wait=False):
     return spawned
 
 
+def _wait_group_gone(pgid, timeout=10.0):
+    """Poll (bounded) until killpg(pgid, 0) reports no member of the
+    group is signalable any more -- SIGKILL delivery/reaping is not
+    instantaneous even though it cannot be blocked, so a single
+    immediate probe right after a kill is a real race, not evidence of
+    survival."""
+    from scripts.release_gate import diagnostics
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not diagnostics._signal_group(pgid, 0):
+            return True
+        time.sleep(0.05)
+    return not diagnostics._signal_group(pgid, 0)
+
+
 def _assert_spawned_gone(spawned, *, sentinel_process, extra_pids=()):
     """Assert BEFORE emergency cleanup: nothing production spawned (and
     nothing it owned) is alive, and its process group is empty."""
-    from scripts.release_gate import diagnostics
-
     pids = [*spawned, *extra_pids]
     try:
         for pid in spawned:
             assert _wait_gone(pid, timeout=10.0), f"owned process {pid} survived"
-            assert not diagnostics._signal_group(pid, 0), f"owned group {pid} survived"
+            assert _wait_group_gone(pid, timeout=10.0), f"owned group {pid} survived"
         for pid in extra_pids:
             assert _wait_gone(pid, timeout=10.0), f"owned descendant {pid} survived"
         assert _alive(sentinel_process.pid)
@@ -998,3 +1012,217 @@ def test_successful_command_leaves_no_reader_thread_or_owned_group(node_target, 
         time.sleep(0.05)
     assert threading.active_count() <= before
     assert _alive(sentinel_process.pid)
+
+
+# --- Corrective (T13-C-I1-B, round 3): finalization itself must be
+# non-abortable -- ANY exception from ONE finalization phase (sweep,
+# residual-group observation, reap, a signal call, a reader join) must
+# not prevent every later applicable phase from still running, and must
+# never let the bridge conclude success while containment is unproven.
+
+FINAL_SWEEP_SENTINEL = "FINAL_SWEEP_FAILURE_SENTINEL_a37d"
+RESIDUAL_OBSERVATION_SENTINEL = "RESIDUAL_OBSERVATION_SENTINEL_c91e"
+REAP_FINALIZATION_SENTINEL = "REAP_FINALIZATION_SENTINEL_1b6f"
+JOIN_FIRST_SENTINEL = "JOIN_FIRST_SENTINEL_8de2"
+SIGNAL_LATER_USABLE_SENTINEL = "SIGNAL_LATER_USABLE_SENTINEL_44aa"
+
+
+def test_final_sweep_exception_still_kills_descendants_and_joins_readers(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """Exact reviewer reproduction: inject a failure into the currently
+    unprotected final-sweep helper around line 324, with a real
+    supervisor/child/descendant tree and real reader threads already
+    running. OS kill primitives remain fully usable throughout."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+
+    real_sweep = diagnostics._sweep_owned_group
+    calls = []
+
+    def _failing_sweep(pgid):
+        calls.append(pgid)
+        if len(calls) == 1:
+            raise RuntimeError(FINAL_SWEEP_SENTINEL)
+        return real_sweep(pgid)  # a later, legitimate call (e.g. from a retry) still works
+
+    monkeypatch.setattr(diagnostics, "_sweep_owned_group", _failing_sweep)
+    started = time.monotonic()
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert time.monotonic() - started < 60
+    assert FINAL_SWEEP_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert "Traceback" not in str(caught.value) + repr(caught.value)
+    assert str(caught.value) == "release diagnostics process supervision failed"
+
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    assert extra, "the resistant tree never recorded itself"
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+
+    # The mandatory reader-thread proof: no reader thread from this
+    # command's own supervision survives the bridge's return.
+    assert not any(t.is_alive() for t in threading.enumerate() if getattr(t, "_target", None) is diagnostics._drain)
+
+
+def test_residual_group_observation_exception_does_not_abort_finalization(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """A failure specifically inside the sweep's OWN residual-group
+    check (not the outer call site) must still leave later finalization
+    phases (reader joins) intact and the tree contained."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+
+    real_signal_group = diagnostics._signal_group
+    calls = []
+
+    def _flaky_signal_group(pgid, signum):
+        calls.append((pgid, signum))
+        if len(calls) == 3:  # let TERM and the first KILL through, then fail once
+            raise OSError(RESIDUAL_OBSERVATION_SENTINEL)
+        return real_signal_group(pgid, signum)
+
+    monkeypatch.setattr(diagnostics, "_signal_group", _flaky_signal_group)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert RESIDUAL_OBSERVATION_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert len(calls) > 3, "cleanup stopped at the injected failure instead of continuing"
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+
+
+def test_reap_exception_during_finalization_does_not_abort_later_phases(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+
+    real_reap = diagnostics._reap
+    calls = []
+
+    def _failing_reap(process, timeout):
+        calls.append(timeout)
+        raise RuntimeError(REAP_FINALIZATION_SENTINEL)
+
+    monkeypatch.setattr(diagnostics, "_reap", _failing_reap)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert REAP_FINALIZATION_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert len(calls) >= 1
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+    real_reap(diagnostics.subprocess.Popen(["true"]), 5)  # sanity: real _reap still usable after test
+
+
+def test_first_reader_join_exception_does_not_skip_the_second(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "timeout", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+
+    real_thread_cls = diagnostics.threading.Thread
+    join_calls: list = []
+
+    class _FirstJoinFails(real_thread_cls):
+        def join(self, timeout=None):
+            join_calls.append(self)
+            if len(join_calls) == 1:
+                raise RuntimeError(JOIN_FIRST_SENTINEL)
+            return super().join(timeout=timeout)
+
+    monkeypatch.setattr(diagnostics.threading, "Thread", _FirstJoinFails)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert JOIN_FIRST_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert len(join_calls) == 2, "the second reader's join was skipped after the first one raised"
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process)
+
+
+def test_signal_helper_exception_still_allows_later_stronger_cleanup(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """A single failing os.killpg() call (an exception type _signal_group
+    itself does not catch) must not stop the sequence -- later signal
+    attempts made from other finalization phases still run and succeed."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "sigterm-resistant", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+    monkeypatch.setattr(diagnostics, "SUPERVISOR_TIMEOUT_SECONDS", 3)
+    monkeypatch.setattr(diagnostics, "_TERMINATION_GRACE_SECONDS", 1)
+
+    real_killpg = diagnostics.os.killpg
+    calls = []
+
+    def _flaky_killpg(pgid, signum):
+        calls.append((pgid, signum))
+        if len(calls) == 1:
+            raise RuntimeError(SIGNAL_LATER_USABLE_SENTINEL)
+        return real_killpg(pgid, signum)
+
+    monkeypatch.setattr(diagnostics.os, "killpg", _flaky_killpg)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert SIGNAL_LATER_USABLE_SENTINEL not in str(caught.value) + repr(caught.value)
+    assert len(calls) > 1, "cleanup stopped after the first failed signal instead of continuing"
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)
+
+
+def test_finalization_failure_never_reports_false_success(
+    node_target, monkeypatch, tmp_path, sentinel_process
+):
+    """Even when the inner command produced a structurally valid PASS/WARN
+    report, a finalization phase that raised must still fail the run
+    closed -- a valid report alone can never buy success when cleanup
+    itself could not be verified complete."""
+    from scripts.release_gate import diagnostics
+
+    _descendant_supervisor(monkeypatch, "success-daemon", tmp_path)
+    spawned = _record_spawned(monkeypatch)
+
+    def _failing_sweep(pgid):
+        raise RuntimeError(FINAL_SWEEP_SENTINEL)
+
+    monkeypatch.setattr(diagnostics, "_sweep_owned_group", _failing_sweep)
+
+    with pytest.raises(ReleaseDiagnosticsError) as caught:
+        diagnostics.run_release_diagnostics(node_target.env, expected_profile="node", repo_root=REPO_ROOT)
+
+    assert FINAL_SWEEP_SENTINEL not in str(caught.value) + repr(caught.value)
+    child = _optional_pid(tmp_path, "child.json", 10.0)
+    descendant = _optional_pid(tmp_path, "descendant.json", 10.0)
+    extra = [pid for pid in (child, descendant) if pid is not None]
+    _assert_spawned_gone(spawned, sentinel_process=sentinel_process, extra_pids=extra)

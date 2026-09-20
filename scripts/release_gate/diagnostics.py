@@ -178,11 +178,38 @@ def _best_effort(step) -> None:
     """Run one cleanup step; ANY exception it raises is swallowed so the
     monotonic sequence of steps around it always continues to the next,
     stronger step (T13-C-I1-B: a single signal/observation failure must
-    never abort escalation toward SIGKILL)."""
+    never abort escalation toward SIGKILL). Used only INSIDE a single
+    termination/signal helper, where the helper's own caller does not
+    need to know a step failed (the next step in that same helper is
+    unconditional regardless). Finalization PHASES themselves (called
+    from _run_command's finally) use `_guard` instead, which also
+    reports whether the phase succeeded."""
     try:
         step()
     except Exception:  # noqa: BLE001, S110 -- see _best_effort's own docstring
         pass
+
+
+def _guard(step, *, default=None):
+    """Run one FINALIZATION PHASE in isolation (T13-C-I1-B, round 3): ANY
+    exception it raises -- including one that a lower-level helper (e.g.
+    _signal_group's own os.killpg call, or a reader's join()) did not
+    itself catch -- is swallowed HERE, at the phase boundary, so it can
+    never escape `_run_command`'s finally block, skip the phases that
+    textually follow it in that block, or leak its raw text outward.
+    Returns `(result, ok)`: `ok` is False whenever the phase raised, and
+    `result` is `default` in that case -- callers that need a value
+    (e.g. whether the final sweep found a survivor) pass a FAIL-CLOSED
+    default, so an unobservable outcome is never treated as a clean one.
+    The caller accumulates `ok` into an overall finalization-success
+    flag; `_run_command` fails closed with the fixed supervision error
+    if that flag is ever False, even when every process was actually
+    contained -- completeness could not be PROVEN, so success is never
+    reported on the strength of a swallowed exception alone."""
+    try:
+        return step(), True
+    except Exception:  # noqa: BLE001 -- finalization must never abort here; see docstring
+        return default, False
 
 
 def _terminate_owned_group(process: subprocess.Popen) -> None:
@@ -202,17 +229,34 @@ def _terminate_owned_group(process: subprocess.Popen) -> None:
 def _sweep_owned_group(pgid: int) -> bool:
     """After the group leader has been reaped, SIGKILL any member still in
     the group and wait (bounded) until the group is empty. Returns True
-    when a survivor existed -- the caller must then fail closed. A
-    signal-send failure here is fail-closed by _signal_group's own
-    contract (True), so a transient error still leads to another sweep
-    iteration rather than silently reporting an empty group."""
-    survivors = _signal_group(pgid, signal.SIGKILL)
+    when a survivor existed -- the caller must then fail closed. Each
+    individual signal attempt is independently guarded (T13-C-I1-B,
+    round 3): a single call raising something outside _signal_group's
+    own expected-error handling does not abort the loop -- it is treated
+    as "cannot confirm empty yet" (fail-closed) and the bounded loop
+    simply tries again on its next iteration, up to the same deadline."""
+
+    def _kill_once():
+        return _signal_group(pgid, signal.SIGKILL)
+
+    survivors, _ok = _guard(_kill_once, default=True)
     deadline = time.monotonic() + _SWEEP_SECONDS
     remaining = survivors
     while remaining and time.monotonic() < deadline:
         time.sleep(0.05)
-        remaining = _signal_group(pgid, signal.SIGKILL)
+        remaining, _ok = _guard(_kill_once, default=True)
     return survivors
+
+
+def _last_resort_kill(pgid: int) -> None:
+    """Absolute last-resort containment (T13-C-I1-B, round 3), reached
+    only when the sweep PHASE ITSELF could not be completed: one direct,
+    best-effort SIGKILL to the owned group using the lowest-level
+    primitive (os.killpg), independent of _sweep_owned_group /
+    _signal_group. "Subsequent OS kill operations were still usable" is
+    exactly the case this exists for -- a defect in one higher-level
+    helper is never the sole reason a still-signalable tree survives."""
+    _best_effort(lambda: os.killpg(pgid, signal.SIGKILL))
 
 
 def _terminate_direct_child(process: subprocess.Popen) -> None:
@@ -314,23 +358,52 @@ def _run_command(argv, *, env, stdin_text, timeout_seconds, own_group) -> Comman
         # dies, and the main thread must never close a stream a reader is
         # blocked on (BufferedReader lock).
         forced = timed_out or internal_failure or (overflow is not None and overflow.is_set())
+        # Every phase below is independently guarded (T13-C-I1-B, round 3):
+        # a phase that raises is recorded in `finalization_ok` but never
+        # prevents a LATER phase from still running -- termination, reap,
+        # sweep and every reader join are each attempted regardless of
+        # what an earlier phase did.
+        finalization_ok = True
+
         if forced or not _best_effort_poll_exited(process):
             if own_group:
-                _terminate_owned_group(process)
+                _, ok = _guard(lambda: _terminate_owned_group(process))
             else:
-                _terminate_direct_child(process)
-        _reap(process, 10)
-        if own_group:
-            stray = _sweep_owned_group(process.pid)
-        else:
-            _courtesy_terminate_shared_group()
-            stray = False
-        for reader in readers:
-            _best_effort(lambda reader=reader: reader.join(timeout=2) if reader.ident is not None else None)
+                _, ok = _guard(lambda: _terminate_direct_child(process))
+            finalization_ok = finalization_ok and ok
 
-    if internal_failure:
-        # The owned tree has already been cleaned up above; surface only the
-        # fixed message, never the internal exception text.
+        _, ok = _guard(lambda: _reap(process, 10))
+        finalization_ok = finalization_ok and ok
+
+        if own_group:
+            # Fail-closed default: if the sweep itself could not be
+            # completed, a survivor is ASSUMED -- never assumed absent.
+            stray, ok = _guard(lambda: _sweep_owned_group(process.pid), default=True)
+            if not ok:
+                # The sweep PHASE failed (not merely one internal signal
+                # attempt, which _sweep_owned_group already tolerates) --
+                # fall back to the independent last-resort primitive
+                # rather than leaving containment to that one helper alone.
+                _guard(lambda: _last_resort_kill(process.pid))
+            finalization_ok = finalization_ok and ok
+        else:
+            _, ok = _guard(_courtesy_terminate_shared_group)
+            finalization_ok = finalization_ok and ok
+            stray = False
+
+        for reader in readers:
+            _, ok = _guard(
+                lambda reader=reader: reader.join(timeout=2) if reader.ident is not None else None
+            )
+            finalization_ok = finalization_ok and ok
+
+    if internal_failure or not finalization_ok:
+        # Either supervision itself failed, or at least one finalization
+        # phase raised and containment could therefore not be PROVEN --
+        # the owned tree has still been cleaned up on a best-effort basis
+        # above, but a report is never returned as successful on the
+        # strength of a swallowed exception; surface only the fixed
+        # message, never any internal exception text.
         raise ReleaseDiagnosticsError(_MSG_SUPERVISION)
     if overflow is not None and overflow.is_set():
         return CommandOutcome(process.returncode, b"", b"", overflow=True, stray_processes=stray)
